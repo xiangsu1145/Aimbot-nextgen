@@ -152,6 +152,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         handleStartShellIntent(intent)
+
+        // Usage notice on every fresh app open (not on rotation / recreation).
+        if (savedInstanceState == null) AppDialogs.showUsageNotice(this)
     }
 
     override fun onNewIntent(intent: Intent) {

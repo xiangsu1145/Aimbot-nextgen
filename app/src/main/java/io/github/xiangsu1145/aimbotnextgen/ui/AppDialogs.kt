@@ -1,6 +1,7 @@
 package io.github.xiangsu1145.aimbotnextgen.ui
 
 import android.content.Intent
+import android.net.Uri
 import android.provider.Settings
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -42,6 +43,34 @@ object AppDialogs {
                 }
             }
             .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    /** Shown once every time the app is opened. Free-software notice + repo link. */
+    fun showUsageNotice(activity: AppCompatActivity) {
+        MaterialAlertDialogBuilder(activity)
+            .setTitle("使用须知")
+            .setMessage(
+                "欢迎使用 Aimbot-Nextgen。\n\n" +
+                    "1. 本软件完全免费、开源 (AGPLv3)，任何人不得拿它收费。\n\n" +
+                    "2. 如果你是花钱购买的，那你被骗了：请立即退款，并到官方仓库获取最新免费版本。\n\n" +
+                    "3. 唯一官方仓库 / 更新地址：\n" +
+                    "https://github.com/xiangsu1145/Aimbot-nextgen\n\n" +
+                    "4. 非官方渠道的安装包可能被植入恶意代码，请只从上方仓库下载。"
+            )
+            .setPositiveButton("前往仓库") { _, _ ->
+                try {
+                    activity.startActivity(
+                        Intent(
+                            Intent.ACTION_VIEW,
+                            Uri.parse("https://github.com/xiangsu1145/Aimbot-nextgen")
+                        )
+                    )
+                } catch (_: Exception) {
+                    Toast.makeText(activity, "无法打开浏览器", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("知道了", null)
             .show()
     }
 
