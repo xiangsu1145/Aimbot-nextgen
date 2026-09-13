@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Aimbot-Nextgen</string>
+
+    <!-- Shell daemon foreground service -->
+    <string name="shell_channel_id">shell_daemon</string>
+    <string name="shell_channel_name">Shell 服务</string>
+    <string name="shell_channel_desc">保持 Shell 守护进程在后台运行</string>
+    <string name="shell_notif_title_running">Shell 服务运行中</string>
+    <string name="shell_notif_title_idle">Shell 服务已停止</string>
+    <string name="shell_notif_text_idle">点击应用返回</string>
+
+    <!-- Battery optimization card -->
+    <string name="battery_card_title">电池优化提示</string>
+    <string name="battery_card_message">系统会在后台冻结未加入电池白名单的应用，导致 Shell 服务断开。建议将本应用加入电池优化白名单。</string>
+    <string name="battery_card_button">去设置</string>
+</resources>

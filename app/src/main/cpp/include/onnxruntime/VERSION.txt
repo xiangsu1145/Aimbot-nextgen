@@ -1,0 +1,4 @@
+ORT 1.29.0 (ORT_API_VERSION 29)
+来源: onnxruntime-linux-x64-1.29.0.tgz 的 include/
+运行时: com.microsoft.onnxruntime:onnxruntime-android:1.29.0 (Maven)
+公共 C/C++ API 头跨平台一致，与 Android AAR 里的 .so 严格同版本。

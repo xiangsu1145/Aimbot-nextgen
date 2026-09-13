@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <!--
+      Required to launch Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+      against our own package. The Settings activity on ColorOS / AOSP checks
+      this permission and finishes itself silently if the launcher does not
+      declare it, which presents as "tap the button, nothing opens".
+      Normal install-time permission — granted automatically, no runtime prompt.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!--
+        No SYSTEM_ALERT_WINDOW on purpose. The menu is drawn into a layer built by
+        the shell daemon straight on SurfaceFlinger, so the app never adds a window
+        and never needs the overlay permission.
+    -->
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AimbotNextgen"
+        tools:targetApi="31">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.AimbotNextgen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".adb.AdbPairingTutorialActivity"
+            android:exported="false"
+            android:label="ADB 配对"
+            android:theme="@style/Theme.AimbotNextgen" />
+
+        <!--
+          The Add-Model dialog used to launch a translucent activity to host
+          the system IME for the model-name / class-name fields. Both fields
+          are gone now (the model name comes from the file's basename, class
+          names were dropped), so there is no Activity to declare here.
+        -->
+
+        <service
+            android:name=".adb.AdbPairingService"
+            android:exported="true"
+            android:foregroundServiceType="specialUse" />
+
+        <!--
+          ShellDaemonService keeps the ADB TCP session that bridges to the
+          shell-uid `app_process` daemon. The foreground notification is
+          what stops Android from putting this process into a deep standby
+          bucket, where the TCP socket would stall and the user would see
+          "Shell 守护进程已断开" within minutes of backgrounding.
+        -->
+        <service
+            android:name=".shell.ShellDaemonService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" />
+
+        <!--
+          Brings the shell daemon service back up after a device reboot, but
+          only if the user previously started the shell and is still paired
+          via wireless ADB. See BootReceiver.kt for the guard.
+        -->
+        <receiver
+            android:name=".shell.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

@@ -1,0 +1,38 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+# ── Private signing key: never commit to the repo (AGPLv3 public repo) ──
+*.jks
+*.keystore
+*.p12
+*.pfx
+# This file contains the real alias/passwords (local only).
+sign/签名说明.txt
+keystore.properties
+signing.properties
+# ── Build outputs (any level) ──
+build/
+*.apk
+*.aab
+*.ap_
+# ── Python (local venv, caches) ──
+venv/
+__pycache__/
+*.pyc
+# ── Local-only tooling / agent memory ──
+.workbuddy/
+.gradle-home/
+.kotlin/
+.verify/
