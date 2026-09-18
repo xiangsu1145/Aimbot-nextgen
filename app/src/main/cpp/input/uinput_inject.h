@@ -34,7 +34,10 @@ extern "C" {
 #define UINPUT_SLOT_TRIGGER 9
 #define UINPUT_ID_TRIGGER   2000
 
-// Slots used by uinput_mirror_physical() — physical finger i lands in slot i.
+// Slots available to uinput_mirror_physical() for physical fingers. A finger is
+// given one when it goes down and keeps it until it lifts, so the slice of slot
+// numbers a hand consumes is not necessarily contiguous, and slot i does not
+// mean "the i-th finger" — it means "whichever finger went down onto it".
 #define UINPUT_MIRROR_SLOTS 8
 
 /// Tells uinput which panel to clone its identity / capabilities from. Call
@@ -87,9 +90,41 @@ void uinput_up(int slot);
 /// uinput frame. Fingers beyond `n` — and any mirror slot not listed — are
 /// lifted. Used to re-inject what we grabbed off the physical panel, so the
 /// app underneath keeps receiving touches while the overlay stays transparent.
-/// `ids`/`xs`/`ys` are the reader's pointers (screen coordinates); `n` is
-/// clamped to UINPUT_MIRROR_SLOTS.
-void uinput_mirror_physical(const int* ids, const int* xs, const int* ys, int n);
+///
+/// `ids` are the reader's pointer ids — the PANEL's tracking ids. They are not
+/// what goes on the wire (every slot carries a constant synthetic id, as in
+/// aimbot 1.2.1); they are kept per slot so that touch fusion can answer "which
+/// mirror slot is carrying this finger right now", and so that the slot aim has
+/// taken over is excluded by finger rather than by position. `rawXs`/`rawYs` are
+/// **panel raw coordinates**, not screen pixels: they are written to the device
+/// as-is. That is the whole point — this device declares the panel's own
+/// coordinate range, so the exact numbers the panel produced are exactly what it
+/// wants back, and routing them through screen pixels and out again only adds a
+/// truncation and a dependency on two separately-maintained copies of the
+/// rotation/scale state. `n` is clamped to UINPUT_MIRROR_SLOTS.
+///
+/// (The aim's synthetic touches are the other direction and take screen pixels:
+/// see uinput_down/uinput_move.)
+///
+/// `screenXs`/`screenYs` carry the SAME fingers in display pixels, and exist for
+/// the InputManager backend: a MotionEvent is in display coordinates and cannot
+/// be handed panel raw. The caller already has both arrays — the reader computes
+/// them in the same pass — so neither backend ever sees the other's space and
+/// nothing is converted at the last moment.
+void uinput_mirror_physical(const int* ids, const int* rawXs, const int* rawYs,
+                            const int* screenXs, const int* screenYs, int n);
+
+/// Slot-direct mirror for Protocol B panels (old touch_core.cpp behaviour).
+///
+/// `slotIds[k] >= 0` means panel slot k is down; otherwise it is up.
+/// This preserves the panel's own slot number on the virtual device (virtual
+/// slot k = panel slot k), so there is no compact-list allocation and no
+/// same-frame lift+reuse of one wire id — the old project's 1:1 model that
+/// never exhibited the teleport. Only slots [0 .. UINPUT_MIRROR_SLOTS) are
+/// mirrored; slots beyond are ignored. `slotIds` may be larger than
+/// UINPUT_MIRROR_SLOTS, excess entries are ignored.
+void uinput_mirror_slots(const int* slotIds, const int* rawXs, const int* rawYs,
+                         const int* screenXs, const int* screenYs, int maxSlots);
 
 /// Lifts every mirrored finger (call when the sink is switched off so the
 /// app underneath does not keep a phantom finger pressed).
@@ -120,7 +155,6 @@ void uinput_release_takeover(void);
 /// restore the touchscreen and with it the appearance that nothing happened,
 /// so the reader reports this and leaves the grab alone.
 int uinput_write_failures(void);
-
 #ifdef __cplusplus
 }
 #endif

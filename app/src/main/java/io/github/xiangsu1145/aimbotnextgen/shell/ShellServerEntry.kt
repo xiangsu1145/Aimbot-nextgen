@@ -1,6 +1,7 @@
 package io.github.xiangsu1145.aimbotnextgen.shell
 
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -11,6 +12,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
+import io.github.xiangsu1145.aimbotnextgen.inject.InputManagerInjector
 import kotlin.system.exitProcess
 
 /**
@@ -50,6 +52,9 @@ import kotlin.system.exitProcess
  *     OK | OK:<value> | ERR:<message>
  *     LAYER ...                            layer/renderer progress diagnostics
  *     TOUCH <D|M|U> <x> <y>               physical finger went down / moved / up
+ *     BYE                                  this process is exiting on purpose
+ *                                          (the menu's 退出 row); the app must NOT
+ *                                          read it as a crash and relaunch us
  *
  * All diagnostics go to logcat, never to stdout, so the stream stays clean.
  *
@@ -84,6 +89,14 @@ object ShellServerEntry {
     /** Consecutive failed polls the reader tolerates before it gives up. */
     private const val kReaderMaxFailures = 100
 
+    /**
+     * How often the injector snapshot is logged while the panel is held.
+     *
+     * Short enough that a 20-30 second field test always contains several lines,
+     * long enough not to matter in the log buffer.
+     */
+    private const val kInjectTickMs = 5_000L
+
     // ── Session (one client connection) timeouts ────────────────────────────
     //
     // The app has to sit in the background while a game is in front, which on
@@ -113,6 +126,9 @@ object ShellServerEntry {
     @Volatile private var running = true
     @Volatile private var readerThread: Thread? = null
 
+    /** Set once the loopback port is bound; see [requestExitFromMenu]. */
+    @Volatile private var serverSocketRef: ServerSocket? = null
+
     // ── Client session ──────────────────────────────────────────────────────
     //
     // The connection is a *session*, not the daemon's lifetime. It comes and
@@ -140,6 +156,9 @@ object ShellServerEntry {
 
     /** Asks the reader thread to leave its loop (set by stopReaderThread). */
     @Volatile private var readerStop = false
+
+    /** Periodic "what is the injector doing" line. See startInjectTicker(). */
+    @Volatile private var injectTicker: Thread? = null
 
     /** Publishes the live ImGui rectangles to the uinput mirror. */
     @Volatile private var regionThread: Thread? = null
@@ -274,6 +293,7 @@ object ShellServerEntry {
 
     @JvmStatic
     fun main(args: Array<String>) {
+        bootBegin()
         Log.i(TAG, "daemon starting uid=${Process.myUid()} pid=${Process.myPid()}")
 
         val existing = alreadyRunningPort()
@@ -281,6 +301,7 @@ object ShellServerEntry {
             Log.i(TAG, "a daemon is already serving 127.0.0.1:$existing — this one exits")
             exitProcess(0)
         }
+        bootStep("port check")
 
         val libDir = args.firstOrNull()
         if (libDir.isNullOrBlank()) {
@@ -293,7 +314,14 @@ object ShellServerEntry {
         // vendor .so files by absolute path first, which makes their SONAMEs
         // resolvable when System.load(libaimbotng.so) walks its DT_NEEDED list.
         // See preloadDaemonDeps() for the long version.
+        //
+        // Timed: this is the QNN/HTP stack — seven vendor .so files, the two
+        // .so's that only exist to be preloaded (each tens of MB) multiplied by
+        // a cold page cache on the first launch after a boot. It is the single
+        // most likely candidate for "the daemon takes forever to come up", and
+        // the log line settles it either way.
         preloadDaemonDeps(libDir)
+        bootStep("preload vendor .so")
         try {
             ShellNative.load("$libDir/libaimbotng.so")
         } catch (t: Throwable) {
@@ -302,7 +330,53 @@ object ShellServerEntry {
             return
         }
 
+        // The whole MediaTek-APU picture, before any model or menu can be
+        // involved.
+        //
+        // This has to be here and not only on the model-load path. The
+        // "Neuron (APU)" row can only be picked when it is not greyed out, so on
+        // a device where the APU is unreachable the user never gets far enough
+        // to load a model through it — and a diagnosis that only runs on model
+        // load can therefore never explain the one failure it exists to explain.
+        // Anything it throws is caught: a broken probe must not cost us the
+        // daemon.
+        //
+        // Timed from both sides on purpose. The native half prints a per-step
+        // breakdown with its own `[+Nms / total Mms]`; this wraps the whole call
+        // so the JNI transition itself is accounted for too. If this line shows
+        // a large delta and the native `end APU diagnosis` line never appears,
+        // the diagnosis is where the daemon is stuck — and the last native step
+        // that DID print names the culprit.
+        try {
+            ShellNative.neuronDiagnosis()
+        } catch (t: Throwable) {
+            Log.w(TAG, "neuronDiagnosis failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
+        bootStep("APU diagnosis")
+
         ShellNative.modelLoadFromDisk()
+        bootStep("modelLoadFromDisk")
+
+        // Which injection backend to use has to be known before the first OPEN,
+        // not when the menu opens: it decides whether a virtual touchscreen is
+        // created at all. Everything else in config.json is still applied by
+        // ui::start() when the render thread comes up.
+        val backend = try {
+            ShellNative.configLoad()
+        } catch (t: Throwable) {
+            Log.e(TAG, "configLoad failed", t)
+            0
+        }
+        bootStep("configLoad")
+        // `backend` is configLoad()'s return value: it says whether config.json
+        // could be read, NOT whether the injector came up. Labelling it `ready`
+        // made a field log read as "uinput is broken" when all it actually said
+        // was "nothing saved yet, so the default backend is in use" — and that
+        // cost a round of testing the wrong backend.
+        milestone("inject backend at startup: " +
+                "${if (ShellNative.injectGetBackend() == ShellNative.INJECT_BACKEND_INPUT_MANAGER) "InputManager" else "uinput"} " +
+                "configLoaded=${backend != 0}" +
+                (if (backend == 0) " (config.json unreadable — using the default backend)" else ""))
 
         // Bind a 127.0.0.1 TCP port (loopback — no NAT, no OEM timeout) and
         // publish the port number so the app can find us. The shell launched
@@ -319,6 +393,7 @@ object ShellServerEntry {
         runCatching { java.io.File(PORT_FILE).writeText(port.toString()) }
             .onFailure { Log.w(TAG, "could not write $PORT_FILE", it) }
         Log.i(TAG, "listening on 127.0.0.1:$port, pid=${Process.myPid()}")
+        bootStep("bind + publish port")
 
         // The listening socket stays open for the daemon's whole life. It used
         // to be closed the instant the first client arrived, which meant a
@@ -326,12 +401,21 @@ object ShellServerEntry {
         // kill and relaunch the whole daemon, taking the panel grab and the
         // menu down with it.
         serverSocket.soTimeout = 0
+        // Kept reachable outside main() purely so the menu's 退出 row can close
+        // it: with no client attached the main loop is parked in accept(), and
+        // flipping `running` alone would not be noticed until somebody dialled
+        // this port again.
+        serverSocketRef = serverSocket
 
         startCaptureSupervisor()
+        bootStep("capture supervisor")
         startGeometryWatcher()
+        bootStep("geometry watcher")
         clearRelayScratch()
+        bootStep("clear relay scratch")
 
-        Log.i(TAG, "daemon ready (uid=${Process.myUid()} pid=${Process.myPid()}), awaiting a client")
+        bootStep("BOOT COMPLETE (ready to accept)")
+        milestone("daemon ready (uid=${Process.myUid()} pid=${Process.myPid()}), awaiting a client")
 
         // ── One iteration per client ────────────────────────────────────────
         //
@@ -392,7 +476,7 @@ object ShellServerEntry {
 
         startTcpSenderThread(tcpOut, mySession)
 
-        Log.i(TAG, "client connected from ${client.inetAddress}")
+        milestone("client connected from ${client.inetAddress}")
         send("READY")
         // A reconnecting app has to be told where things stand — its own idea
         // of the menu is from before it was frozen, or from a previous process.
@@ -703,22 +787,42 @@ object ShellServerEntry {
             Log.i(TAG, "capture supervisor started")
             while (running && !captureStop) {
                 try {
-                    // The switch says the user has capture turned on; the
-                    // reader says whether anyone is looking. Both have to hold
-                    // before a mirror is worth building.
+                    // The switch says the user has capture turned on; the reader
+                    // flag says whether anyone is actually sampling pixels. Both
+                    // have to hold before a mirror is worth building.
                     //
-                    // Acting on the switch alone kept a full-screen 2K virtual
-                    // display and its frame pump running for entire sessions in
-                    // which not one frame was sampled: ~80% of a core and a GC
-                    // cycle every other second, spent producing frames that
-                    // were counted and then thrown away.
+                    // The second half must stay distinguishable from the switch,
+                    // and the reason is the one that made this flag exist: with
+                    // `consuming` in its place, holding to infer kept a mirror
+                    // alive while the capture switch read "off", so turning
+                    // capture off changed nothing visible — indistinguishable
+                    // from a broken switch. The switch has to be the thing that
+                    // decides, and inference gets its frames by asking loudly
+                    // (turning the switch on, in the settings page, where the
+                    // user can see it).
+                    //
+                    // But `capturePreviewWanted` is the *reader* half, not "the
+                    // Capture page is open" — it counts a running model. It used
+                    // to mean the preview page alone, and that is what made
+                    // inference need that page: with continuous inference on and
+                    // the page closed, this saw no reader, stopped the mirror, and
+                    // the detector had no frame source at all. Opening the Capture
+                    // page started the producer, so the page appeared to be what
+                    // inference ran on.
+                    //
+                    // Acting on the switch alone was an even earlier version of
+                    // the bug: it kept a full-screen 2K virtual display and its
+                    // frame pump running for entire sessions in which not one
+                    // frame was sampled: ~80% of a core and a GC cycle every other
+                    // second, spent producing frames that were counted and then
+                    // thrown away.
                     val switch = ShellNative.captureWanted()
-                    val reading = ShellNative.captureConsuming()
-                    val wanted = switch && reading
+                    val preview = ShellNative.capturePreviewWanted()
+                    val wanted = switch && preview
                     val size = ShellNative.captureWantedSize()
                     if (wanted) {
                         if (!ScreenCapture.isAlive() || ScreenCapture.needsRestart()) {
-                            Log.i(TAG, "capture: building mirror (switch=$switch, reading=$reading, " +
+                            Log.i(TAG, "capture: building mirror (switch=$switch, preview=$preview, " +
                                     "alive=${ScreenCapture.isAlive()}, " +
                                     "needsRestart=${ScreenCapture.needsRestart()}, crop ${size}x$size)")
                             if (!ScreenCapture.start(size)) {
@@ -821,6 +925,7 @@ object ShellServerEntry {
         geometryThread = null
     }
 
+
     private fun startRegionPump() {
         // `!= null` is not liveness. The pump's loop is bounded by the menu layer
         // being up, so it returns on its own the moment that layer goes away —
@@ -897,11 +1002,29 @@ object ShellServerEntry {
             return
         }
 
-        // Order matters: the reader enumerates /dev/input BEFORE we create the
-        // virtual device, otherwise it could pick our own clone. uinput is then
-        // told exactly which panel to clone.
+        // Order matters in two places, and they pull in opposite directions:
+        //
+        //   1. the reader enumerates /dev/input BEFORE the virtual device is
+        //      created, otherwise it could pick our own clone as "the panel";
+        //   2. the panel is GRABBED before the virtual device is created.
+        //
+        // (2) is aimbot 1.2.1's actual order, and it is the one this fork had
+        // reversed. Its own startup log states it plainly:
+        //
+        //   Detected touch device: /dev/input/event5 abs=127999x277199
+        //   openAndGrab: fd=85 EVIOCGRAB success on /dev/input/event5
+        //   uinput created: name='focaltech_ts' bus=0x1c ...
+        //   Started 1 reader threads
+        //
+        // Seen from the input stack that means the real panel goes quiet FIRST
+        // and only then does a second touchscreen appear. Building the virtual
+        // device while the physical one is still live has the input reader
+        // discover a new touchscreen while another one is still producing
+        // events, and that is the last remaining difference between this build
+        // and the build measured working on the device we cannot reproduce.
         if (!ShellNative.readerIsReady()) {
             if (!ShellNative.readerInit(screenW, screenH, rotation)) {
+                Log.e(TAG, "OPEN: readerInit FAILED at ${screenW}x$screenH rot=$rotation")
                 replyErr("readerInit failed (no touch panel?)")
                 return
             }
@@ -909,25 +1032,125 @@ object ShellServerEntry {
         ShellNative.readerSetScreenParams(screenW, screenH, rotation)
 
         ShellNative.uinputSetSourcePanel(ShellNative.readerGetPanelPath())
-        if (!ShellNative.uinputIsReady()) {
+
+        // Grab first. From this instant the daemon is the panel's only source of
+        // touch, so everything below has to be able to hand it back.
+        val grabbed = ShellNative.readerGrab()
+
+        // Which way a touch gets back out. The two backends are mutually
+        // exclusive and the native side enforces that: selecting InputManager
+        // lifts whatever the virtual device holds and destroys it. Building the
+        // device here anyway would put two pointers under every mirrored finger,
+        // because the same finger would arrive once mirrored and once injected.
+        val useInputManager =
+            ShellNative.injectGetBackend() == ShellNative.INJECT_BACKEND_INPUT_MANAGER
+
+        // The screen size goes to the native injector either way. uinput needs it
+        // now; InputManager does not, but a switch back to uinput later rebuilds
+        // the device from the last known size, and a device rebuilt at 0x0 maps
+        // every pixel to the origin.
+        ShellNative.uinputSetScreenParams(screenW, screenH, screenW > screenH)
+
+        if (useInputManager) {
+            val ok = try {
+                ShellNative.injectSetBackend(ShellNative.INJECT_BACKEND_INPUT_MANAGER)
+            } catch (t: Throwable) {
+                Log.e(TAG, "injectSetBackend threw", t)
+                false
+            }
+            if (ok) {
+                milestone("OPEN: inject=InputManager ready, no virtual touchscreen")
+            } else {
+                // Deliberately not falling back to uinput. The whole reason this
+                // backend exists is a device where the virtual touchscreen is
+                // accepted and then ignored; sliding back to it would restore
+                // exactly that invisible failure, minus any trace of why.
+                milestone("OPEN: inject=InputManager NOT usable " +
+                        "(${runCatching { ShellNative.injectLastError() }.getOrDefault("?")}) " +
+                        "— no virtual device was created, so nothing will be injected. " +
+                        "The menu still works (it reads the panel directly); " +
+                        "on MIUI/HyperOS this is usually " +
+                        "\"USB debugging (Security settings)\" being off.")
+            }
+        } else if (!ShellNative.uinputIsReady()) {
             if (!ShellNative.uinputInit(screenW, screenH)) {
+                Log.e(TAG, "OPEN: uinputInit FAILED (panel=${ShellNative.readerGetPanelPath()}) " +
+                        "— rolling the grab back: we already hold the panel, and with no " +
+                        "virtual device there would be no touch source left at all")
+                // readerClose() alone is not enough here. It tears the reader
+                // down, but the grab is a property of the panel fd and would be
+                // released only by a clean process exit — leaving the phone with
+                // a taken panel and nothing injecting into it.
+                runCatching { ShellNative.readerUngrab() }
                 ShellNative.readerClose()
                 replyErr("uinputInit failed (cannot open /dev/uinput?)")
                 return
             }
         }
-        ShellNative.uinputSetScreenParams(screenW, screenH, screenW > screenH)
 
         // Physical touches are mirrored back out so the game still receives
         // them, while we read a copy for the ImGui menu.
         ShellNative.readerSetSink(true)
 
-        val grabbed = ShellNative.readerGrab()
-        Log.i(TAG, "OPEN: panel=${ShellNative.readerGetPanelPath()} " +
+        milestone("OPEN: panel=${ShellNative.readerGetPanelPath()} " +
                 "abs=${ShellNative.readerGetMaxX()}x${ShellNative.readerGetMaxY()} grabbed=$grabbed")
 
         startReaderThread()
+        startInjectTicker()
         replyOkValue("grabbed=${if (grabbed) 1 else 0}")
+    }
+
+    /**
+     * Prints an injector snapshot every five seconds, moving or not.
+     *
+     * Every other line about injection is a *counter*, and counters only exist
+     * while something is happening: the IM status line prints every N frames
+     * (frames advance only when a finger actually moves), the native health line
+     * is emitted from inside the frame writer, and the reader's per-gesture line
+     * only fires when a gesture begins. A session in which the user did nothing
+     * therefore produces *no injection output at all* — which is indistinguishable
+     * from "the collection missed those lines", and that ambiguity has already
+     * cost two field-test rounds.
+     *
+     * This ticker removes it. It also carries the three states that decide whether
+     * a physical finger is allowed through at all: `grabbed` (we hold the panel,
+     * so the device has no touch of its own any more), `sink` (is the mirror on)
+     * and `regions` (how many menu rectangles are currently swallowing gestures —
+     * at full pass-through this is 0, and a screen-sized rectangle here is itself
+     * the bug).
+     */
+    private fun startInjectTicker() {
+        if (injectTicker != null) return
+        val t = Thread({
+            while (running && !readerStop) {
+                try {
+                    Thread.sleep(kInjectTickMs)
+                } catch (e: InterruptedException) {
+                    break
+                }
+                if (!running || readerStop) break
+                val im = ShellNative.injectGetBackend() == ShellNative.INJECT_BACKEND_INPUT_MANAGER
+                runCatching {
+                    Log.i(TAG, "inject tick: backend=${if (im) "inputmgr" else "uinput"} " +
+                            "ready=${ShellNative.injectIsReady()} grabbed=${ShellNative.readerIsGrabbed()} " +
+                            "sink=${ShellNative.readerGetSink()} regions=${ShellNative.readerGetRegionCount()} " +
+                            "ui=${ShellNative.uiIsRunning()} uinputFail=${ShellNative.uinputWriteFailures()}")
+                }.onFailure { Log.w(TAG, "inject tick failed", it) }
+                if (im) {
+                    runCatching { Log.i(TAG, "inject tick(im): ${InputManagerInjector.stats()}") }
+                }
+            }
+            Log.i(TAG, "inject ticker stopped")
+        }, "aimbot-inject-tick")
+        t.isDaemon = true
+        injectTicker = t
+        t.start()
+    }
+
+    private fun stopInjectTicker() {
+        val t = injectTicker ?: return
+        injectTicker = null
+        runCatching { t.join(300) }
     }
 
     // ── Physical touch → upstream ────────────────────────────────────────────
@@ -1022,6 +1245,7 @@ object ShellServerEntry {
     }
 
     private fun stopReaderThread() {
+        stopInjectTicker()
         val t = readerThread ?: return
         readerThread = null
         readerStop = true
@@ -1119,7 +1343,62 @@ object ShellServerEntry {
     private fun replyOkValue(value: String) = send("OK:$value")
     private fun replyErr(message: String) = send("ERR:$message")
 
+    /**
+     * A lifecycle line that has to survive whatever logcat filter the user was
+     * told to use — logged at ERROR for that reason alone, not because anything
+     * is wrong.
+     *
+     * Why this exists: the capture command handed to testers is
+     * `logcat ... AimbotReader:V AimbotInput:V AimbotNg:V ... *:E`. Everything
+     * named gets V, everything else gets E — and the daemon's *own* tag was
+     * never in that list, so every `Log.i` this file writes was dropped. Five
+     * logs in a row arrived with `I/aimbot_shell` = 0 lines, which is why we
+     * could never see `OPEN: panel=…`, `daemon ready`, the status ticker or the
+     * exit sequence, and kept re-diagnosing from the native half alone.
+     *
+     * Fixing the command is the real answer (add `aimbot_shell:V`), but a build
+     * that has already been handed out cannot be re-filtered, and the next
+     * capture may still use the old line. ERROR is the one level that survives
+     * it, so the handful of lines that answer "what happened at OPEN / exit"
+     * come through here.
+     */
+    private fun milestone(message: String) = Log.e(TAG, "MILESTONE $message")
+
+    /// Millisecond wall-clock at the moment the daemon entered main().
+    ///
+    /// Every boot line goes through [bootStep] and carries `[+Nms / total Mms]`
+    /// against this. The problem it solves: "the daemon hangs and never brings
+    /// the UI up" has been attributed to the compile, to the APU diagnosis and
+    /// to the vendor preload at different times, and a logcat capture could not
+    /// settle it — Logcat's own timestamps are second-resolution, and lines
+    /// written from native code carry a different tag and no shared origin.
+    ///
+    /// With this, one `logcat -d` answers both questions: which step is slow,
+    /// and which step never finished (its closing line is simply absent, and
+    /// the last one that printed is where it is stuck).
+    private var bootStartMs: Long = 0L
+    private var bootStepStartMs: Long = 0L
+
+    private fun bootBegin() {
+        bootStartMs = SystemClock.elapsedRealtime()
+        bootStepStartMs = bootStartMs
+    }
+
+    /// Logs one boot step with its own cost and the running total. Call after
+    /// the step's work is done — the delta printed is the work, not the logging.
+    /// Uses ERROR level for the same reason [milestone] does: it is the one
+    /// level that survives a `aimbot_shell` filter that was captured without
+    /// the tag's verbosity raised.
+    private fun bootStep(name: String) {
+        val now = SystemClock.elapsedRealtime()
+        val self = now - bootStepStartMs
+        val total = now - bootStartMs
+        Log.e(TAG, "MILESTONE boot ── " + name.padEnd(24) + " [+${self}ms / total ${total}ms]")
+        bootStepStartMs = now
+    }
+
     private fun shutdown() {
+        milestone("shutdown: releasing the panel and everything downstream of it")
         stopGeometryWatcher()
         stopCaptureSupervisor()
         stopRegionPump()
@@ -1130,6 +1409,49 @@ object ShellServerEntry {
             ShellNative.readerClose()
             ShellNative.uinputClose()
         }.onFailure { Log.w(TAG, "cleanup failed", it) }
+        // The definitive line for a "touch died" report: the panel fd is closed
+        // above, and a closed fd drops EVIOCGRAB at the kernel — whatever else
+        // is broken, the device has its own touch back from here on.
+        milestone("shutdown: panel released, grab=${ShellNative.readerIsGrabbed()}")
+    }
+
+    /**
+     * The menu asked to quit. Called over JNI from the ImGui Settings page's
+     * 退出 row (see `cpp/input/exit_request.h`) — same destination as a
+     * client's DESTROY, but originating inside this process.
+     *
+     * The [BYE] line is the important part, not the exit. Without it the app
+     * sees nothing but a dropped socket, concludes the daemon crashed, and
+     * relaunches it — which takes the panel straight back a few seconds after
+     * the user pressed the button whose entire purpose was to get it released.
+     * [BYE] makes the app go idle and promise not to reconnect.
+     *
+     * The delay before clearing [running] is what lets that line leave: [send]
+     * only enqueues, and `exitProcess` at the end of main() would otherwise
+     * beat the sender thread to it. It runs off-thread so the render thread
+     * that called us is not the one waiting.
+     *
+     * Closing the sockets is not cleanup — it is what makes the flag take
+     * effect now. The main thread is parked either in accept() (no client) or
+     * in a 30 s read deadline inside serveClient(), and neither looks at
+     * `running` until it returns. Without this the exit would land up to a
+     * minute late — or never, if nothing ever dials the port again — which for
+     * a button labelled "恢复触摸" is indistinguishable from being broken.
+     * The flag goes first so those calls fail outwards instead of retrying.
+     */
+    @JvmStatic
+    fun requestExitFromMenu() {
+        if (!running) return
+        milestone("exit requested from the menu — handing the panel back " +
+                "(client attached=${clientSocket != null}, uid=${Process.myUid()})")
+        send("BYE")
+        Thread({
+            runCatching { Thread.sleep(250) }
+            running = false
+            milestone("exit: running=false, waking the accept/read loop")
+            runCatching { clientSocket?.close() }
+            runCatching { serverSocketRef?.close() }
+        }, "exit-request").apply { isDaemon = true }.start()
     }
 
     // ── Relay scratch cleanup ──────────────────────────────────────────────

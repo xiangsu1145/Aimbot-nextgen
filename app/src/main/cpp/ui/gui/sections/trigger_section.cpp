@@ -17,6 +17,7 @@
 
 #include "inference/model_runtime.h"
 #include "inference/model_store.h"
+#include "input/inject_backend.h"
 #include "input/touch_reader.h"
 #include "input/uinput_inject.h"
 #include "tracking/kalman_tracker.h"
@@ -395,14 +396,18 @@ void TriggerCategoryState::syncFromModel(const std::vector<std::string>& modelCl
 // ── drawTriggerSection ────────────────────────────────────────────────────
 
 void drawTriggerSection(ImDrawList* dl, float x, float& y, float w,
-                        float /*bottomY*/, float s, float es, const Xf& xf) {
+                        float /*bottomY*/, float s, float es, const Xf& xf,
+                        Scroll& sc) {
     const float gap   = 12.0f * s;
     const float rowSw = widgets::kSwitchRowH   * s;
     const float rowSl = widgets::kSliderRowH   * s;
     const float rowDd = widgets::kDropdownRowH * s;
 
     auto wRect = [&](float wx, float wy, float ww, float wh) {
-        return wRectOf(wx, wy, ww, wh, s, xf);
+        // Apply the page's scroll offset so paint and hit-test sit at the
+        // right visual y. `y` keeps advancing in the natural coordinate space
+        // (see Scroll in hud.h).
+        return wRectOf(wx, wy - sc.offset, ww, wh, s, xf);
     };
 
     // Timing + tap sliders — ranges/defaults from the old project.
@@ -541,8 +546,13 @@ void syncTriggerPage() {
         p.fired = false;
     };
 
-    // ── Gates: master switch, uinput, model ───────────────────────────────
-    if (!p.enabled.value || !uinput_is_ready() || !snap.active) {
+    // ── Gates: master switch, injection backend, model ────────────────────
+    // The middle one asks the injector, not uinput. It used to be
+    // uinput_is_ready() ("is there a /dev/uinput device?"), which is false while
+    // the InputManager backend is selected — the virtual device is destroyed on
+    // purpose there — so the auto trigger did nothing but the mirror kept
+    // working. See input/inject_backend.h.
+    if (!p.enabled.value || !inject_is_ready() || !snap.active) {
         resetTiming();
         return;
     }

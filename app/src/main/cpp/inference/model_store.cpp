@@ -61,9 +61,46 @@ const Engine kOnnxEngineIds[] = {Engine::OnnxRuntime, Engine::OnnxCpu};
 // GPU is the OpenCL delegate. It is widely available on Adreno / Mali.
 // QNN HTP is shown but not wired (this build has no QNN EP); the engine
 // table marks it "not implemented" so the row appears grey rather than gone.
+// ⚠️ These two arrays are the single source of truth for the tflite engine
+// dropdown, and enginesFor() reports their length as a literal. Adding an
+// engine means editing BOTH arrays AND the count — miss one and the dropdown
+// renders a garbage `const char*` taken from whatever the linker put after
+// this array, which is a SIGSEGV inside ImFontCalcTextSizeEx (strlen) the
+// first time the list is drawn. That crash looks nothing like its cause.
+// Neuron (APU) is gated independently of NeuroPilot (AIMBOTNG_HAVE_NEURON):
+// the delegate source is private and not in the repo. Previously Neuron was
+// folded into the NeuroPilot branch, which wrongly hid it whenever NeuroPilot
+// was off. Keep the two flags orthogonal.
+// ── NPU (LiteRT) is temporarily commented out: LiteRT 2.x vendor dispatch
+//    crashes on this MediaTek SKU and is not being fixed in this branch.
+//    The arrays below still hold the same length, so engineAt/engineIndex
+//    keep returning a meaningful value for entries written by an older build;
+//    those entries fall through to (LiteRT, Cpu) in resolvePair() so the
+//    model still loads, just on the CPU backend.
+// {"NPU (LiteRT)",
+#if AIMBOTNG_HAVE_NEUROPILOT
+const char* kTfliteEngines[]   = {"NeuroPilotTFLite",
+#if AIMBOTNG_HAVE_NEURON
+                                  "Neuron (APU)",
+#endif
+                                  "QNN HTP", "NNAPI", "CPU", "XNNPACK", "GPU"};
+const Engine kTfliteEngineIds[] = {Engine::NeuroPilot,
+#if AIMBOTNG_HAVE_NEURON
+                                   Engine::Neuron,
+#endif
+                                   Engine::QnnHtp, Engine::Nnapi, Engine::Cpu,
+                                   Engine::TfliteXnnpack, Engine::TfliteGpu};
+#elif AIMBOTNG_HAVE_NEURON
+const char* kTfliteEngines[]   = {"Neuron (APU)",
+                                  "QNN HTP", "NNAPI", "CPU", "XNNPACK", "GPU"};
+const Engine kTfliteEngineIds[] = {Engine::Neuron,
+                                   Engine::QnnHtp, Engine::Nnapi, Engine::Cpu,
+                                   Engine::TfliteXnnpack, Engine::TfliteGpu};
+#else
 const char* kTfliteEngines[]   = {"QNN HTP", "NNAPI", "CPU", "XNNPACK", "GPU"};
 const Engine kTfliteEngineIds[] = {Engine::QnnHtp, Engine::Nnapi, Engine::Cpu,
                                    Engine::TfliteXnnpack, Engine::TfliteGpu};
+#endif
 
 /** Loads the list on first use, so a caller cannot read an empty list by
  *  simply asking before start-up has read the file. */
@@ -263,35 +300,61 @@ const char* engineLabel(Engine engine) {
         case Engine::Cpu:           return "CPU";
         case Engine::TfliteXnnpack: return "XNNPACK";
         case Engine::TfliteGpu:     return "GPU";
+        case Engine::LiteRtNpu:     return "NPU (LiteRT)";
+#if AIMBOTNG_HAVE_NEUROPILOT
+        case Engine::NeuroPilot:    return "NeuroPilotTFLite";
+#endif
+#if AIMBOTNG_HAVE_NEURON
+        case Engine::Neuron:        return "Neuron (APU)";
+#endif
         default:                    return "未选择";
     }
 }
 
+/// Array length, so the counts below cannot drift away from the arrays they
+/// describe. See the warning on kTfliteEngines for why that matters.
+template <class T, size_t N>
+constexpr int arrayLen(T (&)[N]) { return static_cast<int>(N); }
+
 const char* const* enginesFor(Kind kind, int& count) {
     switch (kind) {
-        case Kind::Onnx:   count = 2; return kOnnxEngines;
-        case Kind::Tflite: count = 5; return kTfliteEngines;
+        case Kind::Onnx:   count = arrayLen(kOnnxEngines);   return kOnnxEngines;
+        case Kind::Tflite: count = arrayLen(kTfliteEngines); return kTfliteEngines;
         default:           count = 0; return nullptr;
     }
 }
 
 Engine engineAt(Kind kind, int index) {
     if (kind == Kind::Onnx) {
-        return (index >= 0 && index < 2) ? kOnnxEngineIds[index] : Engine::None;
+        return (index >= 0 && index < arrayLen(kOnnxEngineIds))
+                   ? kOnnxEngineIds[index] : Engine::None;
     }
     if (kind == Kind::Tflite) {
-        return (index >= 0 && index < 5) ? kTfliteEngineIds[index] : Engine::None;
+        return (index >= 0 && index < arrayLen(kTfliteEngineIds))
+                   ? kTfliteEngineIds[index] : Engine::None;
     }
     return Engine::None;
 }
 
+/// The dropdown index for `engine`, or -1 when this build has no row for it.
+///
+/// -1 rather than 0 is load-bearing. 0 is a real index (it is "NPU (LiteRT)"
+/// in the tflite list and "ONNX Runtime · XNNPACK" in the onnx one), so
+/// returning it for "not found" does not mean "no selection" — it means a
+/// concrete engine the user never picked. A stored engine that this build
+/// cannot name (NeuroPilot saved by a NeuroPilot build, then opened by one
+/// built without it) would come back as index 0, the Settings dialog would
+/// show "NPU (LiteRT)", and pressing Save would write LiteRtNpu over the
+/// user's model. Callers must treat negative as "leave the selection alone".
 int engineIndex(Kind kind, Engine engine) {
     if (kind == Kind::Onnx) {
-        for (int i = 0; i < 2; ++i) if (kOnnxEngineIds[i] == engine) return i;
+        for (int i = 0; i < arrayLen(kOnnxEngineIds); ++i)
+            if (kOnnxEngineIds[i] == engine) return i;
     } else if (kind == Kind::Tflite) {
-        for (int i = 0; i < 5; ++i) if (kTfliteEngineIds[i] == engine) return i;
+        for (int i = 0; i < arrayLen(kTfliteEngineIds); ++i)
+            if (kTfliteEngineIds[i] == engine) return i;
     }
-    return 0;
+    return -1;
 }
 
 std::string baseName(const std::string& path) {
@@ -409,7 +472,13 @@ bool setInference(int id, Engine engine, float confidence, int threads,
     if (confidence > 1.0f) confidence = 1.0f;
     for (Entry& e : g_entries) {
         if (e.id != id) continue;
-        e.engine     = engine;
+        // Engine::None means "no runtime chosen", which is not a state a saved
+        // model may be left in: prepare() would fail with "this model has no
+        // runtime selected" and the entry would be dead weight in the list.
+        // Callers that have no real selection pass None by accident (an empty
+        // dropdown, an index that had no row); keeping the existing engine is
+        // the only answer that does not destroy a working model.
+        if (engine != Engine::None) e.engine = engine;
         e.confidence = confidence;
         if (threads > 0) {
             int t = threads;
@@ -424,8 +493,12 @@ bool setInference(int id, Engine engine, float confidence, int threads,
             e.htpPerfMode = p;
         }
         saveLocked();
+        // Log the engine that was actually stored, not the argument: when the
+        // caller passes None the write above is skipped, and a log line naming
+        // "未选择" for a model that still has a working engine is exactly the
+        // kind of misleading entry this project has been bitten by before.
         LOGI("model #%d inference -> %s @ %.2f, threads=%d, htpPerf=%d",
-             id, engineLabel(engine), confidence, e.cpuThreads, e.htpPerfMode);
+             id, engineLabel(e.engine), confidence, e.cpuThreads, e.htpPerfMode);
         return true;
     }
     return false;

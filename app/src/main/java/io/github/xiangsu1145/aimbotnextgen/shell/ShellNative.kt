@@ -47,6 +47,21 @@ object ShellNative {
      */
     external fun preloadAllDaemonLibraries(): Int
 
+    /**
+     * Prints the whole MediaTek-APU picture, once, whatever the UI is doing.
+     *
+     * Called at daemon boot rather than only from the model-load path. The
+     * model-load path is too late to diagnose with: the "Neuron (APU)" row can
+     * only be picked if it is not greyed out, so on a device where the APU is
+     * unreachable the user never gets far enough to load a model — and the
+     * capture therefore contains a greyed-out row and nothing explaining it.
+     *
+     * Cheap and idempotent: the underlying probes are cached, so calling this
+     * early costs one round of dlopens that the first real use would have paid
+     * for anyway.
+     */
+    external fun neuronDiagnosis()
+
     // ── Physical panel (exclusive) ───────────────────────────────────────────
 
     /** Opens + decodes the real touch panel. `rotation` is 0..3. */
@@ -93,10 +108,58 @@ object ShellNative {
     external fun uinputIsReady(): Boolean
     external fun uinputSetScreenParams(width: Int, height: Int, landscape: Boolean)
 
+    /**
+     * Consecutive frames the kernel refused since the last one landed. Read by
+     * the daemon's status ticker so a "his touch died" report that reaches us
+     * as a logcat can tell "we never wrote" from "we wrote and it was ignored".
+     */
+    external fun uinputWriteFailures(): Int
+
     external fun uinputDown(slot: Int, id: Int, x: Int, y: Int)
     external fun uinputMove(slot: Int, x: Int, y: Int)
     external fun uinputUp(slot: Int)
     external fun uinputMirrorClear()
+
+    // ── Injection backend (uinput / InputManager) ────────────────────────────
+    //
+    // Which of the two carries a touch out of this process. Both share the
+    // reader, the grab and the menu rectangles; only the last hop differs, so
+    // this is a mode on the native injector rather than a second implementation.
+    // See cpp/input/inject_backend.h for why switching tears the virtual device
+    // down.
+
+    /** [INJECT_BACKEND_UINPUT] or [INJECT_BACKEND_INPUT_MANAGER]. */
+    external fun injectSetBackend(backend: Int): Boolean
+
+    external fun injectGetBackend(): Int
+
+    /**
+     * Whether the *selected* backend can actually deliver a frame right now.
+     *
+     * Distinct from [injectGetBackend], and the distinction is the point: the
+     * InputManager backend can be selected and still be refused by the platform
+     * (a missing `INJECT_EVENTS` grant), which must be reported rather than
+     * papered over.
+     */
+    external fun injectIsReady(): Boolean
+
+    /** One-line reason the injection path is unusable, or "" when it is fine. */
+    external fun injectLastError(): String
+
+    /**
+     * Reads config.json and applies the parts of it that must be in force before
+     * the first OPEN — today the injection backend, which decides whether a
+     * virtual touchscreen is created at all.
+     *
+     * Called once when the daemon starts: ui::start() loads the config too, but
+     * that happens when the *menu* opens, long after the panel may already have
+     * been taken. Returns the resulting backend's readiness.
+     */
+    external fun configLoad(): Int
+
+    /** Values for [injectSetBackend] / [injectGetBackend]; mirror inject_backend.h. */
+    const val INJECT_BACKEND_UINPUT = 0
+    const val INJECT_BACKEND_INPUT_MANAGER = 1
 
     /** Injection slot / tracking id (see UINPUT_SLOT_PRIMARY in uinput_inject.h). */
     const val INJECT_SLOT = 8
@@ -180,11 +243,40 @@ object ShellNative {
      */
     external fun captureConsuming(): Boolean
 
+    /**
+     * Whether anyone is reading frames — the half of the supervisor's decision
+     * that is not [captureWanted].
+     *
+     * It counts inference. The question it answers is "is anyone sampling
+     * pixels", and a running model is — the supervisor holds a mirror open on
+     * `captureWanted() && capturePreviewWanted()`, so excluding inference here
+     * left the detector with no frame source whenever the Capture page was
+     * closed, which presented as "inference only runs with that page open".
+     *
+     * It is still not the same flag as the switch, which is what keeps "capture
+     * off" meaningful: a reader with the switch off still fails the AND.
+     */
+    external fun capturePreviewWanted(): Boolean
+
     /** Side of the square the menu asked for, in pixels. */
     external fun captureWantedSize(): Int
 
     /** Reports whether a producer is live, so the preview can say which it is. */
     external fun captureSetRunning(running: Boolean)
+
+    /**
+     * Declares every frame produced so far dead, because the producer is gone.
+     *
+     * Called by [ScreenCapture.stop], right before [captureSetRunning]`(false)`.
+     * The frame generation is process-lifetime and never rewound, so without
+     * this the next mirror's first frame reads as "new" to a consumer that had
+     * already seen the previous mirror's last one — and the detector then runs
+     * on a picture of a display that no longer exists, carrying the crop origin
+     * of a screen that may since have changed shape. That is the "the boxes are
+     * old and sit in the wrong place" failure, and it only became reachable once
+     * inference could source its own frames.
+     */
+    external fun captureInvalidateFrames()
 
     // ── Model store (Add-Model page) ─────────────────────────────────────────
     //

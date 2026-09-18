@@ -22,7 +22,9 @@
 #include "ui/gui/sections/aim_section.h"
 #include "ui/gui/sections/capture_section.h"
 #include "ui/gui/sections/settings_section.h"
+#include "ui/gui/sections/touch_section.h"
 #include "ui/gui/sections/trigger_section.h"
+#include "ui/gui/sections/backflash_section.h"
 
 #define TAG "AimbotNg"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -116,9 +118,11 @@ json serialize() {
         json o;
         putSwitch(o, "on", a.enabled);
         putSlider(o, "kp", a.kp);
-        putSlider(o, "ki", a.ki);
         putSlider(o, "kd", a.kd);
-        putSlider(o, "kf", a.kf);
+        putSlider(o, "predictX", a.predictX);
+        putSlider(o, "predictY", a.predictY);
+        putSlider(o, "rate", a.rate);
+        putSlider(o, "smooth", a.smooth);
         putSlider(o, "dz", a.deadzone);
         putBox(o, "touch", a.touchArea.toggle.value,
                a.touchArea.x, a.touchArea.y, a.touchArea.w, a.touchArea.h,
@@ -154,6 +158,24 @@ json serialize() {
         j["trigger"] = std::move(o);
     }
     {
+        // Back-Flash page — every user-tuned value persisted so the swipe
+        // gesture keeps its settings across restarts. Same shape as the Aim /
+        // Trigger pages: master switch, the four sliders, the touch-area box,
+        // and the flash-category mask.
+        const auto& b = ui::sections::g_pageBackFlash;
+        json o;
+        putSwitch(o, "on", b.enabled);
+        putSlider(o, "flash", b.flashDelay);
+        putSlider(o, "reset", b.resetDelay);
+        putSlider(o, "slide", b.slideDistancePx);
+        putSlider(o, "ppf", b.maxPerFramePx);
+        putBox(o, "touch", b.touchArea.toggle.value,
+               b.touchArea.x, b.touchArea.y, b.touchArea.w, b.touchArea.h,
+               b.touchArea.placed);
+        o["mask"] = b.category.sel.mask;
+        j["backflash"] = std::move(o);
+    }
+    {
         const auto& c = ui::sections::g_pageCapture;
         json o;
         putSlider(o, "size", c.size);  // size only — the page switch is not stored
@@ -165,7 +187,22 @@ json serialize() {
         putSwitch(o, "fps", s.fpsOverlay);
         putSwitch(o, "antiShot", s.antiScreenshot);
         putSwitch(o, "boxes", s.showDetections);
+        putSwitch(o, "touchPass", s.touchPassthrough);
+        putSwitch(o, "contInf", s.continuousInference);
+        putCircle(o, "infArea", s.inferenceArea.toggle.value,
+                  s.inferenceArea.cx, s.inferenceArea.cy, s.inferenceArea.r,
+                  s.inferenceArea.placed);
         j["settings"] = std::move(o);
+    }
+    {
+        // The Touch page's own setting. Its panel dropdown is deliberately NOT
+        // stored — which /dev/input node is the touchscreen is a property of the
+        // device, not a preference, and a saved path would be wrong the moment
+        // the same config meets a second phone.
+        const auto& t = ui::sections::g_pageTouch;
+        json o;
+        o["inject"] = t.injectBackend.value;
+        j["touch"] = std::move(o);
     }
     return j;
 }
@@ -178,9 +215,11 @@ void apply(const json& j) {
         const json& o = *it;
         getSwitch(o, "on", a.enabled);
         getSlider(o, "kp", a.kp);
-        getSlider(o, "ki", a.ki);
         getSlider(o, "kd", a.kd);
-        getSlider(o, "kf", a.kf);
+        getSlider(o, "predictX", a.predictX);
+        getSlider(o, "predictY", a.predictY);
+        getSlider(o, "rate", a.rate);
+        getSlider(o, "smooth", a.smooth);
         getSlider(o, "dz", a.deadzone);
         bool on = false, placed = false;
         float x = -1, y = -1, w = 0, h = 0;
@@ -252,12 +291,58 @@ void apply(const json& j) {
     if (const auto it = j.find("capture"); it != j.end() && it->is_object()) {
         getSlider(*it, "size", ui::sections::g_pageCapture.size);
     }
+    if (const auto it = j.find("backflash"); it != j.end() && it->is_object()) {
+        auto& b = ui::sections::g_pageBackFlash;
+        const json& o = *it;
+        getSwitch(o, "on", b.enabled);
+        getSlider(o, "flash", b.flashDelay);
+        getSlider(o, "reset", b.resetDelay);
+        getSlider(o, "slide", b.slideDistancePx);
+        getSlider(o, "ppf", b.maxPerFramePx);
+        bool on = false, placed = false;
+        float x = -1, y = -1, w = 0, h = 0;
+        if (getBox(o, "touch", on, x, y, w, h, placed)) {
+            b.touchArea.toggle.value = on;
+            b.touchArea.toggle.anim  = on ? 1.0f : 0.0f;
+            b.touchArea.x = x; b.touchArea.y = y;
+            b.touchArea.w = w; b.touchArea.h = h;
+            b.touchArea.placed = true;
+        }
+        if (const auto m = o.find("mask"); m != o.end() && m->is_number_unsigned()) {
+            // A saved mask means the user has configured this page — claim it
+            // now so the first model sync keeps it instead of selecting all.
+            b.category.sel.mask = m->get<uint32_t>();
+            b.category.synced   = true;
+        }
+    }
     if (const auto it = j.find("settings"); it != j.end() && it->is_object()) {
         auto& s = ui::sections::g_pageSettings;
         const json& o = *it;
         getSwitch(o, "fps", s.fpsOverlay);
         getSwitch(o, "antiShot", s.antiScreenshot);
         getSwitch(o, "boxes", s.showDetections);
+        getSwitch(o, "touchPass", s.touchPassthrough);
+        getSwitch(o, "contInf", s.continuousInference);
+        bool on = false, placed = false;
+        float cx = -1, cy = -1, r = 0;
+        if (getCircle(o, "infArea", on, cx, cy, r, placed)) {
+            s.inferenceArea.toggle.value = on;
+            s.inferenceArea.toggle.anim  = on ? 1.0f : 0.0f;
+            s.inferenceArea.cx = cx;
+            s.inferenceArea.cy = cy;
+            s.inferenceArea.r  = r;
+            s.inferenceArea.placed = placed;
+        }
+    }
+    if (const auto it = j.find("touch"); it != j.end() && it->is_object()) {
+        if (const auto v = it->find("inject"); v != it->end() && v->is_number_integer()) {
+            // Clamped to the two backends that exist. A config written by a
+            // build with three of them must not index past the dropdown's items
+            // — the widget trusts this number.
+            const int wanted = v->get<int>();
+            auto& backend = ui::sections::g_pageTouch.injectBackend;
+            backend.value = (wanted == 0 || wanted == 1) ? wanted : 0;
+        }
     }
 }
 

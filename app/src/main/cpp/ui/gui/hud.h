@@ -98,14 +98,22 @@ void drawHud();
 /// The right pane switches on it, so the order here is also the top-to-bottom
 /// order of the rail buttons.
 enum class MenuSection {
-    Aim = 0,   // 自瞄
-    Trigger,   // 扳机
-    Model,     // 模型
-    Touch,     // 触摸
-    Capture,   // 画面 — picker size + live preview of what is being captured
-    Settings,  // 设置
+    Aim = 0,        // 自瞄
+    Trigger,        // 扳机
+    BackFlash,      // 背闪
+    Model,          // 模型
+    Touch,          // 触摸
+    Capture,        // 画面 — picker size + live preview of what is being captured
+    Settings,       // 设置
     Count,
 };
+
+/// Which pages get vertical scrolling. Capture is intentionally excluded —
+/// its rows fit on a single screen and a scroll would just steal drag
+/// gestures from the preview well the page already owns.
+inline bool sectionIsScrollable(MenuSection s) {
+    return s != MenuSection::Capture && s != MenuSection::Count;
+}
 
 /// The section currently highlighted in the rail. Persists across frames and
 /// is only ever written by a tap that lands on a rail button.
@@ -135,6 +143,29 @@ bool hudSettled();
 /// float button is on screen. Nothing on screen is moving and the loop can
 /// crawl.
 bool hudHidden();
+
+/// Scroll context for one right-pane section. Bundles the per-page offset with
+/// a small helper so each section paints at `y - sc.offset` but keeps `y`
+/// advancing in the *natural* (un-scrolled) coordinate space, the way the
+/// section's hit-test rectangles expect.
+///
+/// The natural-vs-shifted split lets the section report its true content
+/// height back to drawContent by simply returning the final `y` value — which
+/// is exactly the contract the scroll clamp needs (max scroll = content - view).
+struct Scroll {
+    float offset = 0.0f;          // surface px scrolled (>=0, <= maxOffset)
+    float maxOffset = 0.0f;       // computed by drawContent each frame
+
+    /// Surface-pixel y a row drawn at natural coordinate `y` should actually
+    /// appear at. Sections use this everywhere a Rect is built or xf.pt() is
+    /// called, so paint and hit-test stay in lock-step.
+    float screenY(float naturalY) const { return naturalY - offset; }
+
+    /// True when scrolling is worth driving on this page (content longer than
+    /// the viewport). A page that fits without scrolling still reports its
+    /// maxOffset == 0 so its offset stays parked at 0.
+    bool active() const { return maxOffset > 0.5f; }
+};
 
 }  // namespace ui
 }  // namespace aimbotng

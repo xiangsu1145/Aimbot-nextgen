@@ -285,6 +285,45 @@ LetterboxMap letterboxRgba(const FrameView& frame, const Roi& roi,
     const int w = p.targetW;
     const int h = p.targetH;
 
+    // ── Fast path: the crop already IS the tensor — see letterboxRgbaU8 ─────
+    //
+    // Same condition, different arithmetic: no scaling and no padding means
+    // each output pixel is one input pixel, so the weight tables are not
+    // consulted at all. This one does not vectorise as cleanly as the uint8
+    // case because it produces three floats per pixel, but it still removes a
+    // dependent table lookup per output channel.
+    const bool identityMap = (p.srcW == w && p.srcH == h &&
+                              p.map.padX == 0.0f && p.map.padY == 0.0f);
+    if (identityMap && !cfg.nchw) {
+        const float sc = cfg.scale;
+        const int c0 = cfg.bgr ? 2 : 0;
+        const int c2 = cfg.bgr ? 0 : 2;
+        const uint8_t* src = frame.pixels +
+                             static_cast<size_t>(p.srcY) * static_cast<size_t>(frame.rowStrideBytes) +
+                             static_cast<size_t>(p.srcX) * 4u;
+        for (int y = 0; y < h; ++y) {
+            const uint8_t* s = src + static_cast<size_t>(y) * static_cast<size_t>(frame.rowStrideBytes);
+            float* d = out + static_cast<size_t>(y) * static_cast<size_t>(w) * 3u;
+            for (int x = 0; x < w; ++x) {
+                float v[3] = {static_cast<float>(s[0]), static_cast<float>(s[1]),
+                              static_cast<float>(s[2])};
+                if (cfg.normalize) {
+                    // Means and stddevs are conventionally given in 0..255 units
+                    // even when the model wants 0..1; see the general path.
+                    for (int c = 0; c < 3; ++c) v[c] = (v[c] - cfg.mean[c]) * (1.0f / cfg.stdv[c]);
+                } else {
+                    for (int c = 0; c < 3; ++c) v[c] *= sc;
+                }
+                d[0] = v[c0];
+                d[1] = v[1];
+                d[2] = v[c2];
+                s += 4;
+                d += 3;
+            }
+        }
+        return p.map;
+    }
+
     // Padding first, so the bars are written even in the regions no tap covers.
     const float pad = clamp01(cfg.padValue);
     const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
@@ -336,6 +375,50 @@ LetterboxMap letterboxRgbaU8(const FrameView& frame, const Roi& roi,
 
     const int w = p.targetW;
     const int h = p.targetH;
+
+    // ── Fast path: the crop already IS the tensor ───────────────────────────
+    //
+    // The menu lets the crop size be set to whatever the model wants, and it
+    // usually is — so the overwhelmingly common case here is a source rect
+    // exactly the size of the target with no aspect padding. The general path
+    // handles that correctly (step 1.0 collapses every tap to a single weight
+    // of 1.0), but it gets there by reading a weight table and an index table
+    // per pixel, four multiplies and three adds per pixel, for a result that is
+    // a straight byte read.
+    //
+    // The gain is not the multiply — it is that this loop has no data-dependent
+    // branches, so it vectorises, and the RGBA->RGB pack becomes a shuffle
+    // instead of three scattered byte loads. Measured worth having: 640x640 is
+    // 400k pixels per frame at screen rate.
+    //
+    // Conditions, all of which make the mapping the identity: no padding was
+    // added, and no scaling happened. `keepAspect` is not excluded on its own —
+    // when the aspect already matches it computes padX = padY = 0 and newW/H
+    // equal to the crop, which is the identity in effect.
+    const int srcW = p.srcW;
+    const int srcH = p.srcH;
+    const bool identityMap = (srcW == w && srcH == h &&
+                              p.map.padX == 0.0f && p.map.padY == 0.0f);
+    if (identityMap && !cfg.nchw) {
+        const int c0 = cfg.bgr ? 2 : 0;
+        const int c2 = cfg.bgr ? 0 : 2;
+        const uint8_t* src = frame.pixels +
+                             static_cast<size_t>(p.srcY) * static_cast<size_t>(frame.rowStrideBytes) +
+                             static_cast<size_t>(p.srcX) * 4u;
+        for (int y = 0; y < h; ++y) {
+            const uint8_t* s = src + static_cast<size_t>(y) * static_cast<size_t>(frame.rowStrideBytes);
+            uint8_t* d = out + static_cast<size_t>(y) * static_cast<size_t>(w) * 3u;
+            for (int x = 0; x < w; ++x) {
+                d[0] = s[c0];
+                d[1] = s[1];
+                d[2] = s[c2];
+                s += 4;
+                d += 3;
+            }
+        }
+        return p.map;
+    }
+
     const uint8_t pad = static_cast<uint8_t>(
         std::lround(clamp01(cfg.padValue) * 255.0f));
     const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);

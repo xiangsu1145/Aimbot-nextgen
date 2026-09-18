@@ -18,10 +18,14 @@
 #include "inference/model_store.h"
 #include "inference/model_type.h"
 #include "ui/gui/hud.h"
+#include "ui/gui/notify.h"
+#include "ui/gui/sections/settings_section.h"
 #include "ui/gui/theme.h"
 
 #define TAG "AimbotInfer"
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 
 namespace aimbotng {
 namespace ui {
@@ -129,6 +133,47 @@ bool engineUsesCpuThreads(model::Engine e) {
            e == model::Engine::TfliteXnnpack;
 }
 
+/** Whether an engine row in the 推理引擎 dropdown should be dimmed and
+ *  un-pickable.
+ *
+ *  Only the backends whose library we dlopen at menu time can answer "no" —
+ *  NeuroPilot (libtflite_mtk.mtk.so, from the system image) and Neuron (the
+ *  APU adapter, libneuronusdk_adapter.mtk.so, also from the system image).
+ *  Both are simply absent on a Snapdragon, and both would otherwise let the
+ *  user pick a row that fails only once a model is loaded. Everything else
+ *  either links into this binary or is loaded when the model loads, and dimming
+ *  those here would hide a real error message behind a grey row.
+ *
+ *  The check costs one dlopen the first time the Model page draws and nothing
+ *  afterwards (epAvailable() caches), so it is safe to call per row per frame.
+ */
+bool engineRowDisabled(model::Engine e) {
+    // "No engine" is not a choice. engineAt() answers Engine::None for an
+    // out-of-range index, and the row that maps to None has nothing behind it
+    // — resolvePair() would fail with "this model has no runtime selected" —
+    // so it must not be selectable. Without this it fell through to the
+    // `return false` below and looked like a perfectly good option.
+    bool disabled = false;
+    if (e == model::Engine::None) {
+        disabled = true;
+    } else if (e == model::Engine::Neuron) {
+        disabled = !infer::runtime::engineAvailable(e);
+    } else if (e == model::Engine::NeuroPilot) {
+        disabled = !infer::runtime::engineAvailable(e);
+    }
+    LOGD("engineRowDisabled: engine=%d (%s) → disabled=%d",
+         static_cast<int>(e), model::engineLabel(e), disabled ? 1 : 0);
+    return disabled;
+}
+
+/** Fills the parallel `disabled` array widgets::dropdown() takes. `out` must
+ *  hold `count` entries; anything past the engine count is left untouched. */
+void fillEngineDisabled(model::Kind kind, bool* out, int count) {
+    for (int i = 0; i < count; ++i) {
+        out[i] = engineRowDisabled(model::engineAt(kind, i));
+    }
+}
+
 // ── HTP performance-mode picker ────────────────────────────────────────────────
 //
 // The dropdown index is the raw TfLiteQnnDelegateHtpPerformanceMode value, so
@@ -234,11 +279,21 @@ void selectFile(const std::string& path) {
     memcpy(pg.pathBuf, path.data(), n);
     pg.pathBuf[n] = '\0';
     pg.pathLen = static_cast<int>(n);
-    pg.engine.value = 0;      // a new file: the old engine index may not fit
+    // -1, not 0. The old engine index may well not fit the new file's kind —
+    // that is what this line is for — but 0 is a *valid* index and it maps to
+    // "NPU (LiteRT)" in the tflite list, so resetting to 0 does not mean
+    // "nothing chosen", it means "LiteRtNpu chosen". The Add button already
+    // gates on `pg.engine.value >= 0` and the dropdown already treats -1 as
+    // "no selection" (see the Unknown-kind branch below), so -1 is the value
+    // this screen was written against. Resetting to 0 silently enrolled every
+    // newly added .tflite on the LiteRT 2.x NPU path, which is the one that
+    // traps in __loader_android_link_namespaces and takes the process down.
+    pg.engine.value = -1;
     pg.pathPicking = false;
     pg.pathFailed = false;
     pg.pathErr[0] = '\0';
     g_fileBrowser.open = false;
+    LOGI("AddDialog: file selected path='%s'", pg.pathBuf);
     g_fileBrowser.dragScroll = false;
     // Peek the model's tensor element type so the XNNPACK caution (and the list
     // label) can react to FP16 without loading the whole graph yet.
@@ -538,10 +593,12 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
         pg.engine.value = -1;
         pg.engine.open  = false;
     }
+    bool engineDisabled[8] = {};
+    fillEngineDisabled(kind, engineDisabled, enginesCount);
     widgets::Rect engineRect{card.x + padX, yc, card.w - 2.0f * padX, 58.0f * s};
     const bool engineChanged = widgets::dropdown(dl, engineRect, pg.engine, label,
                       kind == model::Kind::Unknown ? engineDisplay : engines,
-                      enginesCount, es, false);
+                      enginesCount, es, false, engineDisabled);
     yc += 58.0f * s + padY;
 
     // 3. Confidence — the threshold detections are filtered by. Lives here as
@@ -565,12 +622,15 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
         yc += 80.0f * s + padY;
     }
 
-    // 4b. HTP performance-mode picker — only for the QNN HTP engine. Lets the
-    //     user vote the DSP/NPU scheduling profile (latency ↔ power/heat).
+    // 4b. HTP performance-mode picker — for the QNN HTP engine, and for the
+    //     LiteRT 2.x NPU engine because on a Snapdragon that one ends up on the
+    //     same Hexagon and takes the same vote. On MediaTek it is accepted and
+    //     ignored, which is harmless: the MediaTek path has its own options,
+    //     set unconditionally by the engine.
     widgets::Rect htpRect{};
     int htpCount = 0;
     const char* const* htpLabels = nullptr;
-    if (selEngine == model::Engine::QnnHtp) {
+    if (selEngine == model::Engine::QnnHtp || selEngine == model::Engine::LiteRtNpu) {
         htpLabels = htpPerfLabels(htpCount);
         htpRect = widgets::Rect{card.x + padX, yc, card.w - 2.0f * padX, 58.0f * s};
         widgets::dropdown(dl, htpRect, pg.htpPerf,
@@ -603,6 +663,11 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
         e.name       = model::baseName(e.path);
         e.kind       = kind;
         e.engine     = model::engineAt(kind, pg.engine.value);
+        LOGI("AddDialog: CONFIRM path='%s', kind=%d, engine=%d (%s), "
+             "dropdown index=%d",
+             e.path.c_str(), static_cast<int>(e.kind),
+             static_cast<int>(e.engine), model::engineLabel(e.engine),
+             pg.engine.value);
         // Peek the model's real input edge and class count so the list can
         // show "N classes • WxH" and so preprocessing feeds the right size.
         // Falls back to 640 when the size is not statically known.
@@ -629,7 +694,8 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     // exactly what made the list read as "under" the other controls.) The
     // Cancel/Add buttons keep their fixed position and are simply covered by
     // the floating popover while it is open — standard menu behaviour.
-    widgets::dropdownList(dl, engineRect, pg.engine, engines, enginesCount, es);
+    widgets::dropdownList(dl, engineRect, pg.engine, engines, enginesCount, es,
+                          engineDisabled);
     if (selEngine == model::Engine::QnnHtp && htpRect.w > 0.0f) {
         widgets::dropdownList(dl, htpRect, pg.htpPerf, htpLabels, htpCount, es);
     }
@@ -691,6 +757,12 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
         return;
     }
 
+    LOGD("SettingsDialog: editing model #%d '%s' (current engine=%d %s, "
+         "stored index=%d)",
+         current.id, current.name.c_str(),
+         static_cast<int>(current.engine), model::engineLabel(current.engine),
+         pg.settingsEngine.value);
+
     const float padY = 24.0f * s;
     float yc = card.y + titleH + padY;
 
@@ -710,9 +782,12 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
         engines = engineDisplay;
         enginesCount = 1;
     }
+    bool settingsEngineDisabled[8] = {};
+    fillEngineDisabled(current.kind, settingsEngineDisabled, enginesCount);
     widgets::Rect engineRect{card.x + padX, yc, card.w - 2.0f * padX, 58.0f * s};
     const bool settingsEngineChanged = widgets::dropdown(dl, engineRect, pg.settingsEngine,
-                                                      "推理引擎", engines, enginesCount, es, false);
+                                                      "推理引擎", engines, enginesCount, es, false,
+                                                      settingsEngineDisabled);
     yc += 58.0f * s + padY;
 
     // 2. Confidence.
@@ -734,11 +809,12 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
         yc += 80.0f * s + padY;
     }
 
-    // 3b. HTP performance-mode picker — only for the QNN HTP engine.
+    // 3b. HTP performance-mode picker — QNN HTP, and LiteRT 2.x NPU on a
+    //     Snapdragon (same Hexagon, same vote).
     widgets::Rect htpRect{};
     int htpCount = 0;
     const char* const* htpLabels = nullptr;
-    if (selEngine == model::Engine::QnnHtp) {
+    if (selEngine == model::Engine::QnnHtp || selEngine == model::Engine::LiteRtNpu) {
         htpLabels = htpPerfLabels(htpCount);
         htpRect = widgets::Rect{card.x + padX, yc, card.w - 2.0f * padX, 58.0f * s};
         widgets::dropdown(dl, htpRect, pg.settingsHtpPerf,
@@ -759,10 +835,44 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
     }
     if (widgets::button(dl, saveRect, "保存", widgets::ButtonVariant::Primary, es)) {
         const int threads = static_cast<int>(pg.settingsThreadsSlider.value + 0.5f);
-        model::setInference(pg.settingsId,
-                            model::engineAt(current.kind, pg.settingsEngine.value),
-                            pg.settingsConf.value, threads,
-                            clampHtpPerf(pg.settingsHtpPerf.value));
+        // A negative index means the dropdown has no selection — either the
+        // entry's stored engine has no row in this build, or a file was picked
+        // but no engine chosen yet. engineAt() would answer Engine::None for
+        // it, and passing None to setInference() would persist "no engine" and
+        // wipe a working selection. Keep the entry's engine in that case and
+        // save only the fields the dialog can speak for.
+        const bool haveEngine = pg.settingsEngine.value >= 0;
+        const model::Engine newEngine =
+            haveEngine ? model::engineAt(current.kind, pg.settingsEngine.value)
+                       : current.engine;
+        const float newConf   = pg.settingsConf.value;
+        const int   newHtp    = clampHtpPerf(pg.settingsHtpPerf.value);
+
+        // Did anything that the *compiled graph* depends on change? Engine,
+        // thread count and HTP vote are all baked in at delegate-build time, so
+        // a change to any of them leaves the live interpreter holding the old
+        // one — and prepare()'s fast path (`engineReady && same id`) cannot see
+        // it. Read the previous values before the write below clobbers them.
+        const bool engineChanged =
+            current.engine != newEngine || current.cpuThreads != threads ||
+            current.htpPerfMode != newHtp;
+
+        LOGI("SettingsDialog: SAVE model #%d '%s' — old engine=%d (%s), "
+             "new engine=%d (%s), threads=%d, htpPerf=%d, conf=%.2f, "
+             "engineChanged=%d",
+             current.id, current.name.c_str(),
+             static_cast<int>(current.engine), model::engineLabel(current.engine),
+             static_cast<int>(newEngine),    model::engineLabel(newEngine),
+             threads, newHtp, newConf, engineChanged ? 1 : 0);
+
+        model::setInference(pg.settingsId, newEngine, newConf, threads, newHtp);
+
+        // Confidence, by contrast, is applied per frame by the session's
+        // post-processing, so it is picked up on the next inference and must NOT
+        // trigger a recompile — that would turn a slider drag into a 20-second
+        // stall the next time the user held the area.
+        if (engineChanged) infer::runtime::invalidateEngine();
+
         pg.dialog = ModelDialogState::Closed;
     }
 
@@ -770,7 +880,8 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
     // floats above the Cancel/Save buttons instead of being painted over.
     // The buttons keep their fixed position and are just covered by the
     // floating popover while it is open.
-    widgets::dropdownList(dl, engineRect, pg.settingsEngine, engines, enginesCount, es);
+    widgets::dropdownList(dl, engineRect, pg.settingsEngine, engines, enginesCount, es,
+                          settingsEngineDisabled);
     if (selEngine == model::Engine::QnnHtp && htpRect.w > 0.0f) {
         widgets::dropdownList(dl, htpRect, pg.settingsHtpPerf, htpLabels, htpCount, es);
     }
@@ -783,13 +894,16 @@ bool anyDialogOpen() {
 }
 
 void drawModelSection(ImDrawList* dl, float x, float& y, float w,
-                      float bottomY, float s, float es, const Xf& xf) {
+                      float bottomY, float s, float es, const Xf& xf,
+                      Scroll& sc) {
     PageModel& pg = g_pageModel;
     const float gap = kModelRowGap * s;
     ImFont* font = ImGui::GetFont();
 
     auto wRect = [&](float wx, float wy, float ww, float wh) {
-        const ImVec2 p = xf.pt(wx, wy);
+        // Shift by the page's scroll offset so paint and hit-test agree on the
+        // visual y. `y` keeps advancing in the natural coordinate space.
+        const ImVec2 p = xf.pt(wx, wy - sc.offset);
         return widgets::Rect{p.x, p.y, xf.s(ww), xf.s(wh)};
     };
 
@@ -880,7 +994,8 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
         char detail[48];
         if (engineUsesCpuThreads(e.engine)) {
             snprintf(detail, sizeof(detail), "threads %d", e.cpuThreads);
-        } else if (e.engine == model::Engine::QnnHtp) {
+        } else if (e.engine == model::Engine::QnnHtp ||
+                   e.engine == model::Engine::LiteRtNpu) {
             snprintf(detail, sizeof(detail), "htp %d", e.htpPerfMode);
         } else {
             detail[0] = '\0';
@@ -909,6 +1024,15 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
                             "Setting",
                              widgets::ButtonVariant::Ghost, es) && !dialogOpen) {
             pg.settingsId = e.id;
+            LOGI("ModelList: tap Setting on model #%d '%s' (engine=%d %s)",
+                 e.id, e.name.c_str(),
+                 static_cast<int>(e.engine), model::engineLabel(e.engine));
+            // engineIndex() returns -1 when this build has no row for the
+            // entry's engine — the honest answer is "nothing selected", and
+            // the dropdown and the Save guard below both understand -1. The
+            // value must NOT be coerced to 0 here: 0 is "NPU (LiteRT)", so a
+            // stored NeuroPilot/absent engine would open this dialog showing
+            // LiteRtNpu and Save would persist that over the user's choice.
             pg.settingsEngine.value = model::engineIndex(e.kind, e.engine);
             pg.settingsEngine.open  = false;
             pg.settingsConf.value   = e.confidence;
@@ -939,9 +1063,9 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
 
 /// Spins up a background thread that runs the (potentially multi-second)
 /// graph compile, and puts the page into the Compiling state so the overlay
-/// can show progress. A successful load starts the inference loop; a failed
-/// one keeps the switch where it is and surfaces the reason through
-/// `compileError`.
+/// can show progress. A successful prepare() leaves the engine ready (no
+/// frames flowing yet); a failed one keeps the switch where it is and
+/// surfaces the reason through `compileError`.
 ///
 /// `killed` is set to true on the way out when the call is being made
 /// redundant (the user turned the switch off again, or swapped to
@@ -981,13 +1105,38 @@ void startCompileAsync(int modelId, std::atomic<bool>* killed) {
             if (!found) {
                 s = infer::Status::bad("the model is no longer in the list");
             } else {
-                // The page state is the source of truth for "is inference
-                // wanted right now" — re-check it inside the worker in case
-                // the user flipped the switch off again before we got here.
-                const bool wantRun =
-                    g_pageModel.enabled.value && model::loadedId() == modelId;
-                if (wantRun) {
-                    s = infer::runtime::start();
+                // Load-time compile, not load-time inference. The user no
+                // longer pays the 1–3 s cold start the moment they want a
+                // detection — they pay it once at Load, and later arm() is
+                // a flag flip. If the master switch is already on, arm now
+                // so they do not need a second tap; if not, arm() will be
+                // called by syncModelPage() on the turnedOn edge and the
+                // engine will be hot by then anyway.
+                //
+                // The toast and the modal card are raised together, on purpose.
+                // The card is this page's own surface and is right for a user
+                // who is watching the Model page; the toast is the one that
+                // survives the menu being closed or the page being switched,
+                // which is what happens when the user flips the switch and
+                // immediately goes back to the Settings page to hold the area.
+                notify::post(notify::kCompileTag, notify::Kind::Info,
+                                 "模型编译中  正在准备引擎", 0.0f, 0.05f);
+                notify::publishProgress(notify::kCompileTag, 0.20f);
+
+                s = infer::runtime::prepare();
+
+                if (s.ok) {
+                    notify::publishProgress(notify::kCompileTag, 1.0f);
+                    notify::post(notify::kCompileTag, notify::Kind::Success,
+                                     "模型编译完成", 2.5f, 1.0f);
+                    if (g_pageModel.enabled.value) {
+                        infer::runtime::arm();
+                    }
+                } else {
+                    notify::publishProgress(notify::kCompileTag, -1.0f);
+                    notify::post(notify::kCompileTag, notify::Kind::Error,
+                                     ("模型编译失败: " + s.message).c_str(),
+                                     8.0f, -1.0f);
                 }
             }
 
@@ -1012,6 +1161,32 @@ void syncModelPage() {
     const bool on = g_pageModel.enabled.value;
     const int  id = model::loadedId();
 
+    // ── Triggered mode: this page has no authority ──────────────────────────
+    // With continuous inference OFF, the Settings page's inference-area circle
+    // owns arm/disarm, and hud.cpp forces this page's switch off and grey
+    // precisely so the user cannot reach it. But that forcing is itself an
+    // edge: the switch reads ON for one frame (it was left on when the user
+    // visited Settings), then hud.cpp writes it off, and this function — which
+    // runs before hud.cpp's write, on the very next frame — sees ON → OFF and
+    // treats it as the user turning inference off.
+    //
+    // The result was a race over `disarm()` against the held-finger handler:
+    // whichever ran second won, so a finger already down could be disarmed by
+    // a switch the user cannot even see, and holding the area would work or not
+    // depending on the frame order.
+    //
+    // So: in triggered mode this function only tracks the two values it watches,
+    // and touches nothing. The track is still updated (rather than returning
+    // early before it) so that leaving triggered mode does not look like a
+    // spontaneous edge to the code below.
+    if (!g_pageSettings.continuousInference.value) {
+        if (on != lastOn || id != lastLoadedId) {
+            lastOn = on;
+            lastLoadedId = id;
+        }
+        return;
+    }
+
     if (on == lastOn && id == lastLoadedId) return;
 
     const bool turnedOn  = on && !lastOn;
@@ -1022,7 +1197,11 @@ void syncModelPage() {
     lastLoadedId = id;
 
     if (turnedOff) {
-        infer::runtime::stop();
+        // Master switch flipped off. Disarm only — the engine stays loaded
+        // so flipping the switch back on is instant. A full stop() (which
+        // unloads the engine and pays the next-load cost) only happens when
+        // the loaded model itself goes away, see the !hasModel branch below.
+        infer::runtime::disarm();
         return;
     }
     if (!on) return;
@@ -1033,6 +1212,24 @@ void syncModelPage() {
     // model graph compiles, and so a model that fails to load shows the
     // reason instead of a silent switch flip back.
     if (turnedOn || swapped) {
+        // No entry carries the loaded flag (or the flagged entry vanished):
+        // there is nothing to compile. Do NOT enter the Compiling overlay
+        // with a made-up "(model)" name — show the Chinese hint instead and
+        // flip the switch back off so it never reads ON with nothing running.
+        bool hasModel = false;
+        if (id > 0) {
+            for (const model::Entry& e : model::all()) {
+                if (e.id == id) { hasModel = true; break; }
+            }
+        }
+        if (!hasModel) {
+            infer::runtime::stop();
+            g_pageModel.enabled.value = false;
+            g_pageModel.dialog = ModelDialogState::NoModel;
+            lastOn = false;
+            lastLoadedId = id;
+            return;
+        }
         static std::atomic<bool> killed{false};
         killed.store(false);
         startCompileAsync(id, &killed);
@@ -1101,9 +1298,9 @@ void drawCompilingDialog(ImDrawList* dl, const HudRect& board, float s, float es
     if (found) {
         displayName = e.name.empty() ? model::baseName(e.path) : e.name;
     } else {
-        displayName = "(model)";
+        displayName = "(未知模型)";
     }
-    snprintf(title, sizeof(title), "Compiling %s", displayName.c_str());
+    snprintf(title, sizeof(title), "正在加载 %s", displayName.c_str());
 
     // The three dots that march across. They grow in opacity at 1-second
     // intervals (so the cycle is . .. ... . .. ... over three seconds),
@@ -1136,24 +1333,75 @@ void drawCompilingDialog(ImDrawList* dl, const HudRect& board, float s, float es
 
     // If the worker has failed, drop the dots and show the reason. The
     // switch stays where the user put it; the only way out is a tap on
-    // "Close" (or the page-level retry of toggling the switch off and on).
+    // "关闭" (or the page-level retry of toggling the switch off and on).
     if (pg.compileDone.load() && !pg.compileOk) {
         const float btnW = 200.0f * s;
         const float btnH = 64.0f * s;
         widgets::Rect btn{cx - btnW * 0.5f, cmax.y - btnH - 24.0f * s, btnW, btnH};
-        if (widgets::button(dl, btn, "Close",
+        if (widgets::button(dl, btn, "关闭",
                              widgets::ButtonVariant::Primary, es)) {
             pg.dialog = ModelDialogState::Closed;
         }
 
         char msg[256];
-        snprintf(msg, sizeof(msg), "Failed: %s",
-                 pg.compileError.empty() ? "(no detail)" : pg.compileError.c_str());
+        snprintf(msg, sizeof(msg), "加载失败: %s",
+                 pg.compileError.empty() ? "(无详细信息)" : pg.compileError.c_str());
         const std::string cut = ellipsize(
             font, 18.0f * s, msg, w - 2.0f * padX - 16.0f * s);
         dl->AddText(font, 18.0f * s,
                     ImVec2(cmin.x + padX, cmax.y - btnH - 24.0f * s - 36.0f * s),
                     xf.col(IM_COL32(255, 96, 96, 255)), cut.c_str());
+    }
+}
+
+/// Chinese hint shown when the inference switch is flipped on while no model
+/// is loaded. There is nothing to compile, so this replaces the Compiling
+/// overlay entirely: same small centered card style, outside-tap or the
+/// "知道了" button dismisses it. The switch has already been flipped back
+/// off by syncModelPage() before this is shown.
+void drawNoModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
+                       const Xf& xf) {
+    PageModel& pg = g_pageModel;
+
+    const ImVec2 min(board.x, board.y);
+    const ImVec2 max(board.x + board.w, board.y + board.h);
+    dl->AddRectFilled(xf.pt(min), xf.pt(max),
+                      xf.col(IM_COL32(0, 0, 0, 160)));
+
+    const float w = 560.0f * s;
+    const float h = 260.0f * s;
+    const float cx = board.x + board.w * 0.5f;
+    const float cy = board.y + board.h * 0.5f;
+    const ImVec2 cmin(cx - w * 0.5f, cy - h * 0.5f);
+    const ImVec2 cmax(cx + w * 0.5f, cy + h * 0.5f);
+
+    widgets::Rect card{cmin.x, cmin.y, w, h};
+    if (closeOnOutsideTap(card)) {
+        pg.dialog = ModelDialogState::Closed;
+        return;
+    }
+
+    dl->AddRectFilled(cmin, cmax, xf.col(PaneRight), xf.s(20.0f * s));
+    dl->AddRect(cmin, cmax, xf.col(Edge), xf.s(20.0f * s), 0, xf.s(1.0f * s));
+
+    ImFont* font = ImGui::GetFont();
+    const float padX = 40.0f * s;
+    dl->AddText(font, 30.0f * s,
+                ImVec2(cmin.x + padX, cmin.y + 36.0f * s),
+                xf.col(TextPrimary), "未选择模型");
+    dl->AddText(font, 20.0f * s,
+                ImVec2(cmin.x + padX, cmin.y + 92.0f * s),
+                xf.col(TextMuted), "请先在模型列表中点击 Load");
+    dl->AddText(font, 20.0f * s,
+                ImVec2(cmin.x + padX, cmin.y + 122.0f * s),
+                xf.col(TextMuted), "选择一个模型，再打开推理开关。");
+
+    const float btnW = 200.0f * s;
+    const float btnH = 64.0f * s;
+    widgets::Rect btn{cx - btnW * 0.5f, cmax.y - btnH - 24.0f * s, btnW, btnH};
+    if (widgets::button(dl, btn, "知道了",
+                        widgets::ButtonVariant::Primary, es)) {
+        pg.dialog = ModelDialogState::Closed;
     }
 }
 
@@ -1169,6 +1417,11 @@ void drawModelOverlays(ImDrawList* dl, float s, float es, const Xf& xf) {
 
     if (g_pageModel.dialog == ModelDialogState::Compiling) {
         drawCompilingDialog(dl, board, s, es, xf);
+        return;
+    }
+
+    if (g_pageModel.dialog == ModelDialogState::NoModel) {
+        drawNoModelDialog(dl, board, s, es, xf);
         return;
     }
 

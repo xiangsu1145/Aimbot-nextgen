@@ -292,5 +292,55 @@ bool detectModelShape(const std::string& path, int& w, int& h, int& classes) {
     }
 }
 
+bool detectTfliteOutputQuant(const std::string& path,
+                             std::vector<float>& scales,
+                             std::vector<int32_t>& zeroPoints) {
+    TfLiteModel* model = TfLiteModelCreateFromFile(path.c_str());
+    if (model == nullptr) return false;
+
+    TfLiteInterpreterOptions* opts = TfLiteInterpreterOptionsCreate();
+    if (opts == nullptr) {
+        TfLiteModelDelete(model);
+        return false;
+    }
+    TfLiteInterpreterOptionsSetNumThreads(opts, 1);
+
+    TfLiteInterpreter* interp = TfLiteInterpreterCreate(model, opts);
+    TfLiteInterpreterOptionsDelete(opts);
+
+    bool ok = false;
+    if (interp != nullptr &&
+        TfLiteInterpreterAllocateTensors(interp) == kTfLiteOk) {
+        const int n = TfLiteInterpreterGetOutputTensorCount(interp);
+        if (n > 0) {
+            scales.assign(static_cast<size_t>(n), 0.0f);
+            zeroPoints.assign(static_cast<size_t>(n), 0);
+            ok = true;
+            for (int i = 0; i < n; ++i) {
+                const TfLiteTensor* t =
+                    TfLiteInterpreterGetOutputTensor(interp, i);
+                if (t == nullptr) { ok = false; break; }
+                scales[static_cast<size_t>(i)]     = t->params.scale;
+                zeroPoints[static_cast<size_t>(i)] = t->params.zero_point;
+                // An unquantised tensor reports scale 0, and a per-channel one
+                // can too. Neither is a pair this caller can dequantise with,
+                // so the whole probe fails rather than half-filling the
+                // arrays: a caller that trusts a zero scale silently scales
+                // every score to zero, which looks exactly like "the model
+                // sees nothing" and is miserable to trace back to here.
+                if (!(t->params.scale > 0.0f)) ok = false;
+            }
+        }
+    }
+
+    if (interp != nullptr) TfLiteInterpreterDelete(interp);
+    TfLiteModelDelete(model);
+    if (!ok) {
+        scales.clear();
+        zeroPoints.clear();
+    }
+    return ok;
+}
+
 }  // namespace infer
 }  // namespace aimbotng

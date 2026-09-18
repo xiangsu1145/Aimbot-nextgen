@@ -67,6 +67,21 @@ void pushFrame(const void* rgba, int srcWidth, int srcHeight, int stride,
 /// caller size its destination before asking for the pixels.
 bool peekSize(int& outW, int& outH);
 
+/// Invalidates every frame produced so far.
+///
+/// Called when the *producer* goes away (the virtual display is torn down). The
+/// frame id is process-lifetime and never rewound, so without this the next
+/// session's first copy would look "new" to a consumer that had already seen the
+/// previous session's last frame — and the consumer would run on pixels from a
+/// display that no longer exists, with the crop origin of a screen that may have
+/// since changed shape.
+///
+/// The id is *bumped* rather than zeroed: every existing holder of a last-seen
+/// id then fails its comparison and re-reads, which is exactly the intent, and
+/// it reuses the one mechanism already in place instead of adding a second
+/// "is this stale" flag for callers to forget.
+void invalidateFrames();
+
 /// Copies the newest frame into `dst` if it is newer than the id in `lastId`
 /// (which is updated in place). Returns false when there is nothing new, or when
 /// `dstBytes` is too small for it.
@@ -101,6 +116,25 @@ bool cropOrigin(int& outX, int& outY);
 /// honest about what the producer is doing.
 void setConsuming(bool on);
 bool consuming();
+
+/// Whether the menu is sampling frames — the *reader* half of the supervisor's
+/// decision, independent of the capture switch (`enabled()`).
+///
+/// The capture supervisor holds a virtual display open on `enabled() &&
+/// previewWanted()`. The point of the split is that the switch must mean what it
+/// says: if the second half were `consuming()` on its own, holding to infer would
+/// keep a mirror alive with the switch off, and turning capture off would change
+/// nothing visible — the failure that made this flag necessary.
+///
+/// It is deliberately NOT "the preview page is open". Inference is a reader of
+/// frames in its own right, so it belongs on this side of the AND: with the
+/// Capture page closed and a model running, the supervisor must still see a
+/// reader, or it tears the mirror down and the detector is starved — which is
+/// exactly how "inference only works with the Capture page open" happened. The
+/// switch remains the user's authority; a decoder that wants frames with the
+/// switch off still gets nothing, because that half of the AND is false.
+void setPreviewWanted(bool on);
+bool previewWanted();
 
 // ── Renderer -> frame thread ─────────────────────────────────────────────────
 

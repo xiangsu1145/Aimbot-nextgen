@@ -65,6 +65,9 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++17", "-fexceptions")
+                val haveNeuropilot = (project.findProperty("aimbot.haveNeuropilot") as String?)?.toBoolean() ?: true
+                // Private Neuron APU backend gate. See gradle.properties.
+                val haveNeuron = (project.findProperty("aimbot.haveNeuron") as String?)?.toBoolean() ?: true
                 arguments += listOf(
                     // Static C++ runtime: the privileged shell daemon dlopen()s
                     // libaimbotng.so by absolute path, where the linker would
@@ -72,7 +75,11 @@ android {
                     // platform one (a different, possibly older ABI). Linking it
                     // in removes that dependency entirely.
                     "-DANDROID_STL=c++_static",
-                    "-DANDROID_TOOLCHAIN=clang"
+                    "-DANDROID_TOOLCHAIN=clang",
+                    // Closed-source backend gate. See gradle.properties.
+                    "-DAIMBOTNG_HAVE_NEUROPILOT=${if (haveNeuropilot) "ON" else "OFF"}",
+                    // Private Neuron APU delegate gate. See gradle.properties.
+                    "-DAIMBOTNG_HAVE_NEURON=${if (haveNeuron) "ON" else "OFF"}"
                 )
             }
         }

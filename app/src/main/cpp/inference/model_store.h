@@ -49,6 +49,22 @@ enum class Engine {
     OnnxCpu,       // .onnx — plain ORT/MLAS CPU, no XNNPACK. For FP16 / XNNPACK-incompatible models
     TfliteXnnpack, // .tflite — explicit XNNPACK delegate on top of the default
     TfliteGpu,     // .tflite — GPU delegate (OpenCL)
+    LiteRtNpu,     // .tflite — LiteRT 2.x vendor dispatch: MediaTek Neuron /
+                   //           Qualcomm HTP. Different runtime from TfliteGpu's,
+                   //           same file format.
+    NeuroPilot,    // .tflite — MediaTek NeuroPilot (libtflite_mtk.mtk.so), the
+                   //           APU path. A third runtime again, and the only
+                   //           one whose .so comes from the system image.
+    Neuron,        // .tflite — MediaTek APU driven through the Neuron adapter
+                   //           (libneuronusdk_adapter.mtk.so) with Google's own
+                   //           TFLite interpreter underneath. Not the same thing
+                   //           as NeuroPilot: no MediaTek TFLite fork is used,
+                   //           only the delegate/APU half of their SDK.
+                   //
+                   // Appended last on purpose. This enum is persisted as an int
+                   // in the model store, so inserting anywhere but the end
+                   // would silently re-label every model already saved on
+                   // device (a stored 5 would become a different engine).
 };
 
 /// One entry in the list. `loaded` is a marker, not a state of the runtime: at
@@ -101,8 +117,14 @@ const char* const* enginesFor(Kind kind, int& count);
 /// is out of range. Kept next to enginesFor() so the two cannot drift apart.
 Engine engineAt(Kind kind, int index);
 
-/// The index engineAt() would map back to `engine`, or 0. Used to place the
-/// dropdown on an entry that is being edited.
+/// The index engineAt() would map back to `engine`, or **-1** when this build
+/// has no row for it. Used to place the dropdown on an entry that is being
+/// edited.
+///
+/// Negative is not interchangeable with 0: 0 is a valid index that names a
+/// real engine, so a caller that clamped this to 0 would show — and on Save
+/// persist — an engine the user never chose. Callers must skip the write when
+/// this returns a negative value.
 int engineIndex(Kind kind, Engine engine);
 
 /// "file.onnx" -> "file", for pre-filling the name field.

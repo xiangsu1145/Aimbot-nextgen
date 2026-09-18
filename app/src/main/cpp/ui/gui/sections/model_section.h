@@ -25,7 +25,10 @@ namespace sections {
 /// Compiling is a modal-only state — it is drawn by drawModelOverlays but
 /// does not replace the underlying list view, which stays paintable behind
 /// the scrim so the user has a frame of context while waiting.
-enum class ModelDialogState { Closed, Adding, Settings, Compiling };
+/// NoModel is the Chinese hint shown when the inference switch is flipped on
+/// while no entry carries the loaded flag — there is nothing to compile, so
+/// the Compiling overlay must not appear at all.
+enum class ModelDialogState { Closed, Adding, Settings, Compiling, NoModel };
 
 struct PageModel {
     ModelDialogState dialog = ModelDialogState::Closed;
@@ -92,7 +95,8 @@ extern PageModel g_pageModel;
 
 /// Draw the Model page's list of entries + the "Add Model" button.
 void drawModelSection(ImDrawList* dl, float x, float& y, float w,
-                      float bottomY, float s, float es, const Xf& xf);
+                      float bottomY, float s, float es, const Xf& xf,
+                      Scroll& sc);
 
 /// Publishes the page's switch and the loaded-model choice to the inference
 /// runtime. Called once per frame by the board, and cheap: it does work only on
@@ -113,8 +117,9 @@ void syncModelPage();
 void setModelSwitch(bool on);
 bool modelSwitch();
 
-/// Draws whichever dialog is open — Add-Model, the per-model Settings card, or
-/// the file browser sitting on top of either. No-op when nothing is open.
+/// Draws whichever dialog is open — Add-Model, the per-model Settings card,
+/// the Compiling overlay, the no-model Chinese hint, or the file browser
+/// sitting on top of either. No-op when nothing is open.
 void drawModelOverlays(ImDrawList* dl, float s, float es, const Xf& xf);
 
 /// True while any modal layer is up (Add / Settings / Compiling dialog, or

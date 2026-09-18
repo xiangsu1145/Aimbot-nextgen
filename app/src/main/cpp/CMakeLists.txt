@@ -4,6 +4,28 @@ project("aimbotng" LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ── MediaTek NeuroPilot (closed-source backend) ─────────────────────
+# NeuroPilot ships as /system_ext/lib64/libtflite_mtk.mtk.so on MediaTek
+# devices and is reached via a proprietary SDK header. Neither the header
+# nor the SDK are redistributable, so they are not in this repo. The
+# source files are kept out of .gitignore excludes.
+#
+# ON (default):  the engine is compiled in. Developer machines have the
+#                SDK installed locally and get the MediaTek APU path.
+# OFF:            NeuroPilot is not compiled. The engine.cpp / model_store
+#                / model_runtime sites are #ifdef'd out so the build is
+#                clean without the SDK. Used by GitHub CI and by anyone
+#                building without MediaTek hardware.
+option(AIMBOTNG_HAVE_NEUROPILOT "Build the MediaTek NeuroPilot backend (proprietary SDK)" ON)
+
+# MediaTek Neuron APU delegate — private backend, intentionally NOT in the repo.
+# This is the project's own TFLite delegate (neuron_delegate.cpp) talking to the
+# vendor NeuronAdapter at runtime, distinct from NeuroPilot (MediaTek's TFLite
+# fork) above. The source files live only on developer machines (see .gitignore).
+# Default ON so local builds pick up the APU path; public CI builds pass
+# -DAIMBOTNG_HAVE_NEURON=OFF.
+option(AIMBOTNG_HAVE_NEURON "Build the MediaTek Neuron APU delegate (private)" ON)
+
 # Debug builds get -O2 as well as -g.
 #
 # The NDK's default Debug profile is -O0, and this library is not a program that
@@ -45,11 +67,13 @@ set(NATIVE_SOURCES
     ui/gui/aimbot_ui.cpp            # ImGui over Vulkan (renderer + input)
     ui/gui/hud.cpp                  # the menu board shell (rail, layout, animation)
     ui/gui/float_button.cpp         # the always-on HUD toggle button
+    ui/gui/notify.cpp               # bottom-right toasts (compile progress, capture warnings)
     ui/gui/widgets.cpp              # switch / slider / dropdown / button / text-field controls
     ui/gui/fonts.cpp                # embedded Latin + Chinese ImGui fonts
     ui/gui/sections/aim_section.cpp         # Aim page (自瞄)
     tracking/kalman_tracker.cpp             # multi-target Kalman tracker (smoothing + lead)
     ui/gui/sections/trigger_section.cpp     # Trigger page (扳机)
+    ui/gui/sections/backflash_section.cpp   # Back-Flash page (背闪)
     ui/gui/sections/model_section.cpp       # Model page + Add-Model dialog + file browser
     ui/gui/sections/touch_section.cpp       # Touch page (触摸)
     ui/gui/sections/capture_section.cpp     # Capture page + live preview
@@ -65,6 +89,10 @@ set(NATIVE_SOURCES
     inference/model_type.cpp        # file-level dtype probe (ONNX + TFLite)
     inference/ort_engine.cpp        # ONNX Runtime: XNNPACK and plain CPU
     inference/litert_engine.cpp     # LiteRT (TFLite): CPU/XNNPACK/NNAPI/GPU delegates
+    inference/litert_npu_engine.cpp # LiteRT 2.x: vendor NPU dispatch (MediaTek/Qualcomm)
+    # inference/neuron_delegate.cpp / inference/neuron_engine.cpp are added
+    # conditionally below (AIMBOTNG_HAVE_NEURON) — they are not in the repo.
+    inference/shared_region.cpp     # ashmem/memfd region shared with the capture thread
     inference/session.cpp           # worker thread + drop-newest frame mailbox
     inference/model_runtime.cpp     # the platform's front door: start/stop/pump
     input/uinput_inject.cpp         # /dev/uinput touch injection + mirroring
@@ -124,6 +152,35 @@ add_library(${PROJECT_NAME} SHARED
     ${EMBEDDED_FONT_OBJECTS}
 )
 
+if(AIMBOTNG_HAVE_NEUROPILOT)
+    # Closed-source backend: header and .cpp live outside the repo on
+    # developer machines. See the option block above.
+    target_sources(${PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/inference/neuropilot_engine.cpp
+    )
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AIMBOTNG_HAVE_NEUROPILOT=1)
+else()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AIMBOTNG_HAVE_NEUROPILOT=0)
+endif()
+
+if(AIMBOTNG_HAVE_NEURON)
+    # Private backend: the delegate (neuron_delegate.cpp) and its engine
+    # (neuron_engine.cpp) are the project's own code but are kept out of the
+    # repo (see .gitignore). They are only present on developer machines that
+    # have them; the public build / CI passes -DAIMBOTNG_HAVE_NEURON=OFF and
+    # the binary is built without the APU path.
+    target_sources(${PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/inference/neuron_engine.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/inference/neuron_delegate.cpp
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AIMBOTNG_HAVE_NEURON=1)
+else()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AIMBOTNG_HAVE_NEURON=0)
+endif()
+
 # Module headers are included relative to the cpp root, e.g.
 #   #include "ui/gui/aimbot_ui.h"
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -137,6 +194,15 @@ if(HAS_IMGUI)
         ${IMGUI_DIR}/backends
     )
 endif()
+
+# ── LiteRT 2.x headers (headers only — the .so is dlopened, not linked) ──
+#
+# litert_tensor_buffer.h includes <CL/cl.h> whenever OpenCL is enabled, and the
+# NDK ships no OpenCL headers. The switch is a *header* switch: it hides the
+# OpenCL buffer types and the cl_mem helpers from our compilation unit. It does
+# not change what the already-built libLiteRt.so can do at runtime, and this
+# backend asks for NPU + CPU only, so nothing it calls is behind the switch.
+target_compile_definitions(${PROJECT_NAME} PRIVATE LITERT_DISABLE_OPENCL_SUPPORT=1)
 
 target_link_libraries(${PROJECT_NAME}
     ${log-lib}

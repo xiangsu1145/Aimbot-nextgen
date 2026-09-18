@@ -237,6 +237,48 @@ void LiteRtEngine::setConfidence(float c) {
 
 namespace {
 
+/// Stand-in return type for a TFLite factory that hands back an options struct
+/// by value.
+///
+/// AAPCS64 splits aggregates at 16 bytes: up to that they come back in x0/x1,
+/// above it the *caller* passes the address of a buffer in x8 and the callee
+/// fills it. Which form a call uses is decided by the declared return type
+/// alone, so a declaration smaller than the .so's real struct is a crash with
+/// no compiler diagnostic at all: nothing sets x8 and the callee stores
+/// through whatever x8 happens to hold. That is exactly this one:
+///
+///   #00 pc 0x9fd64 libtensorflowlite_jni.so (TfLiteXNNPackDelegateOptionsDefault+4)
+///   #01 pc 0xa98b70 libaimbotng.so (LiteRtEngine::load+1008)
+///   x8 = 0x2, fault addr 0x2
+///
+/// Disassembling that .so (BuildId 385d6d92…) settled the size:
+///
+///   9fd64: stp xzr, xzr, [x8]      ; +0..+15
+///   9fd68: str xzr, [x8, #0x10]    ; +16..+23
+///   9fd6c: str w9,  [x8, #0x4]     ; flags = 3
+///
+/// — 24 bytes, against the 8 that xnnpack_delegate.h declares.
+///
+/// Two ways out. Correcting the declaration works, but re-breaks every time
+/// TFLite grows the struct. Handing x8 over from inline asm works too, but
+/// only until the compiler decides to keep the buffer in x30 — which it did
+/// here, and an asm block that saves "the return address" out of x30 then
+/// writes a buffer address back into it. So: oversize the return type
+/// instead. It clears the 16-byte threshold, so x8 is used, and it is far
+/// bigger than these factories write, so whatever size they really are lands
+/// inside. No asm, nothing for the optimiser to get creative with.
+///
+/// The leading fields have never moved, so reading them back out through the
+/// declared type stays correct.
+template <size_t N>
+struct alignas(16) OptionsBox {
+    unsigned char raw[N] = {};
+    template <typename T> T* as() { return reinterpret_cast<T*>(raw); }
+    template <typename T> const T* as() const {
+        return reinterpret_cast<const T*>(raw);
+    }
+};
+
 /// Builds the delegate for the engine's chosen Ep, or returns nullptr for
 /// Ep::Cpu (where "no delegate" is the whole point).
 TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
@@ -244,12 +286,16 @@ TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
     if (ep == Ep::Cpu) return nullptr;
 
     if (ep == Ep::Xnnpack) {
-        auto opts = TfLiteXNNPackDelegateOptionsDefault();
-        return TfLiteXNNPackDelegateCreate(&opts);
+        using DefaultFn = OptionsBox<256> (*)();
+        auto defaults =
+            reinterpret_cast<DefaultFn>(&TfLiteXNNPackDelegateOptionsDefault);
+        OptionsBox<256> box = defaults();
+        return TfLiteXNNPackDelegateCreate(
+            box.as<TfLiteXNNPackDelegateOptions>());
     }
 
     if (ep == Ep::Nnapi) {
-        using OptionsDefaultFn = TfLiteNnapiDelegateOptions (*)();
+        using OptionsDefaultFn = OptionsBox<256> (*)();
         using CreateFn = TfLiteDelegate* (*)(const TfLiteNnapiDelegateOptions*);
         OptionsDefaultFn optsDefault = reinterpret_cast<OptionsDefaultFn>(
             resolveDelegateSymbol("TfLiteNnapiDelegateOptionsDefault", kNnapiLibs));
@@ -259,15 +305,20 @@ TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
             if (why) *why = "NNAPI delegate symbols missing (TfLiteNnapiDelegateCreate)";
             return nullptr;
         }
-        TfLiteNnapiDelegateOptions opts = optsDefault();
-        opts.model_token = cacheToken.empty() ? nullptr : cacheToken.c_str();
-        TfLiteDelegate* d = create(&opts);
+        // Same x8 rule as XNNPack above: these option structs are far larger
+        // than 16 bytes, so the factory writes through the buffer the caller
+        // names in x8 — which only happens while the return type says so.
+        OptionsBox<256> box = optsDefault();
+        TfLiteNnapiDelegateOptions* opts =
+            box.as<TfLiteNnapiDelegateOptions>();
+        opts->model_token = cacheToken.empty() ? nullptr : cacheToken.c_str();
+        TfLiteDelegate* d = create(opts);
         if (d == nullptr && why) *why = "TfLiteNnapiDelegateCreate returned null";
         return d;
     }
 
     if (ep == Ep::Gpu) {
-        using OptionsDefaultFn = TfLiteGpuDelegateOptionsV2 (*)();
+        using OptionsDefaultFn = OptionsBox<256> (*)();
         using CreateFn = TfLiteDelegate* (*)(const TfLiteGpuDelegateOptionsV2*);
         OptionsDefaultFn optsDefault = reinterpret_cast<OptionsDefaultFn>(
             resolveDelegateSymbol("TfLiteGpuDelegateOptionsV2Default", kGpuLibs));
@@ -278,10 +329,11 @@ TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
                             "missing or has no TfLiteGpuDelegateV2Create";
             return nullptr;
         }
-        TfLiteGpuDelegateOptionsV2 opts = optsDefault();
-        opts.inference_preference = TFLITE_GPU_INFERENCE_PREFERENCE_FAST_SINGLE_ANSWER;
-        opts.inference_priority1 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
-        TfLiteDelegate* d = create(&opts);
+        OptionsBox<256> box = optsDefault();
+        TfLiteGpuDelegateOptionsV2* opts = box.as<TfLiteGpuDelegateOptionsV2>();
+        opts->inference_preference = TFLITE_GPU_INFERENCE_PREFERENCE_FAST_SINGLE_ANSWER;
+        opts->inference_priority1 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
+        TfLiteDelegate* d = create(opts);
         if (d == nullptr && why) *why = "TfLiteGpuDelegateV2Create returned null";
         return d;
     }
@@ -529,21 +581,13 @@ Status LiteRtEngine::load(const ModelSpec& spec) {
                 " outputs; only single-head and boxes+scores split-head are decoded so far");
         }
 
-        impl->post.layout = impl->channelsFirst
-                                ? HeadLayout::V8ChannelsFirst
-                                : HeadLayout::V8Rows;
-        if (spec.classes.size() == impl->channels - 4) {
-            impl->post.numClasses = static_cast<int>(spec.classes.size());
-        } else if (spec.classes.size() == impl->channels - 5) {
-            impl->post.layout = HeadLayout::V5Objectness;
-            impl->post.numClasses = static_cast<int>(spec.classes.size());
-        } else if (spec.classes.size() > 0) {
-            LOGW("declared %zu classes but output channels=%d — trusting channels",
-                 spec.classes.size(), impl->channels);
-            impl->post.numClasses = std::max(1, impl->channels - 4);
-        } else {
-            impl->post.numClasses = std::max(1, impl->channels - 4);
-        }
+        // Layout and class count come from one shared rule set, so that a
+        // single question ("is this head v5 or v8?") has a single answer for
+        // every backend. See resolveHeadLayout in postprocess.h.
+        impl->post.layout = resolveHeadLayout(
+            impl->anchors, impl->channels, impl->channelsFirst,
+            std::max(inputW, inputH), static_cast<int>(spec.classes.size()),
+            impl->post.numClasses);
         impl->post.confidence = std::clamp(spec.confidence, 0.01f, 0.99f);
         impl->post.iou = std::clamp(spec.iou, 0.05f, 0.95f);
         impl->confidence.store(impl->post.confidence, std::memory_order_relaxed);
@@ -743,6 +787,7 @@ bool LiteRtEngine::readOutputInto(Impl* m, std::vector<float>& dst) {
                     dst[static_cast<size_t>(a) * static_cast<size_t>(C) + static_cast<size_t>(4 + c)] = sAt(a, c);
             }
         }
+
         return true;
     }
     const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(m->interp, 0);

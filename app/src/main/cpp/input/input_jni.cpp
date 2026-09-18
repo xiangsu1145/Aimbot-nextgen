@@ -10,6 +10,7 @@
 //  Bound to io.github.xiangsu1145.aimbotnextgen.shell.ShellNative.
 // ─────────────────────────────────────────────────────────────────────────────
 #include <jni.h>
+#include <android/log.h>
 #include <android/native_window_jni.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -19,15 +20,22 @@
 #include <vector>
 
 #include "capture/capture.h"
+#include "config/config_manager.h"
 #include "inference/engine.h"
 #include "inference/libpath.h"
 #include "inference/model_runtime.h"
 #include "inference/model_store.h"
+#if AIMBOTNG_HAVE_NEURON
+#include "inference/neuron_engine.h"
+#endif
+#include "input/exit_request.h"
+#include "input/inject_backend.h"
 #include "input/skip_screenshot.h"
 #include "touch_reader.h"
 #include "uinput_inject.h"
 #include "ui/gui/aimbot_ui.h"
 #include "ui/gui/sections/model_section.h"
+#include "ui/gui/sections/touch_section.h"
 
 #define PREFIX(name) Java_io_github_xiangsu1145_aimbotnextgen_shell_ShellNative_##name
 
@@ -169,6 +177,68 @@ PREFIX(uinputIsReady)(JNIEnv*, jobject) {
     return uinput_is_ready() ? JNI_TRUE : JNI_FALSE;
 }
 
+/// Exposed only so the daemon's periodic status line can print it next to the
+/// grab and layer state — see ShellServerEntry.startStatusTicker().
+JNIEXPORT jint JNICALL
+PREFIX(uinputWriteFailures)(JNIEnv*, jobject) {
+    return uinput_write_failures();
+}
+
+// ── Injection backend (uinput / InputManager) ────────────────────────────────
+//
+// Selection is made in the menu (Touch page → 触摸方式) and persisted, so the
+// pick reaches the daemon in two ways: live, by the sync layer calling
+// inject_set_backend() straight from the render thread, and at startup, by
+// configLoad() below pushing the saved value before anything is opened.
+//
+// Switching is destructive — see input/inject_backend.h — so the return value
+// matters: 0 means "selected, but not usable", which the daemon logs rather than
+// hides.
+
+JNIEXPORT jboolean JNICALL
+PREFIX(injectSetBackend)(JNIEnv*, jobject, jint backend) {
+    return inject_set_backend(backend) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+PREFIX(injectGetBackend)(JNIEnv*, jobject) {
+    return inject_get_backend();
+}
+
+/// True when the *selected* backend can deliver a frame. For InputManager that
+/// is the Kotlin side's own answer, asked for here rather than cached: it can
+/// change (a SecurityException invalidates it) and this call is rare — once per
+/// OPEN, not once per frame.
+JNIEXPORT jboolean JNICALL
+PREFIX(injectIsReady)(JNIEnv*, jobject) {
+    if (inject_get_backend() != INJECT_BACKEND_INPUT_MANAGER) {
+        return inject_is_ready() ? JNI_TRUE : JNI_FALSE;
+    }
+    return aimbotng::input::imBridgeIsReady() ? JNI_TRUE : JNI_FALSE;
+}
+
+/// Why the injection path is not working, in one line, for the log. Empty when
+/// it is working.
+JNIEXPORT jstring JNICALL
+PREFIX(injectLastError)(JNIEnv* env, jobject) {
+    const char* err = aimbotng::input::imBridgeLastError();
+    return env->NewStringUTF(err != nullptr ? err : "");
+}
+
+/// Reads config.json and applies the parts of it that have to be in force
+/// before the first OPEN — currently just the injection backend.
+///
+/// ui::start() already loads the config, but it runs when the *menu* opens,
+/// which is after the daemon has already talked to the app and possibly taken
+/// the panel. The saved backend decides whether a virtual device is created at
+/// all, so it cannot wait for the menu.
+JNIEXPORT jint JNICALL
+PREFIX(configLoad)(JNIEnv*, jobject) {
+    aimbotng::config::load();
+    const int saved = aimbotng::ui::sections::g_pageTouch.injectBackend.value;
+    return inject_set_backend(saved);
+}
+
 JNIEXPORT void JNICALL
 PREFIX(uinputSetScreenParams)(JNIEnv*, jobject, jint w, jint h, jboolean landscape) {
     uinput_set_screen_params(w, h, landscape == JNI_TRUE);
@@ -306,6 +376,24 @@ PREFIX(captureConsuming)(JNIEnv*, jobject) {
     return aimbotng::capture::consuming() ? JNI_TRUE : JNI_FALSE;
 }
 
+/// Whether anything is reading frames — the half of the supervisor's decision
+/// that is not the capture switch.
+///
+/// The supervisor asks this one alongside `captureWanted()` and holds a mirror
+/// open on the AND. The split is what makes the switch honest: were this
+/// `captureConsuming()` alone, holding to infer would keep a mirror alive with
+/// the switch off, so turning capture off changed nothing — the bug this flag
+/// was added to close.
+///
+/// It counts inference as a reader. The question here is "is anyone sampling
+/// pixels", and a running model is — excluding it is what made the detector need
+/// the Capture page open, because with that page closed the supervisor saw no
+/// reader, stopped the mirror, and left inference with no frame source.
+JNIEXPORT jboolean JNICALL
+PREFIX(capturePreviewWanted)(JNIEnv*, jobject) {
+    return aimbotng::capture::previewWanted() ? JNI_TRUE : JNI_FALSE;
+}
+
 /// Side of the square the menu asked for, in pixels.
 JNIEXPORT jint JNICALL
 PREFIX(captureWantedSize)(JNIEnv*, jobject) {
@@ -317,6 +405,17 @@ PREFIX(captureWantedSize)(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 PREFIX(captureSetRunning)(JNIEnv*, jobject, jboolean on) {
     aimbotng::capture::setRunning(on != 0);
+}
+
+/// Tells the capture module that the producer is gone and every frame it produced
+/// is dead. Called on the same teardown path as captureSetRunning(false), and it
+/// has to *precede* it in effect: the frame id is process-lifetime, so without
+/// this the next mirror's first frame reads as "new" to a consumer that already
+/// saw the previous mirror's last frame, and the detector runs on a picture of a
+/// display that no longer exists.
+JNIEXPORT void JNICALL
+PREFIX(captureInvalidateFrames)(JNIEnv*, jobject) {
+    aimbotng::capture::invalidateFrames();
 }
 
 // ── Model store ────────────────────────────────────────────────────────
@@ -481,6 +580,16 @@ PREFIX(inferDescribe)(JNIEnv* env, jobject) {
 // library list (libpath.cpp).
 JNIEXPORT jint JNICALL
 PREFIX(preloadAllDaemonLibraries)(JNIEnv*, jobject) {
+    // A build marker, before anything else has a chance to fail.
+    //
+    // "The diagnosis did not run" and "the APK on this device does not contain
+    // the diagnosis yet" produce byte-identical logs, and telling them apart
+    // cost a full round trip. One line with the compile date settles it. It is
+    // logged under the inference tag on purpose, so the same
+    // `-s AimbotInfer:V` filter that finds the APU diagnosis finds this too.
+    __android_log_print(ANDROID_LOG_INFO, "AimbotInfer",
+                        "daemon libs: enter (built %s %s)", __DATE__, __TIME__);
+
     int total = 0;
     int pairCount = 0;
     const aimbotng::infer::Pair* pairs = aimbotng::infer::allPairs(pairCount);
@@ -497,7 +606,43 @@ PREFIX(preloadAllDaemonLibraries)(JNIEnv*, jobject) {
             ++total;
         }
     }
+
+    // One APU diagnosis per daemon start, before anything has a chance to ask.
+    //
+    // It belongs here and not in the menu. The menu's probe is reached from
+    // engineRowDisabled(), which only runs when the Model page draws — so a
+    // capture taken from any other page, or from a session where the menu was
+    // never opened, contains a greyed-out "Neuron (APU)" row and no reason for
+    // it anywhere in the log. The probe had not failed; it had never run, and
+    // nothing said so. Running it at startup makes every capture answer the
+    // question whether or not the UI was touched, and it warms the cached
+    // probe result so the Model page never pays for it.
+    //
+    // Has to be after the preloads above: those are what put /system_ext/lib64
+    // and /vendor/lib64 on this process's search path, and the adapter's own
+    // by-name lookups depend on it.
+    // Named for where it runs, not for what it is: there is a second call at
+    // daemon boot (neuronDiagnosis), and two identically-labelled blocks in one
+    // capture are worse than none.
+#if AIMBOTNG_HAVE_NEURON
+    aimbotng::infer::logNeuronDiagnosis("after runtime preload");
+#endif
+
     return total;
+}
+
+// ── APU diagnosis on demand ────────────────────────────────────────────────
+//
+// The same call preloadAllDaemonLibraries() makes, exposed so the daemon boot
+// path can make it too. It matters that this is reachable without loading a
+// model: a greyed-out "Neuron (APU)" row is exactly the situation in which no
+// model can be loaded through that engine, so a diagnosis that only runs on
+// model load can never explain the one failure it exists to explain.
+JNIEXPORT void JNICALL
+PREFIX(neuronDiagnosis)(JNIEnv*, jobject) {
+#if AIMBOTNG_HAVE_NEURON
+    aimbotng::infer::logNeuronDiagnosis("daemon boot");
+#endif
 }
 
 // ── Process detach ─────────────────────────────────────────────────────────
@@ -533,6 +678,8 @@ namespace {
 JavaVM* g_jvm = nullptr;
 jclass   g_skipClass = nullptr;   // io/github/xiangsu1145/aimbotnextgen/shell/ShellLayerHost
 jmethodID g_skipMid = nullptr;    // static boolean setSkipScreenshot(boolean)
+jclass   g_exitClass = nullptr;   // io/github/xiangsu1145/aimbotnextgen/shell/ShellServerEntry
+jmethodID g_exitMid = nullptr;    // static void requestExitFromMenu()
 }  // namespace
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
@@ -548,6 +695,11 @@ namespace input {
 namespace {
 constexpr const char* kLayerHostClass =
     "io/github/xiangsu1145/aimbotnextgen/shell/ShellLayerHost";
+
+/// The daemon's entry point — owns `running`, which is what the menu's 退出 row
+/// has to clear. See input/exit_request.h for why that round-trip exists.
+constexpr const char* kEntryClass =
+    "io/github/xiangsu1145/aimbotnextgen/shell/ShellServerEntry";
 
 // Look up ShellLayerHost.setSkipScreenshot(Z)Z once and cache. Returns false
 // (and clears any pending JNI exception) if the bridge is unreachable for
@@ -611,6 +763,253 @@ bool applySkipScreenshot(bool on) {
     // makes the next toggle free.
     (void)attached;
     return ok;
+}
+
+bool requestDaemonExit() {
+    // Both outcomes are worth a line. This is the last step the menu can see:
+    // if it reports failure, the fault is the bridge (nothing else even tried),
+    // and if it reports success but nothing happens afterwards, everything
+    // downstream of it — the Kotlin half below — is where the exit died.
+    if (g_jvm == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, "AimbotInput",
+                            "exit: no JavaVM cached — JNI_OnLoad never ran");
+        return false;
+    }
+
+    JNIEnv* env = nullptr;
+    const jint status = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK || env == nullptr) {
+            __android_log_print(ANDROID_LOG_ERROR, "AimbotInput",
+                                "exit: could not attach the render thread");
+            return false;
+        }
+    } else if (status != JNI_OK || env == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, "AimbotInput",
+                            "exit: could not get a JNIEnv (status=%d)", status);
+        return false;
+    }
+
+    if (g_exitClass == nullptr) {
+        jclass local = env->FindClass(kEntryClass);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            __android_log_print(ANDROID_LOG_ERROR, "AimbotInput",
+                                "exit: %s not reachable from this thread", kEntryClass);
+            return false;
+        }
+        if (local == nullptr) return false;
+        g_exitClass = static_cast<jclass>(env->NewGlobalRef(local));
+        env->DeleteLocalRef(local);
+    }
+    if (g_exitMid == nullptr) {
+        g_exitMid = env->GetStaticMethodID(g_exitClass, "requestExitFromMenu", "()V");
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            g_exitMid = nullptr;
+            __android_log_print(ANDROID_LOG_ERROR, "AimbotInput",
+                                "exit: ShellServerEntry.requestExitFromMenu not found");
+            return false;
+        }
+    }
+
+    env->CallStaticVoidMethod(g_exitClass, g_exitMid);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "AimbotInput",
+                        "exit: handed to ShellServerEntry (menu 退出 -> releasing the panel)");
+    return true;
+}
+
+// ── Reverse bridge: native → InputManagerInjector (Kotlin) ───────────────────
+//
+// The third user of this JVM handle (after setSkipScreenshot and
+// requestExitFromMenu) and the busiest: the InputManager backend calls in once
+// per injected frame, and frames come from both the reader's poll thread (the
+// physical-finger mirror) and the render thread (aim and trigger). Both are
+// long-lived, so each attaches once and stays attached.
+
+namespace {
+constexpr const char* kInjectorClass =
+    "io/github/xiangsu1145/aimbotnextgen/inject/InputManagerInjector";
+
+constexpr int kImMaxPointers = 10;
+
+jclass    g_imClass      = nullptr;
+jmethodID g_imInitMid    = nullptr;   // static boolean init()
+jmethodID g_imPushMid    = nullptr;   // static void pushFrame(int[], int[], int[], int)
+jmethodID g_imReleaseMid = nullptr;   // static void releaseAll()
+jmethodID g_imReadyMid   = nullptr;   // static boolean isReady()
+jmethodID g_imErrorMid   = nullptr;   // static String lastError()
+
+// Reused for every frame. Allocating three arrays per frame would be a JNI
+// allocation and three copies at 100+ Hz for no benefit: the Kotlin side reads
+// them synchronously inside the call, before this returns.
+jintArray g_imIds = nullptr;
+jintArray g_imXs  = nullptr;
+jintArray g_imYs  = nullptr;
+
+/// Last error, copied out of Java so the caller can have a plain `const char*`
+/// that outlives the JNI call. Only ever read for a log line.
+char g_imLastError[256] = {};
+bool g_imEverInitialised = false;
+
+JNIEnv* imEnv() {
+    if (g_jvm == nullptr) return nullptr;
+    JNIEnv* env = nullptr;
+    const jint status = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+    } else if (status != JNI_OK) {
+        return nullptr;
+    }
+    return env;
+}
+
+/// Resolves the class and its five statics once. Returns false (with any pending
+/// exception cleared) when the bridge cannot be built at all.
+bool imEnsure(JNIEnv* env) {
+    if (g_imClass == nullptr) {
+        jclass local = env->FindClass(kInjectorClass);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return false;
+        }
+        if (local == nullptr) return false;
+        g_imClass = static_cast<jclass>(env->NewGlobalRef(local));
+        env->DeleteLocalRef(local);
+    }
+    if (g_imInitMid != nullptr) return true;
+
+    g_imInitMid    = env->GetStaticMethodID(g_imClass, "init", "()Z");
+    g_imPushMid    = env->GetStaticMethodID(g_imClass, "pushFrame", "([I[I[II)V");
+    g_imReleaseMid = env->GetStaticMethodID(g_imClass, "releaseAll", "()V");
+    g_imReadyMid   = env->GetStaticMethodID(g_imClass, "isReady", "()Z");
+    g_imErrorMid   = env->GetStaticMethodID(g_imClass, "lastError", "()Ljava/lang/String;");
+    if (env->ExceptionCheck() || g_imInitMid == nullptr || g_imPushMid == nullptr ||
+        g_imReleaseMid == nullptr || g_imReadyMid == nullptr || g_imErrorMid == nullptr) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        g_imInitMid = g_imPushMid = g_imReleaseMid = g_imReadyMid = g_imErrorMid = nullptr;
+        __android_log_print(ANDROID_LOG_ERROR, "AimbotInput",
+                            "inject: InputManagerInjector is missing a static method — "
+                            "the backend cannot be driven from native");
+        return false;
+    }
+    return true;
+}
+
+bool imEnsureArrays(JNIEnv* env) {
+    if (g_imIds != nullptr) return true;
+    jintArray ids = env->NewIntArray(kImMaxPointers);
+    jintArray xs  = env->NewIntArray(kImMaxPointers);
+    jintArray ys  = env->NewIntArray(kImMaxPointers);
+    if (ids == nullptr || xs == nullptr || ys == nullptr || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        __android_log_print(ANDROID_LOG_ERROR, "AimbotInput",
+                            "inject: could not allocate the frame arrays");
+        return false;
+    }
+    g_imIds = static_cast<jintArray>(env->NewGlobalRef(ids));
+    g_imXs  = static_cast<jintArray>(env->NewGlobalRef(xs));
+    g_imYs  = static_cast<jintArray>(env->NewGlobalRef(ys));
+    env->DeleteLocalRef(ids);
+    env->DeleteLocalRef(xs);
+    env->DeleteLocalRef(ys);
+    return true;
+}
+}  // namespace
+
+bool imBridgeInit() {
+    JNIEnv* env = imEnv();
+    if (env == nullptr || !imEnsure(env)) return false;
+
+    const jboolean ok = env->CallStaticBooleanMethod(g_imClass, g_imInitMid);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return false;
+    }
+    g_imEverInitialised = true;
+    return ok == JNI_TRUE;
+}
+
+void imBridgePushFrame(const int* ids, const int* xs, const int* ys, int n) {
+    if (n < 0) n = 0;
+    if (n > kImMaxPointers) n = kImMaxPointers;
+
+    JNIEnv* env = imEnv();
+    if (env == nullptr || !imEnsure(env) || !imEnsureArrays(env)) return;
+
+    if (n > 0) {
+        env->SetIntArrayRegion(g_imIds, 0, n, ids);
+        env->SetIntArrayRegion(g_imXs, 0, n, xs);
+        env->SetIntArrayRegion(g_imYs, 0, n, ys);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            return;
+        }
+    }
+    env->CallStaticVoidMethod(g_imClass, g_imPushMid, g_imIds, g_imXs, g_imYs, n);
+    if (env->ExceptionCheck()) {
+        // Not fatal and not repeated here: the Kotlin side already reports the
+        // interesting failures (a refused injection) itself, with the hint that
+        // makes them actionable. Throwing out of the reader thread would take
+        // the panel's grab with it.
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
+void imBridgeReleaseAll() {
+    JNIEnv* env = imEnv();
+    if (env == nullptr || !imEnsure(env)) return;
+    if (!g_imEverInitialised) return;   // never set up, so nothing can be down
+    env->CallStaticVoidMethod(g_imClass, g_imReleaseMid);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
+bool imBridgeIsReady() {
+    JNIEnv* env = imEnv();
+    if (env == nullptr || !imEnsure(env)) return false;
+    const jboolean ok = env->CallStaticBooleanMethod(g_imClass, g_imReadyMid);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return false;
+    }
+    return ok == JNI_TRUE;
+}
+
+const char* imBridgeLastError() {
+    g_imLastError[0] = '\0';
+    JNIEnv* env = imEnv();
+    if (env == nullptr || !imEnsure(env)) return g_imLastError;
+
+    jstring text = static_cast<jstring>(env->CallStaticObjectMethod(g_imClass, g_imErrorMid));
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return g_imLastError;
+    }
+    if (text != nullptr) {
+        const char* utf = env->GetStringUTFChars(text, nullptr);
+        if (utf != nullptr) {
+            strncpy(g_imLastError, utf, sizeof(g_imLastError) - 1);
+            env->ReleaseStringUTFChars(text, utf);
+        }
+        env->DeleteLocalRef(text);
+    }
+    return g_imLastError;
 }
 
 }  // namespace input

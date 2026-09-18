@@ -1,0 +1,2 @@
+setsid /system/bin/app_process -Djava.class.path='/data/app/~~rSo4cVIywFTZfZG-UI0XdQ==/io.github.xiangsu1145.aimbotnextgen-tzt0PJcxaFGTgS419VPkxA==/base.apk' -Djava.library.path='/apex/com.android.runtime/lib64/bionic:/system/lib64:/system_ext/lib64:/vendor/lib64:/vendor/lib64/hw:/vendor/lib64/egl:/odm/lib64:/product/lib64' /system/bin --nice-name=aimbot_shell io.github.xiangsu1145.aimbotnextgen.shell.ShellServerEntry '/data/app/~~rSo4cVIywFTZfZG-UI0XdQ==/io.github.xiangsu1145.aimbotnextgen-tzt0PJcxaFGTgS419VPkxA==/lib/arm64' >/data/local/tmp/aimbot_daemon.log 2>&1 &
+sleep 3

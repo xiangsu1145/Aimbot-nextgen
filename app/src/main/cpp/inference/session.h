@@ -86,9 +86,16 @@ public:
 
     // ── The frame path ──────────────────────────────────────────────────────
 
-    /// Hands a frame over. **Never blocks**, and never copies: it parks the view
-    /// and returns. If the worker has not picked up the previous frame, that one
-    /// is discarded and the drop counter goes up.
+    /// Hands a frame over. **Never blocks, and copies only as a fallback**: the
+    /// pixels go into one of two buffers the worker is not currently reading,
+    /// so the capture thread's own buffer is free the moment this returns. When
+    /// the platform gave us shared memory the handover is a pointer swap and
+    /// nothing is copied at all; elsewhere it is one memcpy and `Stats::copied`
+    /// counts it, so a device silently paying for the fallback is visible
+    /// rather than guessed at.
+    ///
+    /// If the worker has not picked up the previous frame, that one is
+    /// discarded and the drop counter goes up.
     ///
     /// Legal to call with an invalid FrameView — it is counted and ignored,
     /// because the alternative is every capture-side caller remembering to check
@@ -116,6 +123,11 @@ public:
         uint64_t dropped   = 0;   // superseded before they ran
         uint64_t failed    = 0;   // loaded, ran, and returned a bad status
         uint64_t invalid   = 0;   // submit() with an unusable FrameView
+
+        /// submit() calls whose pixels had to be memcpy'd because shared
+        /// memory was not available. Zero on a device that granted it, and the
+        /// signal that the zero-copy path is not actually running.
+        uint64_t copied    = 0;
 
         /// Completed inferences per second, over a short trailing window.
         /// Zero before there is enough history to mean anything.

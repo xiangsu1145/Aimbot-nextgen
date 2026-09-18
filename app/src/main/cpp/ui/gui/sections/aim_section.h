@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "ui/gui/widgets.h"
+#include "tracking/pid_controller.h"
 
 namespace aimbotng {
 namespace ui {
@@ -109,76 +110,44 @@ struct AimCategoryState {
     bool hasAnySelected() const { return sel.mask != 0; }
 };
 
-// ── Aim controller (ported from Aimbot-ai old project's AimController) ─────
+// ── Aim controller (velocity-type PPID, ported from pid.cpp reference) ─────────
 //
-// A proper position-PID with the anti-oscillation machinery the old project
-// spent years tuning — the bare `kp*e + ki*∫ + kd*Δ` that was here before is
-// exactly what made the aim twitch, because the raw derivative amplifies
-// per-frame box jitter and an unfiltered integrator winds up on large sweeps.
+// Two PPID instances, one per axis.  PPID outputs velocity in px/frame @ 60 Hz;
+// the caller divides by 60 to get displacement.  The reference kp=25/kd=25 is
+// used for both axes by default; only `predict` differs (X uses 3.0 for lead,
+// Y uses 0.0).
 //
-// What this adds over a bare PID:
-//   * integral separation — only integrate while |error| is small; reset the
-//     accumulator on a sign change (anti-windup, kills the vertical bounce).
-//   * derivative EMA — smooths dE/dt so box jitter does not spike the D term.
-//   * per-axis gain — Y gets reduced Kp/Kd (kpYRatio / kdYRatio) because the
-//     touch pipeline and target Y motion are noisier than X.
-//   * velocity damping (rate feedback) — subtracts a fraction of last frame's
-//     applied move, braking the approach and removing overshoot bounce.
-//   * per-frame clamp — bounds how far one step may travel.
-//   * feedforward (F term) — leads moving targets using target velocity.
-//
-// The output is a *per-reference-frame* displacement in px (reference = 60 Hz,
-// matching the old project). The caller scales it by `nstep = dt*60` so the
-// behaviour is identical at any render rate — see syncAimPage().
+// Deadzone and per-class Y band are applied AFTER the PID step, so the
+// controller always sees the raw error and does its own adaptive gain
+// management to handle the full range.
 struct AimController {
-    // Gains, copied from the sliders each frame.
-    float kp = 0.5f, ki = 0.0f, kd = 0.0f, kf = 0.0f;
+    tracking::PPID pidX;
+    tracking::PPID pidY;
 
-    // Internal tuning — the old project's defaults, do not expose as sliders.
-    float kpYRatio = 0.6f;   // Y-axis Kp attenuation (anti vertical oscillation)
-    float kdYRatio = 0.85f;  // Y-axis Kd attenuation
-    float kfYRatio = 0.7f;   // Y-axis feedforward attenuation
-    float kfGain   = 2.5f;   // internal amplifier on the F term
-    float derivFilterAlpha = 0.4f;  // D-term EMA: 1.0 = raw, 0.0 = frozen
-    float integralSeparationThresh = 200.0f;  // px: don't integrate above this
-    float integralLimit = 100.0f;  // anti-windup clamp on the accumulator
-    float velocityDamping = 0.35f; // rate-feedback brake (0=none,0.5=firm)
-    float maxPerFrame = 600.0f;    // px cap on one step's displacement
-    float maxDragDist = 400.0f;    // px: lift+repress if finger exceeds this from start
+    // Drag safety: lift+repress if finger travels further than this from press point.
+    float maxDragDist = 400.0f;  // px
 
-    // ── F-term input (Kalman velocity path — UNUSED as of 2026-09-13) ──────
-    // The Kalman tracker (tracking/kalman_tracker.h) emits per-frame target
-    // velocity in screen pixels per render frame (vx, vy). These fields hold
-    // that velocity when syncAimPage writes it; the F-term code in step()
-    // currently does NOT read them — it uses the old-project `smoothVel`
-    // (EMA of position deltas). The fields are kept so a future change can
-    // re-enable the Kalman-velocity F path without touching the header again.
-    float targetVelX = 0.0f, targetVelY = 0.0f;  // from tracker, px/frame
-    float delayFrames = 2.0f;                     // ≈33 ms @ 60 Hz; slider sets
-
-    // Per-axis state.
-    float integX = 0.0f,  integY = 0.0f;   // accumulator (with separation)
-    float derivFiltX = 0.0f, derivFiltY = 0.0f;  // EMA-smoothed derivative
-    float prevErrX = 0.0f, prevErrY = 0.0f;       // last frame's error
-    float prevAppliedX = 0.0f, prevAppliedY = 0.0f; // last frame's move (for damping)
-    float prevTargetX = 0.0f, prevTargetY = 0.0f; // last frame's target (FF)
-    float smoothVelX = 0.0f, smoothVelY = 0.0f;   // EMA target velocity (FF)
-    bool  hasPrevTarget = false;
-
-    void reset() {
-        integX = integY = 0.0f;
-        derivFiltX = derivFiltY = 0.0f;
-        prevErrX = prevErrY = 0.0f;
-        prevAppliedX = prevAppliedY = 0.0f;
-        targetVelX = targetVelY = 0.0f;
-        prevTargetX = prevTargetY = 0.0f;
-        smoothVelX = smoothVelY = 0.0f;
-        hasPrevTarget = false;
+    /// Initialise both axes from sliders.  Call once on press.
+    void init(float kp, float kd, float predictX, float predictY,
+              float rate, float smooth) {
+        pidX.init(kp, kd, predictX, rate, smooth);
+        pidY.init(kp, kd, predictY, rate, smooth);
     }
 
-    /// Writes the per-reference-frame move (px) needed to chase `target` from
-    /// `current` into `outMove`. `dt` only feeds the feedforward velocity term.
-    void step(ImVec2 target, ImVec2 current, float dt, ImVec2& outMove);
+    /// Drive both axes, return raw displacement in px/frame @ 60Hz.  Deadzone is
+    /// applied by the caller after this returns.
+    void step(float errX, float errY, float dt,
+              float& outX, float& outY) {
+        (void)dt;  // PPID is frame-rate-independent; dt kept for API compat only
+        // PPID.update() returns velocity in px/frame @ 60 Hz — direct displacement.
+        outX = pidX.update(errX);
+        outY = pidY.update(errY);
+    }
+
+    void reset() {
+        pidX.reset();
+        pidY.reset();
+    }
 };
 
 // ── Aim-touch state machine ───────────────────────────────────────────────
@@ -233,6 +202,11 @@ struct TouchAimState {
     /// leaves the touch area. Cleared when read, and on press()/release().
     bool justReleasedTakeover = false;
 
+    /// Physical touch delta for fusion: last known screen position of the physical
+    /// finger inside the touch area.  Reset to -1,-1 when no physical finger is tracked.
+    float physX = -1.0f, physY = -1.0f;
+    float lastPhysX = -1.0f, lastPhysY = -1.0f;
+
     /// Drops a finger at the TOUCH-AREA centre ± jitter (the finger's home,
     /// where the virtual thumb rests — matching the old project's
     /// AimController, which seeds at the aim area). The aim direction is
@@ -255,14 +229,17 @@ struct TouchAimState {
 struct PageAim {
     widgets::SwitchState enabled{true};
 
-    /// PIDF controller parameters (sliders write these; the controller reads).
-    /// Defaults are the values the project used before the AimController port;
-    /// the screen-centre error reference (see syncAimPage) is what keeps the aim
-    /// direction independent of where the touch area sits, not these gains.
-    widgets::SliderState kp{0.5f, 0.01f, 2.0f,  0.01f};
-    widgets::SliderState ki{0.0f, 0.0f,  1.0f,  0.001f};
-    widgets::SliderState kd{0.0f, 0.0f,  1.0f,  0.01f};
-    widgets::SliderState kf{0.0f, 0.0f,  1.0f,  0.001f};
+    /// PPID controller parameters.  Defaults match the reference pid.cpp: kp=25, kd=25.
+    /// predictX is the integral amplification for the X axis (reference: 3.0 — lead).
+    /// predictY is the same for Y.  Both default to 3.0 so both axes get equal force.
+    /// 自适应: 0=禁用(P项始终满载, 推荐), >0=启用自适应机制
+    /// 平滑: 控制大误差时的软饱和区间宽度，默认9900
+    widgets::SliderState kp{25.0f, 0.0f, 50.0f, 0.5f};
+    widgets::SliderState kd{25.0f, 0.0f, 50.0f, 0.5f};
+    widgets::SliderState predictX{3.0f, 0.0f, 10.0f, 0.1f};
+    widgets::SliderState predictY{3.0f, 0.0f, 10.0f, 0.1f};
+    widgets::SliderState rate{0.0f, 0.0f, 1.0f, 0.01f};
+    widgets::SliderState smooth{9900.0f, 9500.0f, 9999.0f, 1.0f};
 
     /// Aim deadzone (0.0–1.0, one decimal): ports the old project's
     /// `convergeThresh`. Once the TARGET is within `deadzone` of the screen
@@ -272,25 +249,15 @@ struct PageAim {
     /// is within ~8% of the shorter screen edge of the crosshair.
     widgets::SliderState deadzone{0.0f, 0.0f, 1.0f, 0.1f};
 
-    /// Aim lead / 提前量 (0–10, one-decimal "frames" of delay to project).
-    /// Routes into the PIDF controller's F term:
-    ///     F = targetVel × lead
-    /// The target velocity is the Kalman tracker's per-frame velocity (vx,
-    /// vy). lead=0 disables the F term entirely; lead=1 projects ~16 ms; lead=5
-    /// projects ~80 ms (covers detection+inject latency, common sweet spot).
-    /// The slider is integer-stepped because we want "number of frames of
-    /// look-ahead", not a fractional multiplier.
-    widgets::SliderState lead{2.0f, 0.0f, 10.0f, 1.0f};
-
     /// Touch-area overlay (the dashed box on screen).
     TouchAreaOverlay touchArea;
 
-    /// Touch fusion — when on, the aim loop drives a REAL finger the player holds
-    /// inside the touch area (via the mirror slot it reserves) instead of pressing
-    /// a separate synthetic finger. The real finger must already be down to be
-    /// taken over; if the touch area is empty, aim falls back to pressing a
-    /// synthetic finger as usual. Prevents the two-touch-point flicker that two
-    /// writers on one slot would cause.
+    /// Touch fusion — when on, aim always uses its own synthetic finger. If a
+    /// physical finger is held inside the touch area, its per-frame delta is
+    /// blended with the aim output when both directions align (dot > 0);
+    /// when directions conflict, pure aim output is used. The physical finger
+    /// mirrors normally to the game alongside the synthetic one.  When off, aim
+    /// takes over the physical finger exclusively (no synthetic press).
     widgets::SwitchState fusion{false};
 
     /// Continuous trigger — when on, the trigger-area switch is hidden on the
@@ -327,8 +294,16 @@ struct PageAim {
 extern PageAim g_pageAim;
 
 /// Draw the Aim page starting at `(x, *y)`, advancing `*y` past every row.
+/// `sc` carries the per-page scroll offset: paint coordinates and hit-test
+/// rectangles go through `sc.screenY(y)` so they sit at the right visual
+/// position, but `*y` continues to advance in *natural* (un-scrolled)
+/// coordinates so the caller can compute `sc.maxOffset` from how far `*y`
+/// ran. The natural-Y convention is what makes the Aim overlay drags (the
+/// touch-area dashed box and trigger-area circle) keep working unchanged —
+/// they live in screen pixels, not menu pixels, so scroll never touches them.
 void drawAimSection(ImDrawList* dl, float x, float& y, float w,
-                    float bottomY, float s, float es, const Xf& xf);
+                    float bottomY, float s, float es, const Xf& xf,
+                    Scroll& sc);
 
 /// Draw the Aim page's screen-space overlays (touch-area dashed box and
 /// trigger-area circle), including all drag/interaction handling. Called

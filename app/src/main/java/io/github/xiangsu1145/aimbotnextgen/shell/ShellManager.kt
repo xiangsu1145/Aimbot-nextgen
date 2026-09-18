@@ -85,6 +85,31 @@ private const val kRelaunchIntervalMs = 1_500L
 private const val kLaunchLinger = "sleep 3"
 
 /**
+ * System library directories handed to the daemon as `java.library.path`.
+ *
+ * The daemon's native code dlopens vendor libraries (MediaTek's apuware stack,
+ * Qualcomm's DSP RPC …) from inside the JVM's classloader namespace, `clns-1`.
+ * That namespace is isolated: an *absolute* path has to pass its permitted-path
+ * check, and /system/lib64, /system_ext/lib64 and /vendor/lib64 are not on it,
+ * so every such dlopen was refused.
+ *
+ * A bare soname takes a different route — the linker resolves it against the
+ * namespace's *search* paths, and a hit is loaded without the permitted-path
+ * check. Those search paths are the APK's lib dir plus java.library.path, so
+ * listing the system directories here is what makes vendor libraries reachable.
+ *
+ * `/apex/com.android.runtime/lib64/bionic` is the one that is easy to miss:
+ * /system/lib64/libdl_android.so is a symlink into it, libdl_android.so is a
+ * dependency of the whole VNDK/HIDL stack, and the apex is not permitted
+ * either. Measured on a OnePlus OPD2404 (Android 15): with these directories,
+ * libcdsprpc.so, libvndksupport.so and android.hidl.base@1.0.so all load;
+ * dropping /system/lib64 from the list breaks ld-android.so and fails again.
+ */
+private const val kSystemLibraryPath =
+    "/apex/com.android.runtime/lib64/bionic:/system/lib64:/system_ext/lib64:" +
+            "/vendor/lib64:/vendor/lib64/hw:/vendor/lib64/egl:/odm/lib64:/product/lib64"
+
+/**
  * Killing by pid, not by `pkill -f aimbot_shell`.
  *
  * `pkill -f` matches on the whole command line — and the shell running the
@@ -364,7 +389,7 @@ class ShellManager(private val context: Context) {
                 // survives the shell exit cleanly and outlasts the adb session.
                 // Its output goes to DAEMON_LOG_FILE rather than /dev/null, so a
                 // launch that fails leaves evidence behind instead of nothing.
-                val cmd = "(setsid /system/bin/app_process -Djava.class.path='$apkPath' /system/bin " +
+                val cmd = "(setsid /system/bin/app_process -Djava.class.path='$apkPath' -Djava.library.path='$kSystemLibraryPath' /system/bin " +
                         "--nice-name=aimbot_shell " +
                         "io.github.xiangsu1145.aimbotnextgen.shell.ShellServerEntry '$libDir' " +
                         ">$DAEMON_LOG_FILE 2>&1) & " + kLaunchLinger
@@ -378,7 +403,7 @@ class ShellManager(private val context: Context) {
                 // kLaunchLinger. It has to live inside the payload that the
                 // launching shell runs, which is why it is part of both forms.
                 val scriptLine = "setsid /system/bin/app_process " +
-                        "-Djava.class.path='$apkPath' /system/bin " +
+                        "-Djava.class.path='$apkPath' -Djava.library.path='$kSystemLibraryPath' /system/bin " +
                         "--nice-name=aimbot_shell " +
                         "io.github.xiangsu1145.aimbotnextgen.shell.ShellServerEntry '$libDir' " +
                         ">$DAEMON_LOG_FILE 2>&1 &\n" + kLaunchLinger
@@ -741,8 +766,42 @@ class ShellManager(private val context: Context) {
             line == "OK" -> Unit
             line.startsWith("ERR:") -> appendOutput("守护进程错误: ${line.substring(4)}")
             line.startsWith("TOUCH ") -> handleTouchLine(line)
+            line == "BYE" -> handleDaemonBye()
             else -> appendOutput(line)
         }
+    }
+
+    /**
+     * The daemon quit because the user asked it to from inside the menu
+     * (Settings → 退出并恢复触摸), and it said so before going.
+     *
+     * That distinction is the whole point. To us a daemon exit normally looks
+     * like one thing only — the socket dropped — which is indistinguishable
+     * from a crash, and the answer to a crash is [scheduleReconnect] plus
+     * [maybeRelaunchDaemon]. Left alone those would bring the daemon back and
+     * take the panel again seconds after the user pressed the button whose
+     * entire purpose was to get the panel released, leaving them with the same
+     * frozen input and no second chance: it would look like the button lied.
+     *
+     * So this does what [stop] does to *our* state and nothing to the daemon —
+     * there is nothing left to talk to. Deliberately not [stop]: that writes
+     * DESTROY down the socket from inside the reader loop that owns it.
+     */
+    private fun handleDaemonBye() {
+        Log.i(TAG, "daemon sent BYE — menu-requested exit, staying down")
+        stopRequested = true
+        clearWasRunning()
+        reconnectJob?.cancel()
+        reconnectJob = null
+        fullRestarts = 0
+        stopWhitelistLoop()
+        stopHeartbeat()
+        stopDisplayWatcher()
+        panelGrabbed = false
+        appendOutput("守护进程已退出，触摸已恢复")
+        updateStatus(ShellStatus(state = ShellState.IDLE, message = "已停止"))
+        // The sockets are closing anyway: this line arrived on the reader
+        // thread, whose loop is about to find EOF and run its own cleanup.
     }
 
     /**

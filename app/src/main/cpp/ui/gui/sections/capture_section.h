@@ -29,7 +29,8 @@ extern PageCapture g_pageCapture;
 
 /// Draw the Capture page: size slider on top, the preview well below.
 void drawCaptureSection(ImDrawList* dl, float x, float& y, float w,
-                        float bottomY, float s, float es, const Xf& xf);
+                        float bottomY, float s, float es, const Xf& xf,
+                        Scroll& sc);
 
 /// Mirror `g_pageCapture` into the capture module. Cheap and idempotent so
 /// it runs every frame rather than being hooked to the individual edits —

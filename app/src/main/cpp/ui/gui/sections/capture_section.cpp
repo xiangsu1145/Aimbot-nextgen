@@ -10,6 +10,7 @@
 #include "inference/model_runtime.h"
 #include "ui/gui/aimbot_ui.h"
 #include "ui/gui/hud.h"
+#include "ui/gui/notify.h"
 #include "ui/gui/theme.h"
 
 namespace aimbotng {
@@ -23,6 +24,12 @@ using namespace theme;
 
 constexpr float kPreviewRound = 12.0f;
 constexpr float kHintSize     = 24.0f;
+
+/// Tag for the "inference turned capture on for you" toast. Named here rather
+/// than left as a literal at the call site so that syncCapturePage() — which
+/// runs every frame — cannot accidentally post a second entry under a
+/// differently-spelled tag and defeat the coalescing.
+constexpr const char* kCaptureAutoTag = "capture.auto";
 
 /**
  * The capture page's live preview.
@@ -83,12 +90,16 @@ void drawCapturePreview(ImDrawList* dl, float x, float y, float w, float h,
 }  // namespace
 
 void drawCaptureSection(ImDrawList* dl, float x, float& y, float w,
-                        float bottomY, float s, float es, const Xf& xf) {
+                        float bottomY, float s, float es, const Xf& xf,
+                        Scroll& sc) {
     const float gap   = 12.0f * s;
     const float rowSl = widgets::kSliderRowH * s;
 
     auto wRect = [&](float wx, float wy, float ww, float wh) {
-        const ImVec2 p = xf.pt(wx, wy);
+        // Capture page does not scroll (see sectionIsScrollable), so the offset
+        // is always 0 — left in for parity with the rest of the right pane and
+        // to make a future "let Capture scroll too" a one-line change.
+        const ImVec2 p = xf.pt(wx, wy - sc.offset);
         return widgets::Rect{p.x, p.y, xf.s(ww), xf.s(wh)};
     };
 
@@ -99,17 +110,62 @@ void drawCaptureSection(ImDrawList* dl, float x, float& y, float w,
 }
 
 void syncCapturePage() {
-    // The switch means "I want the preview's frames". Inference is a second,
-    // independent reason for the producer to run, and it is ORed in *here*
-    // rather than left to the runtime to arrange, because `capture::enabled()`
-    // is what the frame thread obeys: a detector that asked for frames while
-    // this said off would get nothing at all and look broken, with the reason
-    // three modules away.
+    // ── Why inference cannot silently enable capture, and what does ─────────
     //
-    // The page stays the single author either way — one function writes both
-    // values, so the switch cannot end up contradicting the module.
+    // The obvious shape here is `setEnabled(switch || inferWants)`, and it used
+    // to be exactly that. It is wrong, for a reason that only shows up in the
+    // user's hands: with the switch off, holding to infer made `inferWants`
+    // true, the module's `enabled()` went true, and frames started flowing. The
+    // switch said OFF and capture happened anyway — indistinguishable from a
+    // broken switch, and it hid the real problem (there was no frame source at
+    // all) behind a detector that returned stale boxes forever.
+    //
+    // So the OR is gone. Asking for inference with the switch off now *turns
+    // the switch on*, visibly, in this page's own state — which is the whole
+    // difference between "capture off means no capture" and "capture off unless
+    // something quietly overrules it".
+    //
+    // ── Edge, not level — this is the part that is easy to get wrong ────────
+    //
+    // Re-deriving "inference wants frames ⇒ turn the switch on" every frame
+    // looks equivalent and is not: inference keeps wanting frames for as long as
+    // it runs, so the write would re-apply forever and the user could never turn
+    // capture back off. Flip the switch, next frame it is on again — the exact
+    // un-turn-off-able control this change exists to remove, just wearing a
+    // different hat.
+    //
+    // So the handler fires on the *rising edge* of `inferWants` only. Once
+    // inference is running the switch is left alone, and turning it off stops
+    // the frames — with the detector starved, which is the honest consequence of
+    // the switch the user just flipped, rather than a silent override.
+    //
+    // ── Ordering, and why it is load-bearing ───────────────────────────────
+    //
+    // hud.cpp calls syncCapturePage() *before* syncSettingsPage(), and the
+    // warning that says "请先开启截图否则无法推理" lives in the latter, gated on
+    // `!capture::enabled()`. So on the frame the user flips inference on with
+    // capture off, this function has already written the switch on and called
+    // setEnabled(true) by the time the Settings handler looks — it sees capture
+    // on, and correctly stays quiet. The user gets one toast ("capture was
+    // turned on for you"), not two contradicting ones.
+    //
+    // Swap those two lines in hud.cpp and both fire on the same frame: "you
+    // must turn capture on" immediately followed by "capture is now on", which
+    // reads as a glitch. Nothing else would notice, which is why it is written
+    // down here rather than left to be rediscovered.
+    static bool lastInferWants = false;
     const bool inferWants = infer::runtime::wantsFrames();
-    capture::setEnabled(g_pageCapture.enabled.value || inferWants);
+    if (inferWants && !lastInferWants && !g_pageCapture.enabled.value) {
+        // Writing the switch is what makes the page honest rather than just the
+        // module: the toggle is drawn from this same struct, so it flips visibly
+        // instead of the module silently disagreeing with what is on screen.
+        g_pageCapture.enabled.value = true;
+        notify::info(kCaptureAutoTag,
+                     "推理需要画面，已自动开启截图", 4.0f);
+    }
+    lastInferWants = inferWants;
+
+    capture::setEnabled(g_pageCapture.enabled.value);
     capture::setSize(static_cast<int>(g_pageCapture.size.value));
 }
 

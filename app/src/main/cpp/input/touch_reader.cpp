@@ -15,6 +15,7 @@
 #include <dirent.h>
 #include <unistd.h>
 
+#include "inject_backend.h"
 #include "uinput_inject.h"
 #include <fcntl.h>
 #include <linux/input.h>
@@ -37,6 +38,7 @@
 
 #define LOG_TAG "AimbotReader"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
@@ -57,6 +59,26 @@ constexpr int kSyntheticMax  = 63999;
 // the touchscreen and with it the illusion that nothing is wrong.
 constexpr int kAlarmFailures = 150;
 
+// The ONE place where this reader still differs from aimbot 1.2.1, and the only
+// one that is switchable at runtime.
+//
+// 1.2.1 grabs the panel and then mirrors every physical finger 1:1, always —
+// it has no notion of a gesture that belongs to the overlay, because its
+// overlay is a real WindowManager window that consumes the touch on its own.
+// Ours is a SurfaceFlinger layer, invisible to the input system, so if a tap on
+// the menu were also mirrored the app underneath would receive it too (in an
+// FPS, tapping a slider would also fire). Swallowing the gestures that BEGAN
+// inside a published menu rectangle is what replaces the window.
+//
+// It changes nothing for any gesture that starts outside the menu — those are
+// mirrored raw, exactly as 1.2.1 does, whatever this is set to.
+//
+// Exposed in the menu as Settings → 允许触摸穿透: turning it on gives a
+// byte-identical 1.2.1 mirror (every touch reaches the system, menu taps
+// included), which is the setting to test with when the question is whether the
+// swallow is what a given device is objecting to.
+constexpr bool kSwallowMenuGesturesDefault = true;
+
 // ── State ────────────────────────────────────────────────────────────────────
 
 std::mutex g_mutex;
@@ -66,6 +88,13 @@ std::string       g_panelPath;    // first panel path (uinput clones from it)
 bool              g_ready    = false;
 bool              g_grabbed  = false;
 bool              g_sink     = true;   // mirror physical fingers to uinput
+/// Mirror gestures that began on the menu as well (true) or keep letting the
+/// menu own them (false). Runtime-switchable: Settings → 允许触摸穿透.
+bool              g_passThrough = !kSwallowMenuGesturesDefault;
+
+/// The panel is always taken exclusively with EVIOCGRAB (the design). The old
+/// runtime toggle ("独占触摸面板") was removed: the daemon is the phone's only
+/// touch source and re-injects what it wants. There is no compatibility mode.
 
 int g_displayW = 0, g_displayH = 0;    // current orientation
 int g_portraitW = 0, g_portraitH = 0;  // min/max of the two
@@ -281,16 +310,32 @@ bool pointInRegionsLocked(float x, float y) {
 
 /// Rebuilds g_pointers from the decoded state. Caller must hold g_mutex.
 /// Returns true when at least one pointer is down.
-bool rebuildPointersLocked(int* ids, int* xs, int* ys, int* outCount) {
+bool rebuildPointersLocked(int* ids, int* xs, int* ys, int* rawXs, int* rawYs,
+                           int* outCount) {
     g_pointers.clear();
     int n = 0;
 
-    auto emit = [&](int id, float sx, float sy) {
+    // `sx, sy` are screen pixels (what the menu and the swallow-test speak);
+    // `rx, ry` are the panel's own raw coordinates, untouched.
+    //
+    // The raw pair exists for the mirror. It used to be reconstituted from the
+    // screen pixels by inverting this same mapping, which is identity on paper
+    // and is not identity in practice: the conversion to pixels is truncated to
+    // an int, and the inverse it is multiplied through depends on two pieces of
+    // state (this file's rotation, uinput's landscape flag and scale) that are
+    // set from different places and are known to be able to disagree after a
+    // geometry change. A mirror built that way can be a pixel out on a good day
+    // and systematically wrong on a rotated one, and there is no reason to
+    // round-trip at all: the panel already gave us the exact value the cloned
+    // device wants, and the reference implementations just write it back.
+    auto emit = [&](int id, float sx, float sy, int rx, int ry) {
         g_pointers.push_back(ReaderPointer{id, sx, sy});
         if (n < kMaxSlots) {
-            ids[n] = id;
-            xs[n] = static_cast<int>(sx);
-            ys[n] = static_cast<int>(sy);
+            ids[n]   = id;
+            xs[n]    = static_cast<int>(sx);
+            ys[n]    = static_cast<int>(sy);
+            rawXs[n] = rx;
+            rawYs[n] = ry;
             ++n;
         }
     };
@@ -304,14 +349,14 @@ bool rebuildPointersLocked(int* ids, int* xs, int* ys, int* outCount) {
         if (g_slotId[i] < 0) continue;
         float sx, sy;
         panelToScreen(g_slotX[i], g_slotY[i], &sx, &sy);
-        emit(g_slotId[i], sx, sy);
+        emit(g_slotId[i], sx, sy, g_slotX[i], g_slotY[i]);
     }
 
     // Protocol A panels: the last frame that SYN_REPORT closed.
     for (int i = 0; i < g_protoASnap.count; ++i) {
         float sx, sy;
         panelToScreen(g_protoASnap.x[i], g_protoASnap.y[i], &sx, &sy);
-        emit(g_protoASnap.id[i], sx, sy);
+        emit(g_protoASnap.id[i], sx, sy, g_protoASnap.x[i], g_protoASnap.y[i]);
     }
 
     *outCount = n;
@@ -344,7 +389,10 @@ bool probeTouchDevice(int fd, bool* hasSlotOut, int* maxXOut, int* maxYOut) {
     }
     free(bits);
 
-    if (!hasX || !hasY) return false;
+    // 必须 Protocol B（带 ABS_MT_SLOT）。vivo 等厂商把"屏下指纹辅助触摸"
+    // 也做成 ABS_MT_* Protocol A，没有 SLOT，仅靠 X/Y 校验会被一起误识别成主屏。
+    // 后果是 reader 把多设备全 grab，真触摸屏也被独占，系统触摸整体死亡。
+    if (!hasX || !hasY || !hasSlot) return false;
 
     input_absinfo infoX{}, infoY{};
     if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &infoX) != 0) return false;
@@ -460,7 +508,7 @@ void enumeratePanelsDetailed(std::vector<ReaderPanel>& out,
         }
 
         if (ok) {
-            LOGD("panel %s max=%d,%d slot=%d own=%d", path.c_str(), maxX, maxY,
+            LOGI("panel %s max=%d,%d slot=%d own=%d", path.c_str(), maxX, maxY,
                  hasSlot ? 1 : 0, ownVirtual ? 1 : 0);
             g_panelPaths.push_back(path);
             g_panelNames.emplace_back(name);
@@ -626,11 +674,44 @@ void publishPointers(bool mirror) {
     int ids[kMaxSlots];
     int xs[kMaxSlots];
     int ys[kMaxSlots];
+    int rawXs[kMaxSlots];
+    int rawYs[kMaxSlots];
     int n = 0;
+    // Slot-direct buffers for Protocol B (old touch_core.cpp 1:1 model)
+    int slotIds[kMaxSlots];
+    int slotRawXs[kMaxSlots];
+    int slotRawYs[kMaxSlots];
+    int slotXs[kMaxSlots];
+    int slotYs[kMaxSlots];
+    bool useSlotsDirect = false;
     bool swallow = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        rebuildPointersLocked(ids, xs, ys, &n);
+        rebuildPointersLocked(ids, xs, ys, rawXs, rawYs, &n);
+        // Build slot-direct view for Protocol B: panel slot k -> virtual slot k
+        useSlotsDirect = g_refHasSlot;
+        if (useSlotsDirect) {
+            for (int k = 0; k < kMaxSlots; ++k) {
+                if (g_slotId[k] >= 0) {
+                    slotIds[k] = g_slotId[k];
+                    slotRawXs[k] = g_slotX[k];
+                    slotRawYs[k] = g_slotY[k];
+                    float sx, sy;
+                    panelToScreen(g_slotX[k], g_slotY[k], &sx, &sy);
+                    slotXs[k] = static_cast<int>(sx);
+                    slotYs[k] = static_cast<int>(sy);
+                } else {
+                    slotIds[k] = -1;
+                    slotRawXs[k] = 0;
+                    slotRawYs[k] = 0;
+                    slotXs[k] = 0;
+                    slotYs[k] = 0;
+                }
+            }
+            // Protocol A fingers (g_protoASnap) have no slot number; if any
+            // are present on a supposedly-B panel treat as fallback to compact.
+            if (g_protoASnap.count > 0) useSlotsDirect = false;
+        }
         if (n > 0) {
             if (!g_gestureActive) {
                 g_gestureConsumed = pointInRegionsLocked(xs[0], ys[0]);
@@ -645,11 +726,13 @@ void publishPointers(bool mirror) {
     }
 
     if (!mirror) return;
-    if (swallow) {
-        // The menu owns this gesture: keep it out of the app underneath.
+    if (swallow && !g_passThrough) {
         uinput_mirror_clear();
+    } else if (useSlotsDirect) {
+        // Zero-delay 1:1 mirror — identical to G:\ai\Aimbot-ai touch_core.cpp
+        uinput_mirror_slots(slotIds, slotRawXs, slotRawYs, slotXs, slotYs, kMaxSlots);
     } else {
-        uinput_mirror_physical(ids, xs, ys, n);
+        uinput_mirror_physical(ids, rawXs, rawYs, xs, ys, n);
     }
 }
 
@@ -718,7 +801,12 @@ extern "C" bool reader_init_with_path(const char* path, int screenW, int screenH
     g_fdHasSlot.push_back(hasSlot);
 
     g_ready = true;
-    LOGD("reader ready: %s max=%d,%d protocol=%s portrait=%dx%d rotation=%d",
+    // INFO, not DEBUG: this is the line that tells a remote report whether we
+    // found the right panel at all, and whether it speaks protocol A or B.
+    // A protocol-A-only stack shows up as touch that works for one finger and
+    // goes wrong on the second, which reads exactly like "his overlay works,
+    // the game does not".
+    LOGI("reader ready: %s max=%d,%d protocol=%s portrait=%dx%d rotation=%d",
          path, maxX, maxY, hasSlot ? "B(slot)" : "A(stream)",
          g_portraitW, g_portraitH, g_rotation);
     return true;
@@ -806,6 +894,7 @@ extern "C" void reader_set_screen_params(int screenW, int screenH, int rotation)
 extern "C" bool reader_grab(void) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_ready) return false;
+
     if (g_grabbed) return true;
 
     int grabbed = 0;
@@ -819,7 +908,11 @@ extern "C" bool reader_grab(void) {
         }
     }
     g_grabbed = grabbed > 0;
-    LOGD("grab: %d/%zu device(s)", grabbed, g_fds.size());
+    // INFO: from this instant the daemon is the device's only source of touch.
+    // Everything the user reports as "the screen does not respond" starts here,
+    // so the log has to be able to say whether we ever took the panel.
+    LOGI("grab: %d/%zu device(s) — panel %s is now ours alone", grabbed, g_fds.size(),
+         g_panelPath.c_str());
     return g_grabbed;
 }
 
@@ -828,7 +921,10 @@ extern "C" void reader_ungrab(void) {
     if (!g_grabbed) return;
     for (int fd : g_fds) ioctl(fd, EVIOCGRAB, 0);
     g_grabbed = false;
-    LOGD("grab released");
+    // INFO: the device has its own touch back from here, regardless of what the
+    // injection side is doing. Pair with the uinput teardown line in
+    // AimbotInput — together they are the whole "touch restored" story.
+    LOGI("grab released");
 }
 
 extern "C" bool reader_is_grabbed(void) { return g_grabbed; }
@@ -844,6 +940,31 @@ extern "C" void reader_set_sink(bool enabled) {
 }
 
 extern "C" bool reader_get_sink(void) { return g_sink; }
+
+/// Turns "let the menu own its gestures" on and off.
+///
+/// ON (passthrough) = mirror everything, exactly like aimbot 1.2.1. OFF = a
+/// gesture that began inside a menu rectangle stays with the menu.
+///
+/// The order matters when it is turned back off mid-gesture: the fingers we had
+/// already mirrored while passthrough was on are still held down on the virtual
+/// device, and nothing will lift them, because from here on the gesture counts
+/// as swallowed and a swallowed gesture is only ever cleared — so lift them
+/// now, once, rather than leaving a stuck pointer behind. Same reasoning as
+/// reader_set_sink() below.
+extern "C" void reader_set_pass_through(bool enabled) {
+    bool changed = false;
+    bool consumed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        changed = (g_passThrough != enabled);
+        g_passThrough = enabled;
+        consumed = g_gestureActive && g_gestureConsumed;
+    }
+    if (changed && !enabled && consumed) uinput_mirror_clear();
+}
+
+extern "C" bool reader_get_pass_through(void) { return g_passThrough; }
 
 extern "C" void reader_set_regions(const int* rects, int count) {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -885,6 +1006,10 @@ extern "C" int reader_poll(int timeoutMs) {
     }
     if (!frame) return 0;
 
+    // We hold the panel exclusively, so the system is NOT receiving the physical
+    // finger natively — mirroring it back through uinput is what lets the app
+    // underneath keep responding. The reader always decodes and publishes the
+    // finger for the menu; the mirror only re-injects when the sink is on.
     publishPointers(g_sink);
 
     // ── Shout, do not paper over ────────────────────────────────────────────

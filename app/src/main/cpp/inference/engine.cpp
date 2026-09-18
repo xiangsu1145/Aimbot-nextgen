@@ -11,6 +11,13 @@
 #include "inference/capabilities.h"
 #include "inference/libpath.h"
 #include "inference/litert_engine.h"
+#include "inference/litert_npu_engine.h"
+#if AIMBOTNG_HAVE_NEUROPILOT
+#include "inference/neuropilot_engine.h"
+#endif
+#if AIMBOTNG_HAVE_NEURON
+#include "inference/neuron_engine.h"
+#endif
 #include "inference/ort_engine.h"
 
 #include <android/log.h>
@@ -21,7 +28,8 @@
 #include <vector>
 
 #define TAG "AimbotInfer"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 
 namespace aimbotng {
 namespace infer {
@@ -47,6 +55,47 @@ const Pair kPairs[] = {
     {Runtime::LiteRT, Ep::Nnapi},
     {Runtime::LiteRT, Ep::Gpu},
     {Runtime::LiteRT, Ep::Htp},
+    // LiteRT 2.x: a different runtime from everything above (libLiteRt.so with
+    // vendor dispatch libraries), despite the shared Runtime. Kept last in the
+    // LiteRT group because it is the one that compiles on the device and the
+    // one a user should reach for deliberately.
+    {Runtime::LiteRT, Ep::Npu},
+    // Neuron (MediaTek APU). Gated by AIMBOTNG_HAVE_NEURON: this backend needs
+    // no MediaTek SDK at build time — the adapter is dlopen'd at runtime and the
+    // delegate is ours — but its source is kept out of the public repo, so it is
+    // compiled only when that flag is set (developer machines / local builds).
+    //
+    // This entry was missing for a while, and the symptom was not "the row is
+    // absent" but "the row is grey and nothing says why": engineRowDisabled()
+    // asks epAvailable(), epAvailable() asks validPair() and returns false on
+    // the first line without a word, so neuron::Adapter was never even asked.
+    // Every explanation added to the adapter was unreachable code. If a pair
+    // is missing here, the engine does not exist as far as the menu is
+    // concerned — keep this table and `implemented()` in step.
+    // Neuron (MediaTek APU). Gated by AIMBOTNG_HAVE_NEURON: this backend needs
+    // no MediaTek SDK at build time — the adapter is dlopen'd at runtime and the
+    // delegate is ours — but its source is kept out of the public repo, so it is
+    // compiled only when that flag is set (developer machines / local builds).
+    //
+    // This entry was missing for a while, and the symptom was not "the row is
+    // absent" but "the row is grey and nothing says why": engineRowDisabled()
+    // asks epAvailable(), epAvailable() asks validPair() and returns false on
+    // the first line without a word, so neuron::Adapter was never even asked.
+    // Every explanation added to the adapter was unreachable code. If a pair
+    // is missing here, the engine does not exist as far as the menu is
+    // concerned — keep this table and `implemented()` in step.
+    //
+    // Temporarily commented out AIMBOTNG_HAVE_NEURON gate so Neuron is wired
+    // in unconditionally (matches the backup build that 9400+ users run).
+    // {Runtime::LiteRT, Ep::Neuron},
+    {Runtime::LiteRT, Ep::Neuron},
+#if AIMBOTNG_HAVE_NEUROPILOT
+    // MediaTek NeuroPilot: a third runtime again (libtflite_mtk.mtk.so), and
+    // the only one here whose library lives on the system rather than in the
+    // APK — so it is the one whose row can go grey for a reason the user did
+    // nothing to cause.
+    {Runtime::LiteRT, Ep::NeuroPilot},
+#endif
 
     // NCNN.
     {Runtime::Ncnn, Ep::Cpu},
@@ -86,7 +135,17 @@ bool implemented(Runtime r, Ep e) {
     if (r == Runtime::LiteRT) {
         return e == Ep::Cpu     || e == Ep::Xnnpack ||
                e == Ep::Nnapi   || e == Ep::Gpu     ||
-               e == Ep::Htp;
+               e == Ep::Htp     || e == Ep::Npu
+        // Temporarily commented out the AIMBOTNG_HAVE_NEURON / _NEUROPILOT
+        // gates so Neuron and NeuroPilot are wired in unconditionally,
+        // matching the backup build.
+        // #if AIMBOTNG_HAVE_NEURON
+               || e == Ep::Neuron
+        // #endif
+        // #if AIMBOTNG_HAVE_NEUROPILOT
+               || e == Ep::NeuroPilot
+        // #endif
+        ;
     }
     return false;
 }
@@ -123,8 +182,15 @@ const char* epLabel(Ep e) {
         case Ep::Nnapi:   return "NNAPI";
         case Ep::Gpu:     return "GPU";
         case Ep::Vulkan:  return "Vulkan";
-        case Ep::Htp:     return "HTP";
-        default:          return "?";
+        case Ep::Htp:        return "HTP";
+        case Ep::Npu:        return "NPU";
+#if AIMBOTNG_HAVE_NEURON
+        case Ep::Neuron:     return "Neuron";
+#endif
+#if AIMBOTNG_HAVE_NEUROPILOT
+        case Ep::NeuroPilot: return "NeuroPilot";
+#endif
+        default:             return "?";
     }
 }
 
@@ -194,8 +260,20 @@ const char* epImplementationState(Runtime r, Ep e) {
 // ── Probing ─────────────────────────────────────────────────────────────────
 
 bool epAvailable(Runtime r, Ep e) {
-    if (!validPair(r, e)) return false;
-    if (!implemented(r, e)) return false;
+    // Both of these returns used to be silent, and that is how a greyed-out
+    // menu row with no explanation in the log became possible. A row is grey
+    // for exactly three reasons — the pair is not in the table, the engine is
+    // not written, or the probe failed — and each now says so.
+    if (!validPair(r, e)) {
+        LOGW("backend unavailable: %s — not a pair this build knows about "
+             "(engine.cpp kPairs is the list; a missing entry hides the whole "
+             "engine, not just the row)", pairLabel(r, e));
+        return false;
+    }
+    if (!implemented(r, e)) {
+        LOGW("backend unavailable: %s — engine not implemented yet", pairLabel(r, e));
+        return false;
+    }
 
     const int ri = static_cast<int>(r);
     const int ei = static_cast<int>(e);
@@ -255,6 +333,119 @@ bool epAvailable(Runtime r, Ep e) {
             LOGI("backend available: %s (htp v%d)", pairLabel(r, e), caps.htpArch);
             return true;
         }
+        // LiteRT 2.x NPU: the runtime plus a dispatch/compiler-plugin pair for
+        // *this* vendor. Existence only — deliberately no dlopen. Loading
+        // libLiteRt.so pulls in 5 MB of runtime and, on some vendors, starts
+        // poking at the NPU; doing that to answer a menu question is how a
+        // settings screen ends up costing a second of boot. Whether it actually
+        // initialises is LiteRtNpuEngine::load()'s problem, and it has a better
+        // error message for it.
+        if (e == Ep::Npu) {
+            const auto& caps = capabilities();
+            if (!caps.isQualcomm && !caps.isMediaTek) {
+                p.ok  = false;
+                p.why = "no MediaTek or Qualcomm SoC detected — LiteRT 2.x NPU "
+                        "dispatch only ships for those two";
+                return false;
+            }
+            if (!libraryPresent("libLiteRt.so")) {
+                p.ok  = false;
+                p.why = "libLiteRt.so is not on this device (LiteRT 2.x AAR)";
+                return false;
+            }
+            const char* dispatch = caps.isQualcomm ? "libLiteRtDispatch_Qualcomm.so"
+                                                   : "libLiteRtDispatch_MediaTek.so";
+            const char* plugin   = caps.isQualcomm ? "libLiteRtCompilerPlugin_Qualcomm.so"
+                                                   : "libLiteRtCompilerPlugin_MediaTek.so";
+            if (!libraryPresent(dispatch)) {
+                p.ok  = false;
+                p.why = std::string(dispatch) + " is not on this device";
+                return false;
+            }
+            // The dispatch library alone is not enough. Without the matching
+            // compiler plugin the vendor options are accepted and ignored, and
+            // the graph runs on a path an order of magnitude slower with no
+            // error anywhere — so this is checked, not assumed.
+            if (!libraryPresent(plugin)) {
+                p.ok  = false;
+                p.why = std::string(plugin) +
+                        " is missing — without it the NPU options are silently "
+                        "ignored (the non-JIT archive ships dispatch only)";
+                return false;
+            }
+            p.ok = true;
+            LOGI("backend available: %s (%s, dispatch + JIT compiler plugin)",
+                 pairLabel(r, e), caps.isQualcomm ? "Qualcomm" : "MediaTek");
+            return true;
+        }
+#if AIMBOTNG_HAVE_NEUROPILOT
+        // NeuroPilot: the one backend whose library is a *system* one rather
+        // than something we shipped, so the only honest answer is to try. This
+        // really does dlopen several megabytes of MediaTek's TFLite fork, which
+        // is expensive enough that it is worth saying why it is worth it:
+        //   - every other failure mode here is "the .so is not in the APK",
+        //     which libraryPresent() answers without loading anything;
+        //   - this one is "the device does not have NeuroPilot", which only
+        //     dlopen can distinguish from "the device has it but the shell
+        //     namespace cannot reach it" — and those two have different fixes.
+        // It runs once: epAvailable() caches per pair.
+        if (e == Ep::NeuroPilot) {
+            std::string why;
+            if (!neuropilotAvailable(&why)) {
+                p.ok  = false;
+                p.why = why;
+                LOGW("backend unavailable: %s — %s", pairLabel(r, e), why.c_str());
+                return false;
+            }
+            p.ok = true;
+            LOGI("backend available: %s", pairLabel(r, e));
+            return true;
+        }
+#endif
+        // Neuron: unlike NeuroPilot this backend needs no MediaTek SDK at build
+        // time — the adapter is dlopen'd at runtime and the whole delegate is
+        // ours — so the probe is the same shape but the failure modes are
+        // different and each gets its own sentence:
+        //   - Android < 12: no NDK AHardwareBuffer/APU path worth taking, and
+        //     the adapter refuses to expose a device anyway;
+        //   - adapter .so absent: a device with no MediaTek NPU at all;
+        //   - adapter present but device count 0: the NPU is there but the
+        //     APU driver has not been brought up (or is owned by another
+        //     process), which is a different fix again.
+        // neuronAvailable() distinguishes them; epAvailable() caches per pair,
+        // so the dlopen cost is paid once.
+        // Neuron: unlike NeuroPilot this backend needs no MediaTek SDK at build
+        // time — the adapter is dlopen'd at runtime and the whole delegate is
+        // ours — so the probe is the same shape but the failure modes are
+        // different and each gets its own sentence:
+        //   - Android < 12: no NDK AHardwareBuffer/APU path worth taking, and
+        //     the adapter refuses to expose a device anyway;
+        //   - adapter .so absent: a device with no MediaTek NPU at all;
+        //   - adapter present but device count 0: the NPU is there but the
+        //     APU driver has not been brought up (or is owned by another
+        //     process), which is a different fix again.
+        // neuronAvailable() distinguishes them; epAvailable() caches per pair,
+        // so the dlopen cost is paid once.
+        //
+        // Temporarily commented out the AIMBOTNG_HAVE_NEURON gate so the
+        // Neuron probe runs unconditionally, matching the backup build.
+        // #if AIMBOTNG_HAVE_NEURON
+        if (e == Ep::Neuron) {
+            std::string why;
+            if (!neuronAvailable(&why)) {
+                p.ok  = false;
+                p.why = why;
+                // Greyed rows used to be silent here, so a device-side capture
+                // showed the option disabled and nothing else. The reason is
+                // the whole point of asking.
+                LOGW("backend unavailable: %s — %s", pairLabel(r, e), why.c_str());
+                return false;
+            }
+            p.ok = true;
+            LOGI("backend available: %s", pairLabel(r, e));
+            return true;
+        }
+        // #endif
         std::string why;
         if (preload("libtensorflowlite.so", &why) == nullptr) {
             p.ok  = false;
@@ -273,6 +464,7 @@ bool epAvailable(Runtime r, Ep e) {
 
     p.ok  = false;
     p.why = "engine not implemented yet";
+    LOGW("backend unavailable: %s — %s", pairLabel(r, e), p.why.c_str());
     return false;
 }
 
@@ -329,6 +521,39 @@ std::unique_ptr<Engine> create(Runtime r, Ep e, std::string* why) {
     }
 
     if (r == Runtime::LiteRT) {
+        // Ep::Npu is a different runtime in a LiteRT-shaped coat: libLiteRt.so
+        // with vendor dispatch, not libtensorflowlite_jni.so with delegates. It
+        // gets its own engine class rather than a branch inside LiteRtEngine
+        // because almost nothing between them is shared — not the API, not the
+        // handles, not the way acceleration is selected.
+        if (e == Ep::Npu) {
+            auto engine = std::make_unique<LiteRtNpuEngine>();
+            if (why != nullptr) why->clear();
+            return engine;
+        }
+#if AIMBOTNG_HAVE_NEUROPILOT
+        // NeuroPilot: MediaTek's TFLite fork. Like Ep::Npu it is a whole
+        // runtime behind a LiteRT-shaped name, but it is not the same library
+        // and shares no handles with it, so it gets its own engine too.
+        if (e == Ep::NeuroPilot) {
+            auto engine = std::make_unique<NeuroPilotEngine>();
+            if (why != nullptr) why->clear();
+            return engine;
+        }
+#endif
+        // Neuron: Google's TFLite interpreter plus our own delegate, so it is
+        // closer to LiteRtEngine than to the two above — same library, same
+        // handles — but it still gets its own class because the delegate, the
+        // partition policy and the failure reporting are all different, and
+        // folding that into LiteRtEngine would mean two unrelated ways to pick
+        // a delegate living in one function.
+#if AIMBOTNG_HAVE_NEURON
+        if (e == Ep::Neuron) {
+            auto engine = std::make_unique<NeuronEngine>();
+            if (why != nullptr) why->clear();
+            return engine;
+        }
+#endif
         // LiteRtEngine::load() does its own runtime-specific gating (it asks
         // buildDelegate() for a delegate and surfaces a clear error if the
         // device lacks a usable skel). The factory just constructs the

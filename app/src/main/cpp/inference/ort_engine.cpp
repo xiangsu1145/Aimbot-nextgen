@@ -199,9 +199,13 @@ const char* dtypeName(ONNXTensorElementDataType t) {
 ///  * Without a declared count, assume 4 + nc — the v8/v11 export. That is the
 ///    common case and the one the Model page's Add dialog produces. The guess is
 ///    logged with the shape so a wrong box count is traceable to it.
+///
+/// The decision itself is shared with the TFLite backends (resolveHeadLayout, in
+/// postprocess.h) so all four engines answer the v5-vs-v8 question the same way;
+/// this function only reads the ONNX shape into the arguments that one takes.
 void resolveLayout(const std::vector<int64_t>& dims, size_t declaredClasses,
-                   int& anchors, int& channels, bool& channelsFirst,
-                   HeadLayout& layout, int& numClasses) {
+                   int inputSize, int& anchors, int& channels,
+                   bool& channelsFirst, HeadLayout& layout, int& numClasses) {
     channelsFirst = false;
     layout = HeadLayout::V8ChannelsFirst;
 
@@ -225,29 +229,8 @@ void resolveLayout(const std::vector<int64_t>& dims, size_t declaredClasses,
         channels = static_cast<int>(dims[1]);
     }
 
-    if (declaredClasses > 0) {
-        const int declared = static_cast<int>(declaredClasses);
-        if (channels == declared + 5) {
-            layout = HeadLayout::V5Objectness;
-            numClasses = declared;
-            return;
-        }
-        if (channels == declared + 4) {
-            layout = channelsFirst ? HeadLayout::V8ChannelsFirst : HeadLayout::V8Rows;
-            numClasses = declared;
-            return;
-        }
-        LOGW("declared %d classes but the head has %d channels — using the head",
-             declared, channels);
-    }
-
-    // No usable declaration: assume v8.
-    if (channels >= 5) {
-        layout = channelsFirst ? HeadLayout::V8ChannelsFirst : HeadLayout::V8Rows;
-        numClasses = channels - 4;
-    } else {
-        numClasses = 1;
-    }
+    layout = resolveHeadLayout(anchors, channels, channelsFirst, inputSize,
+                               static_cast<int>(declaredClasses), numClasses);
 }
 
 /// Counts the anchors that clear a threshold under one head interpretation,
@@ -446,7 +429,9 @@ Status OrtEngine::load(const ModelSpec& spec) {
                 " outputs; only single-head exports are decoded so far");
         }
 
-        resolveLayout(outDims, spec.classes.size(), impl->anchors, impl->channels,
+        resolveLayout(outDims, spec.classes.size(),
+                      std::max(impl->pre.targetW, impl->pre.targetH),
+                      impl->anchors, impl->channels,
                       impl->channelsFirst, impl->post.layout, impl->post.numClasses);
         impl->post.confidence = std::clamp(spec.confidence, 0.01f, 0.99f);
         impl->post.iou = std::clamp(spec.iou, 0.05f, 0.95f);

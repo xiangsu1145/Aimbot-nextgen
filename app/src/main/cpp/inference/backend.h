@@ -6,15 +6,22 @@
 //  it is something ONNX Runtime can be told to use. So the pair (Runtime, Ep)
 //  is the real identity, and this header is the only place the matrix lives.
 //
-//                     CPU  XNNPACK  NNAPI   GPU  Vulkan   HTP
-//    ONNX Runtime      -     -       -      .      .      -     QNN EP needs a
-//                                                               custom ORT build
-//    LiteRT            -     -       -      -      .      -     XNNPACK *is* its
-//                                                               CPU path
-//    NCNN              -     .       .      .      -      .     Vulkan needs a
-//                                                               rebuild (see note)
-//    QNN (direct)      -     .       .      -      .      -     runs a
-//                                                               pre-compiled .bin
+//                     CPU  XNNPACK  NNAPI   GPU  Vulkan   HTP    NPU
+//    ONNX Runtime      -     -       -      .      .      -      .    QNN EP needs
+//                                                                    a custom ORT
+//                                                                    build
+//    LiteRT            -     -       -      -      .      -      -    XNNPACK *is*
+//                                                                    its CPU path.
+//                                                                    HTP = TFLite
+//                                                                    + QNN delegate,
+//                                                                    NPU = LiteRT 2.x
+//                                                                    vendor dispatch
+//                                                                    (two runtimes,
+//                                                                    both open .tflite)
+//    NCNN              -     .       .      .      -      .      .    Vulkan needs a
+//                                                                    rebuild (see note)
+//    QNN (direct)      -     .       .      -      .      -      .    runs a
+//                                                                    pre-compiled .bin
 //
 //  '-' implemented, '.' not. validPair() is the authority; the table is a
 //  summary and the code is the truth.
@@ -60,6 +67,23 @@ enum class Ep : uint8_t {
     Gpu,           // LiteRT's GPU delegate
     Vulkan,        // NCNN's Vulkan backend
     Htp,           // Hexagon Tensor Processor — the Snapdragon NPU
+    Npu,           // LiteRT 2.x vendor dispatch: MediaTek Neuron / Qualcomm HTP
+    /// MediaTek NeuroPilot — not a delegate, MediaTek's own fork of TFLite
+    /// (libtflite_mtk.mtk.so) with the Neuron APU wired into the graph build.
+    /// Third .so, same .tflite file. Backend is gated on
+    /// AIMBOTNG_HAVE_NEUROPILOT (closed-source SDK), but the enum value is
+    /// always present so other enumerators do not shift.
+    NeuroPilot,
+    /// MediaTek Neuron, driven *directly* — Google's TFLite interpreter plus a
+    /// delegate this project builds itself (neuron_delegate.cpp), talking to
+    /// /system_ext/lib64/libneuronusdk_adapter.mtk.so by dlopen.
+    ///
+    /// Distinct from NeuroPilot on purpose, and the distinction is the whole
+    /// reason the value exists: NeuroPilot replaces the runtime and reports
+    /// only that it loaded, while this keeps the stock interpreter and asks the
+    /// vendor, per operation, whether the APU accepts it. The first one can
+    /// look healthy while running entirely on the CPU; the second cannot.
+    Neuron,
     Count
 };
 

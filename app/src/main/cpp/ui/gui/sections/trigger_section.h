@@ -141,7 +141,8 @@ struct PageTrigger {
 extern PageTrigger g_pageTrigger;
 
 void drawTriggerSection(ImDrawList* dl, float x, float& y, float w,
-                        float bottomY, float s, float es, const Xf& xf);
+                        float bottomY, float s, float es, const Xf& xf,
+                        Scroll& sc);
 
 /// Draw the Trigger page's screen-space overlays (touch-area dashed box and
 /// hold-area circle), including all drag/interaction handling. Called from

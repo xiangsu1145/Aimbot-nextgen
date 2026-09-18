@@ -114,5 +114,40 @@ void frameToTarget(const LetterboxMap&, float& x1, float& y1, float& x2,
 /// The config a model of this size and class count wants.
 PostprocessConfig postprocessFor(int inputSize, int numClasses);
 
+/// Decides the head layout and the class count from a head's shape.
+///
+/// Every engine needs this, and every engine used to carry its own copy — which
+/// is how the same off-by-one shipped four times. The rules, in order:
+///
+///  1. **A declared class count wins.** It is the only fact available from
+///     outside the graph, and it is the fact a user can fix in the model list.
+///     The 4 vs 5 offset then follows: v5 inserts an objectness score between
+///     the box and the classes, v8 does not.
+///
+///  2. **Nothing declared: the anchor grid decides.** The grid a YOLO head runs
+///     on is known — (H/8)² + (H/16)² + (H/32)² anchors for an anchor-free v8
+///     export, and *three times* that for a v5 one, because v5 still carries
+///     three anchor boxes per cell. So for a 256-pixel input the two candidates
+///     are 1344 and 4032, and an observed anchor count matching one of them
+///     exactly settles the layout. This is the part a channel-count rule cannot
+///     do: [1,5,1344] and [1,4032,7] are both "a head", and only the anchors
+///     say which family they came from.
+///
+///  3. **Otherwise v8**, the export the Add-Model dialog produces. The guess is
+///     logged so a wrong box count can be traced back to it.
+///
+/// An exact grid match is required for (2) and a non-matching count falls
+/// through to (3), so an unrecognised model behaves exactly as it did before.
+///
+/// `channelsFirst` selects only between the two v8 spellings; `V5Objectness` is
+/// a statement about the numbers, and orientation travels separately (see
+/// OutputTensor::channelsFirst). `inputSize` is the model's square input edge;
+/// 0 or a non-dividing value disables rule (2). `numClasses` is left at 0 only
+/// when the head carries no class scores at all, which the caller reports as a
+/// bad head.
+HeadLayout resolveHeadLayout(int anchors, int channels, bool channelsFirst,
+                             int inputSize, int declaredClasses,
+                             int& numClasses);
+
 }  // namespace infer
 }  // namespace aimbotng

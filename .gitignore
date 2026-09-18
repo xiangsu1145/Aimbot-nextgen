@@ -36,3 +36,64 @@ __pycache__/
 .gradle-home/
 .kotlin/
 .verify/
+
+# ── MediaTek NeuroPilot (closed-source backend) ─────────────────────
+# NeuroPilot is built against MediaTek's proprietary SDK, which is not
+# redistributable. The engine, its header, and the runtime symbols stay
+# on developer machines and are wired in via AIMBOTNG_HAVE_NEUROPILOT.
+app/src/main/cpp/include/NeuroPilotTFLite.h
+app/src/main/cpp/inference/neuropilot_engine.h
+app/src/main/cpp/inference/neuropilot_engine.cpp
+
+# ── MediaTek Neuron APU delegate (private backend, not open-sourced) ──
+# The project's own delegate + engine source. Kept out of the public repo;
+# wired in via AIMBOTNG_HAVE_NEURON (see CMakeLists.txt / gradle.properties).
+app/src/main/cpp/include/NeuronAdapter.h
+app/src/main/cpp/inference/neuron_engine.h
+app/src/main/cpp/inference/neuron_engine.cpp
+app/src/main/cpp/inference/neuron_delegate.h
+app/src/main/cpp/inference/neuron_delegate.cpp
+
+# ── MediaTek proprietary binary dumps (not redistributable) ──────────
+mtk_npu_libs/
+libtflite_mtk.mtk.so
+libtflite_mtk.mtk.so.*
+libtflite_mtk.mtk_for9400+.so
+libandroid_pulled.so
+libmediandk.so
+libutils_pulled.so
+framework.jar
+tombstone_29.txt
+tombstones_pulled/
+
+# ── Neuron reverse-engineering notes & tooling (private IP) ──────────
+docs/neuron-delegate-reverse-v2.md
+docs/mtk-litert-npu-crash.md
+tools/_diag/
+
+# ── Temp / private models & intermediate artifacts (never commit) ────
+_tmp_*.tflite
+_tmp_models/
+best_int8.tflite
+Dawan_*.tflite
+_crop_head.png
+_shot_verify.png
+dis.txt
+
+# ── Neuron/LiteRT-NPU engine (private backend, same policy as above) ──
+app/src/main/cpp/inference/litert_npu_engine.h
+app/src/main/cpp/inference/litert_npu_engine.cpp
+
+# ── RE artifacts, local tooling, private dumps & models ──────────────
+.tmp_ida/
+.tmp_ref/
+.mcp.json
+buckup/
+models/
+probe/
+pid.cpp
+calibration_image_sample_data_20x128x128x3_float32.npy
+tools/ida_mcp_probe.py
+app/src.zip
+app/src (2).zip
+app/src/main/jniLibs/

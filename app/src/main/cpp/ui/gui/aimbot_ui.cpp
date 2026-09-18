@@ -30,6 +30,8 @@
 #include "inference/model_runtime.h"
 #include "input/skip_screenshot.h"
 #include "ui/gui/float_button.h"
+#include "ui/gui/notify.h"
+#include "ui/gui/sections/settings_section.h"
 
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
@@ -118,6 +120,15 @@ static int64_t nowUs() {
         .count();
 }
 
+/// Milliseconds between a steady_clock mark and now. Used only by the
+/// render-thread bring-up timing, where the point is to say how long Vulkan and
+/// ImGui took on this device rather than to be precise to the microsecond.
+static double msSince(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+}
+
 // ── Refresh-rate vote ───────────────────────────────────────────────────────
 // Voting 120 Hz once at start-up pins the *panel* to 120 Hz for as long as the
 // layer exists — SurfaceFlinger recomposes a 2K screen 120 times a second on
@@ -141,6 +152,10 @@ constexpr int64_t kVoteHoldUs = 2'000'000;
 ANativeWindow* g_window = nullptr;  // owned; released by stop()
 std::atomic<bool> g_running{false};
 pthread_t g_thread = 0;
+/// Render-thread-local. Set once, when the first present has been queued, so
+/// the bring-up timing is logged exactly once and a later frame cannot repeat
+/// it. Render thread only — no synchronisation needed and none wanted.
+bool g_firstFrameLogged = false;
 // The ImGui demo was the placeholder while the renderer was being built; the
 // real GUI (ui/gui/hud.*) now draws itself with the draw list. Flip this back
 // to true to get the demo window alongside the board for inspection.
@@ -1059,6 +1074,47 @@ bool updateCaptureTexture() {
     // Told to the frame thread rather than kept private: it is the one doing the
     // crop, so it is the only place the work can actually be avoided.
     capture::setConsuming(wantsPreview || wantsInfer);
+    // The supervisor that owns the virtual display reads this one to decide
+    // whether a mirror is worth holding open, and it has to answer "is anyone
+    // reading pixels" — which includes inference. It used to be handed the
+    // preview half alone, and that is what made the detector need the Capture
+    // page open: with continuous inference on and the page closed, the supervisor
+    // saw no reader, stopped the mirror, and inference had no frame source.
+    //
+    // The switch stays the user's authority and is checked separately
+    // (`wanted = switch && reader`, see ShellServerEntry.startCaptureSupervisor),
+    // so this does not resurrect the older bug where holding to infer kept a
+    // mirror alive on a switch that read "off" — capture::enabled() is still
+    // false in that case and the AND still fails.
+    capture::setPreviewWanted(wantsPreview || wantsInfer);
+
+    // ── The frame generation, and why it must not be gated on the preview ───
+    //
+    // `g_frameId` is bumped by the *producer* (capture::pushFrame) on every frame
+    // it delivers, and it is the only thing `copyLatestInto` compares to answer
+    // "is this newer". So this gate does not control the counter — what it
+    // controls is whether the producer is running at all: `capture::previewWanted`
+    // is what the shell's capture supervisor reads to decide whether a virtual
+    // display is worth holding open (see ShellServerEntry.startCaptureSupervisor,
+    // `wanted = switch && preview`).
+    //
+    // While this function returned early on `!wantsPreview`, that OR was missing
+    // from the *supervisor*'s view too: with inference running and the Capture
+    // page closed, previewWanted stayed false, the supervisor stopped the mirror,
+    // and the detector had no frame source at all. Opening the Capture page was
+    // what started the producer — hence "inference only works with that page
+    // open", which looked like the page was doing the inferring.
+    //
+    // The two flags stay separate in meaning — inference must not be able to hold
+    // a mirror open behind a switch that reads "off" (capture.h) — but "capture
+    // is on and something is reading" has to count inference as a reader. The
+    // switch is what the user controls; the *reader* half is what this function
+    // reports, and inference is a reader.
+    if (!wantsPreview && !wantsInfer) return false;
+
+    // Preview-specific from here down: staging slot, texture, upload. Inference
+    // needs none of it — it takes its own copy of the pixels in pump() — so a
+    // frame nobody is previewing leaves this function without touching them.
     if (!wantsPreview) return false;
 
     int frameW = 0, frameH = 0;
@@ -1415,7 +1471,25 @@ void destroyVulkan() {
 }
 
 void* renderThread(void*) {
-    bool ok = initVulkan() && initImGui();
+    // The gap this closes: uiStart() returns the instant pthread_create does,
+    // so from Kotlin's side "LAYER renderer started" means "the thread exists",
+    // not "the menu is drawing". Everything that can actually be slow — Vulkan
+    // device + swapchain creation, the embedded font atlases, the first
+    // descriptor pool — happens here, after the JNI call has already answered.
+    //
+    // So the phases are timed and logged individually. A capture that shows
+    // LAYER renderer started with no `render: first frame` after it is a
+    // capture of a render thread stuck in initVulkan, and the last phase line
+    // names which call it is inside.
+    const auto tInit0 = std::chrono::steady_clock::now();
+    const bool vkOk = initVulkan();
+    LOGI("render: initVulkan %s in %.1fms", vkOk ? "ok" : "FAILED", msSince(tInit0));
+    const auto tImGui0 = std::chrono::steady_clock::now();
+    const bool imguiOk = vkOk && initImGui();
+    LOGI("render: initImGui %s in %.1fms (total %.1fms)",
+         imguiOk ? "ok" : "FAILED", msSince(tImGui0), msSince(tInit0));
+
+    bool ok = vkOk && imguiOk;
     if (!ok) {
         LOGE("Vulkan/ImGui initialisation failed, render thread exiting");
         // Clean up whatever got created before the failure.
@@ -1498,6 +1572,16 @@ void* renderThread(void*) {
         updateRegions();
         ImGui::Render();
         drawFrame();
+        // The end of the bring-up, and the line to look for. `drawFrame()`
+        // having returned means the swapchain acquired, the command buffers
+        // recorded and the present was queued — i.e. there is something on the
+        // layer. Anything before this is "the menu is not up yet"; this line is
+        // "the menu is up".
+        if (!g_firstFrameLogged) {
+            g_firstFrameLogged = true;
+            LOGI("render: first frame presented %.1fms after the render thread started",
+                 msSince(tInit0));
+        }
 #endif
         // ── Pick the rate for this period ───────────────────────────────────
         // A frame that changed nothing does not need redrawing, and a board
@@ -1507,11 +1591,21 @@ void* renderThread(void*) {
         const int64_t idleFor = frameStartUs - lastActivityUs;
 
         const bool hidden = hudHidden();
+        // The detector counts as "wanted" while the finger is down even if
+        // `wantsFrames()` is still false — see holdToInferHeld(). On a cold
+        // start arm() is deferred until the compile lands, so the runtime flag
+        // stays false for the whole compile; without this OR the loop would sit
+        // in the dormant tier at 2 fps and then feed the detector at 2 fps for
+        // as long as the finger was held. Checked before `hidden` for the same
+        // reason wantsFrames() is: a hidden menu with a finger down is a person
+        // aiming, which is exactly the case the dormant tier must not catch.
+        const bool inferring = infer::runtime::wantsFrames() ||
+                               sections::holdToInferHeld();
         int64_t periodUs;
         if (idleFor < kActiveHoldUs) {
             periodUs = kFramePeriodUs;
             pacedFps = kTargetFps;
-        } else if (infer::runtime::wantsFrames()) {
+        } else if (inferring) {
             // Checked before `hidden`, not after: the case that matters most is a
             // hidden menu with a detector running, which is a person aiming. The
             // dormant tier would starve it to 2 frames a second and the only
@@ -1683,6 +1777,10 @@ void stop() {
         std::lock_guard<std::mutex> lock(g_regionMutex);
         g_regions.clear();
     }
+    // Toasts belong to the render session, not to the daemon: leaving them
+    // would have a freshly started renderer fade in notices about a compile
+    // that finished before the last stop(), with lifetimes already expired.
+    aimbotng::ui::notify::clear();
     LOGI("stopped");
 }
 

@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include "aim_section.h"
 
+#include "ui/gui/sections/backflash_section.h"
 #include "ui/gui/hud.h"
 #include "ui/gui/theme.h"
 
@@ -16,6 +17,7 @@
 
 #include "inference/model_runtime.h"
 #include "inference/model_store.h"
+#include "input/inject_backend.h"
 #include "input/uinput_inject.h"
 #include "input/touch_reader.h"
 #include "tracking/kalman_tracker.h"
@@ -221,49 +223,66 @@ bool realFingerInTouchArea(int& outId, float& outX, float& outY) {
 // frame-rate-independent step and uploads the new position. Shared by both the
 // synthetic and the real-finger (fusion) paths so the aim math is identical.
 //
-// `deadzonePx` is the global radial stop radius (both axes hold). `yDzPx` is
-// the per-class Y-only stop band: once the crosshair is vertically within
-// `yDzPx` of the target centre, Y freezes and X keeps tracking on its own.
+// `deadzonePx` is the global PER-AXIS stop radius: X freezes when |target.x -
+// centre.x| <= deadzonePx and Y freezes when |target.y - centre.y| <= deadzonePx
+// (decoupled, not a single radial circle — see the deadzone note below). `yDzPx`
+// is the per-class Y-only stop band, a wider/narrower band than the global one:
+// once the crosshair is vertically within `yDzPx` of the target centre, Y freezes
+// and X keeps tracking on its own.
+//
+// `physDeltaX/Y`: physical touch delta in px from the last frame. When non-zero
+// and the aim direction and physical direction align (dot > 0), the physical delta
+// is ADDED to the aim output — so the player's fine adjustment is preserved.
+// When directions conflict, only the aim output is used.
 static void driveAimToTarget(TouchAimState& st, int slot,
                              const ImVec2& target, const ImVec2& screenCenter,
-                             const ImGuiIO& io, float deadzonePx, float yDzPx) {
-    float dt = io.DeltaTime;
-    if (!(dt > 0.0f)) dt = 1.0f / 60.0f;
-    dt = std::clamp(dt, 1.0f / 120.0f, 1.0f / 15.0f);
-    const float nstep = std::clamp(dt * 60.0f, 0.5f, 3.0f);
-
-    // Deadzone — old-project `convergeThresh` semantics: once the TARGET is
-    // within `deadzonePx` of the SCREEN CENTRE (crosshair), stop nudging and
-    // hold steady. The crosshair is a fixed point, so this is stable: target
-    // jitter near centre stays inside the deadzone and the aim settles, instead
-    // of a finger-to-target check that chases every frame's box wiggle (which is
-    // why the original finger-distance deadzone looked like it did nothing).
-    // The finger stays pressed (convergence hold); only the per-frame move is
-    // suppressed.
+                             const ImGuiIO& io, float deadzonePx, float yDzPx,
+                             float physDeltaX, float physDeltaY) {
+    (void)io;  // dt kept for step() API compat; PPID is frame-rate-independent
+    // Deadzone — decoupled per-axis stop radius.  A single radial circle was the
+    // old code's bug: a target oscillating along X keeps popping OUTSIDE the
+    // circle even when Y is at rest, dragging X onto the target centre.  Per-axis
+    // freezing holds whichever axis is already inside its band.  The reference is
+    // the SCREEN CENTRE (the crosshair), not the live finger.
     const float dex = target.x - screenCenter.x;
     const float dey = target.y - screenCenter.y;
-    if (dex * dex + dey * dey <= deadzonePx * deadzonePx) {
-        st.aim.prevAppliedX = 0.0f;
-        st.aim.prevAppliedY = 0.0f;
-        return;
+    const bool xInDz  = deadzonePx > 0.0f && dex * dex <= deadzonePx * deadzonePx;
+    const bool yInDz  = deadzonePx > 0.0f && dey * dey <= deadzonePx * deadzonePx;
+    const bool yInYFollow = yDzPx > 0.0f && dey * dey <= yDzPx * yDzPx;
+    if (xInDz && (yInDz || yInYFollow)) return;
+
+    float moveX = 0.0f, moveY = 0.0f;
+    // PPID takes raw error (target - current) and returns displacement in px.
+    st.aim.step(dex, dey, 0.0f, moveX, moveY);
+
+    // Per-axis freeze: if an axis is inside its band, don't move it this frame.
+    if (xInDz)          moveX = 0.0f;
+    if (yInDz || yInYFollow) moveY = 0.0f;
+
+    // Fusion: add physical touch delta when aim direction and physical direction align.
+    const float physLen2 = physDeltaX * physDeltaX + physDeltaY * physDeltaY;
+    if (physLen2 > 0.25f) {  // > 0.5 px threshold to ignore jitter
+        const float aimLen2 = moveX * moveX + moveY * moveY;
+        if (aimLen2 > 0.25f) {
+            // Both aim and physical have non-trivial output — check direction alignment.
+            const float aimLen   = std::sqrt(aimLen2);
+            const float physLen  = std::sqrt(physLen2);
+            const float dot = (moveX * physDeltaX + moveY * physDeltaY) / (aimLen * physLen);
+            if (dot > 0.0f) {
+                // Same direction: blend physical delta fully into aim output.
+                moveX += physDeltaX;
+                moveY += physDeltaY;
+            }
+            // dot <= 0: opposing or perpendicular — use pure aim, do nothing.
+        } else {
+            // Aim output near zero — use pure physical delta (aim converged, user nudges).
+            moveX = physDeltaX;
+            moveY = physDeltaY;
+        }
     }
 
-    ImVec2 move;
-    // Error reference is the SCREEN CENTRE (the crosshair), NOT the live finger —
-    // that is the fix for the "screen-centre coordinate" bug. The finger is seeded
-    // at its start point and moved by this vector, so the on-panel delta encodes
-    // the aim (exactly like the old project's AimController, which uses
-    // executeAiming(targetX, targetY, centerX, centerY) with centre = captureW/2).
-    st.aim.step(target, screenCenter, dt, move);
-    // Per-class Y follow: the crosshair is vertically "inside enough" — freeze
-    // Y, keep tracking X. Zeroed before prevApplied is latched so the damping
-    // term does not inject a stale Y velocity next frame.
-    const float dy0 = target.y - screenCenter.y;
-    if (dy0 * dy0 <= yDzPx * yDzPx) move.y = 0.0f;
-    st.aim.prevAppliedX = move.x;
-    st.aim.prevAppliedY = move.y;
-    st.position.x += move.x * nstep;
-    st.position.y += move.y * nstep;
+    st.position.x += moveX;
+    st.position.y += moveY;
     uinput_move(slot, static_cast<int>(st.position.x), static_cast<int>(st.position.y));
 }
 
@@ -547,92 +566,6 @@ void AimCategoryState::syncFromModel(const std::vector<std::string>& modelClasse
         synced = true;
     }
 }
-
-// ── AimController (ported from Aimbot-ai old project's AimController) ─────────
-
-void AimController::step(ImVec2 target, ImVec2 current, float /*dt*/, ImVec2& outMove) {
-    const float errX = target.x - current.x;
-    const float errY = target.y - current.y;
-
-    // Feedforward seed: EMA of the target's per-frame motion, so a moving target
-    // is led rather than always chased from behind. (Per-reference-frame delta,
-    // proportional to velocity at 60 Hz — the old project's smoothVel.)
-    if (hasPrevTarget) {
-        float dtx = target.x - prevTargetX;
-        float dty = target.y - prevTargetY;
-        // Dead zone: detection boxes jitter ±1-2 px even on a still target.
-        // Below threshold treat as 0 so the feedforward term does not amplify
-        // jitter into phantom velocity (matches the old project).
-        if (std::fabs(dtx) < 2.0f) dtx = 0.0f;
-        if (std::fabs(dty) < 2.0f) dty = 0.0f;
-        smoothVelX = smoothVelX * 0.7f + dtx * 0.3f;
-        smoothVelY = smoothVelY * 0.7f + dty * 0.3f;
-    }
-    prevTargetX = target.x;
-    prevTargetY = target.y;
-    hasPrevTarget = true;
-
-    // Integral separation + anti-windup: accumulate only while |error| is small;
-    // reset on a sign change so a swing the other way does not carry stale area.
-    const float sep = integralSeparationThresh;
-    if (std::fabs(errX) < sep) {
-        if (errX * prevErrX <= 0.0f) integX = 0.0f;
-        integX += errX;
-        integX = std::clamp(integX, -integralLimit, integralLimit);
-    } else {
-        integX *= 0.5f;
-    }
-    if (std::fabs(errY) < sep) {
-        if (errY * prevErrY <= 0.0f) integY = 0.0f;
-        integY += errY;
-        integY = std::clamp(integY, -integralLimit, integralLimit);
-    } else {
-        integY *= 0.5f;
-    }
-
-    // Derivative EMA — raw dE/dt amplifies box jitter into D-term spikes; the
-    // filter kills that without throwing the D term away entirely.
-    const float rawDerivX = errX - prevErrX;
-    const float rawDerivY = errY - prevErrY;
-    derivFiltX = derivFilterAlpha * rawDerivX + (1.0f - derivFilterAlpha) * derivFiltX;
-    derivFiltY = derivFilterAlpha * rawDerivY + (1.0f - derivFilterAlpha) * derivFiltY;
-    prevErrX = errX;
-    prevErrY = errY;
-
-    // Per-axis gain — Y is attenuated to keep the noisier vertical axis steady.
-    const float kpY = kp * kpYRatio;
-    const float kdY = kd * kdYRatio;
-
-    float rawX = errX * kp + integX * ki + derivFiltX * kd;
-    float rawY = errY * kpY + integY * ki + derivFiltY * kdY;
-
-    // Feedforward (F term): lead a moving target.
-    //     raw += smoothVel × kf × kfGain
-    // NOTE: the Kalman-tracker's velocity (targetVelX/Y) is held on the
-    // controller struct for future use but is NOT read here — the user asked
-    // to disable the predictive path on 2026-09-13 and use the old project's
-    // smoothVel path only. Re-enabling prediction is a one-line swap in this
-    // block; the fields and the slider are kept around for that day.
-    rawX += smoothVelX * kf * kfGain;
-    rawY += smoothVelY * kf * kfGain * kfYRatio;
-
-    // Velocity damping (rate feedback): subtract a fraction of last frame's
-    // applied move so the approach brakes near the target and does not bounce.
-    rawX -= prevAppliedX * velocityDamping;
-    rawY -= prevAppliedY * velocityDamping;
-
-    // Per-frame clamp — bound the step regardless of gain scale.
-    const float md = std::sqrt(rawX * rawX + rawY * rawY);
-    if (md > maxPerFrame) {
-        const float s = maxPerFrame / md;
-        rawX *= s;
-        rawY *= s;
-    }
-
-    outMove.x = rawX;
-    outMove.y = rawY;
-}
-
 // ── TouchAimState ──────────────────────────────────────────────────────────
 
 void TouchAimState::press(const TouchAreaOverlay& area) {
@@ -654,6 +587,8 @@ void TouchAimState::release() {
     phase = Phase::Idle;
     drivingReal = false;
     realId = -1;
+    physX = physY = -1.0f;
+    lastPhysX = lastPhysY = -1.0f;
     // NOTE: justReleasedTakeover is intentionally left as-is here — the takeover
     // release paths set it true just before calling release(), and the Idle
     // branch clears it after reading. Resetting it here would defeat the guard.
@@ -662,24 +597,33 @@ void TouchAimState::release() {
 // ── drawAimSection ──────────────────────────────────────────────────────────
 
 void drawAimSection(ImDrawList* dl, float x, float& y, float w,
-                    float /*bottomY*/, float s, float es, const Xf& xf) {
+                    float /*bottomY*/, float s, float es, const Xf& xf,
+                    Scroll& sc) {
     const float gap   = 12.0f * s;
     const float rowSw = widgets::kSwitchRowH   * s;
     const float rowSl = widgets::kSliderRowH   * s;
     const float rowDd = widgets::kDropdownRowH * s;
 
+    // Each row's rect is built at the scrolled screen y so paint coordinates
+    // and hit-test rectangles stay in lock-step. `y` keeps advancing in natural
+    // (un-scrolled) coordinates, which is what lets drawContent compute the
+    // page's total content height for the scroll-range clamp.
     auto wRect = [&](float wx, float wy, float ww, float wh) {
-        return wRectOf(wx, wy, ww, wh, s, xf);
+        return wRectOf(wx, wy - sc.offset, ww, wh, s, xf);
     };
 
-    // ── PIDF controller parameters ─────────────────────────────────────────
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kp, "Kp", 2, es);
+    // ── PPID controller parameters ─────────────────────────────────────────
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kp,       "Kp",       1, es);
     y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ki, "Ki", 3, es);
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kd,       "Kd",       1, es);
     y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kd, "Kd", 2, es);
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.predictX,  "预测X",    1, es);
     y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kf, "Kf", 3, es);
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.predictY,  "预测Y",    1, es);
+    y += rowSl + gap;
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.rate,     "自适应",   2, es);
+    y += rowSl + gap;
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.smooth,   "平滑",     0, es);
     y += rowSl + gap;
 
     // ── Aim deadzone ────────────────────────────────────────────────────────
@@ -689,23 +633,17 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.deadzone, "死区", 1, es);
     y += rowSl + gap;
 
-    // ── Aim lead (提前量) ──────────────────────────────────────────────────
-    // HIDDEN 2026-09-13: predictive F-term path is disabled (the user reverted
-    // to the old project's smoothVel-only F term). The slider still exists on
-    // the controller and the lead field is still on PageAim, so re-enabling is
-    // a one-line change here + re-writing the controller fields in
-    // syncAimPage. Touch-area toggle follows.
-    // widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.lead, "提前量", 0, es);
-    // y += rowSl + gap;
-
     // ── Touch-area toggle ──────────────────────────────────────────────────
     widgets::switchButton(dl, wRect(x, y, w, rowSw), g_pageAim.touchArea.toggle,
                           "触摸区域", es);
     y += rowSw + gap;
 
     // ── Touch-fusion toggle ───────────────────────────────────────────────
-    // When on, aim drives a real finger held inside the touch area (same slot as
-    // that finger, move-only) instead of pressing a separate synthetic finger.
+    // When on, aim always uses a synthetic finger. If a physical finger is held
+    // inside the touch area, its per-frame delta is blended with the aim output
+    // when both directions align (dot > 0); pure aim is used when directions conflict.
+    // The physical finger mirrors normally to the game. When off, aim takes over
+    // the physical finger exclusively (old behaviour: no synthetic press).
     widgets::switchButton(dl, wRect(x, y, w, rowSw), g_pageAim.fusion,
                           "触摸融合", es);
     y += rowSw + gap;
@@ -895,25 +833,26 @@ void syncAimPage() {
         tracking::tracker().reset();
     }
 
-    // ── Copy slider values into the controller every frame ──────────────────
-    // Cheap, and means slider tweaks take effect on the very next step.
-    p.touchAim.aim.kp = p.kp.value;
-    p.touchAim.aim.ki = p.ki.value;
-    p.touchAim.aim.kd = p.kd.value;
-    p.touchAim.aim.kf = p.kf.value;
-    // NOTE: the predictive F-term (targetVelX/Y + delayFrames) is intentionally
-    // NOT written here any more. The Kalman tracker's velocity is no longer
-    // routed into the controller; the F term uses the old project's smoothVel
-    // path inside step(). The fields are kept on the controller struct and the
-    // "提前量" slider remains on the page, both for future re-enable without
-    // touching the header. To re-enable: write bestVelX/bestVelY into
-    // aim.targetVelX/Y after the picker (the locals already exist), and swap
-    // the F-term line in step() to read them.
-    (void)0;
+    // ── Copy slider values into the PPID controller on every press ───────────
+    // init() is idempotent so calling every frame is safe; it only resets the
+    // PID state when the aim goes Idle (aim.reset() in press()).  Slider tweaks
+    // take effect on the very next step because PPID reads kp/kd/predict/rate/smooth
+    // inside update(), not at init time.
+    p.touchAim.aim.init(
+        p.kp.value, p.kd.value,
+        p.predictX.value, p.predictY.value,
+        p.rate.value, p.smooth.value);
 
     // ── Decide whether the aim loop may fire ────────────────────────────────
     //   * master switch on
-    //   * uinput sink initialised
+    //   * an injection backend is up — asked of the injector, NOT of uinput.
+    //     This used to test uinput_is_ready(), which asks "is there a /dev/uinput
+    //     device?" — true only while the uinput backend is the live one, so
+    //     under the InputManager backend (where the virtual device is destroyed
+    //     on purpose, see input/inject_backend.h) the aim silently did nothing
+    //     at all. The question the aim actually has is "can a finger of mine
+    //     reach the system?", which is what inject_is_ready() answers for
+    //     whichever backend is selected.
     //   * a "hold" is active: continuous-trigger OR a real finger held inside
     //     the trigger area — that is what makes the trigger area meaningful
     //     (it is the fire zone). The touch-area / trigger-area *toggles* do
@@ -922,7 +861,11 @@ void syncAimPage() {
     // When the hold drops mid-press, the synthetic finger is released so the
     // game never sees a phantom finger stuck down.
     const bool holdActive = p.continuousTrigger.value || realFingerInTriggerArea();
-    const bool canAim = p.enabled.value && uinput_is_ready() && holdActive;
+    // Back-flash blocks aim during its whole cycle (it owns UINPUT_SLOT_PRIMARY
+    // — see backflash_section.h). The flag is set by syncBackFlashPage() which
+    // runs BEFORE this function so it is current; we just read it.
+    const bool blockedByBackFlash = backflashIsBlockingAim();
+    const bool canAim = p.enabled.value && inject_is_ready() && holdActive && !blockedByBackFlash;
     if (!canAim) {
         if (p.touchAim.phase == TouchAimState::Phase::Pressed) {
             // Hand a taken-over real finger back to the mirror (no uinput_up, so it
@@ -1004,54 +947,66 @@ void syncAimPage() {
         : 0.0f;
 
     // ── Choose injection mode for this frame ──────────────────────────────────
-    //   Fusion ON + a real finger inside the touch area  -> drive that REAL finger
-    //     (reserve its mirror slot, MOVE only, no synthetic press).
-    //   Otherwise                                       -> synthetic finger on the
-    //     dedicated primary slot, pressed at the touch-area centre when idle.
+    //   Fusion ON:  aim always drives its own synthetic finger.
+    //               If a real finger is in the touch area, read its delta each frame
+    //               and BLEND it with the aim output (directions aligned → add delta;
+    //               opposing → pure aim). The physical finger mirrors normally.
+    //   Fusion OFF: old behaviour — takeover the real finger if present (aim
+    //               exclusively drives it, no synthetic press); otherwise synthetic.
+    //
     // There is only ever ONE active touch point: a real finger being driven is
     // removed from the mirror (uinput_takeover_physical_id), so no second writer
-    // competes on its slot — that duel was the "two coordinates flickering" bug.
+    // competes on its slot. With fusion ON the real finger stays in the mirror.
+
     int  realId = -1;
     float realX = 0.0f, realY = 0.0f;
-    const bool wantTakeover =
-        p.fusion.value && realFingerInTouchArea(realId, realX, realY);
+    const bool realFingerInArea = realFingerInTouchArea(realId, realX, realY);
+
+    // Physical touch delta for this frame (fusion path).
+    float physDeltaX = 0.0f, physDeltaY = 0.0f;
+    if (p.fusion.value && realFingerInArea) {
+        // Same physical finger as last frame — compute delta.
+        if (p.touchAim.realId == realId && p.touchAim.lastPhysX >= 0.0f) {
+            physDeltaX = realX - p.touchAim.lastPhysX;
+            physDeltaY = realY - p.touchAim.lastPhysY;
+        }
+        p.touchAim.lastPhysX = realX;
+        p.touchAim.lastPhysY = realY;
+        p.touchAim.realId    = realId;
+    } else {
+        // No physical finger in area — reset tracking.
+        p.touchAim.lastPhysX = p.touchAim.lastPhysY = -1.0f;
+    }
 
     if (p.touchAim.phase == TouchAimState::Phase::Idle) {
         // ── Idle: start aiming when a selected target is on screen ────────────
         if (!hasTarget) return;
-        if (wantTakeover) {
+        if (!p.fusion.value && realFingerInArea) {
+            // Fusion OFF + real finger present → takeover mode (old behaviour).
             const int slot = uinput_takeover_physical_id(realId);
             if (slot >= 0) {
-                // Real finger is already down — seed at its live position and MOVE it.
-                // Do NOT press: the mirror already reported it down, and reserving its
-                // slot makes us the only writer on it.
                 p.touchAim.position.x = realX;
                 p.touchAim.position.y = realY;
                 p.touchAim.start      = p.touchAim.position;
                 p.touchAim.slot       = slot;
-                p.touchAim.realId     = realId;
                 p.touchAim.drivingReal = true;
                 p.touchAim.phase  = TouchAimState::Phase::Pressed;
                 p.touchAim.aim.reset();
-                driveAimToTarget(p.touchAim, slot, target, screenCenter, io, deadzonePx, yDzPx);
+                driveAimToTarget(p.touchAim, slot, target, screenCenter, io,
+                                 deadzonePx, yDzPx, 0.0f, 0.0f);
                 return;
             }
             // Takeover not ready yet (mirror race). Retry next frame.
         }
         // One-frame guard: if a fusion takeover was just released (real finger
         // lifted), skip spawning a synthetic finger this frame so we don't get a
-        // phantom "extra touch point" the instant the real finger leaves the touch
-        // area. Cleared here and on press()/release(), so it cannot stick.
+        // phantom "extra touch point".
         if (p.touchAim.justReleasedTakeover) {
             p.touchAim.justReleasedTakeover = false;
             return;
         }
-        // Synthetic auto-press. Runs whenever aim is permitted (continuous trigger
-        // OR a real finger in the trigger area) and a target is on screen —
-        // regardless of the fusion toggle. Fusion only decides WHICH finger is
-        // driven *when a real finger is present*; with none present, aim behaves
-        // exactly like normal auto-aim (this is what makes "持续触发" press on its
-        // own instead of requiring a finger in the touch area).
+        // Synthetic auto-press. Fusion ON: always synthetic (aim + physical blend).
+        // Fusion OFF: synthetic when no real finger present.
         p.touchAim.press(p.touchArea);
         p.touchAim.slot        = UINPUT_SLOT_PRIMARY;
         p.touchAim.realId      = -1;
@@ -1065,10 +1020,9 @@ void syncAimPage() {
     // ── Pressed: stay locked on; release only on target-loss ──────────────────
     if (!hasTarget) {
         if (p.touchAim.drivingReal) {
-            // Hand the real finger back to the mirror — no uinput_up, so it does
-            // not flicker down/up. The mirror resumes reporting it seamlessly.
+            // Takeover release (fusion OFF path).
             uinput_release_takeover();
-            p.touchAim.justReleasedTakeover = true;  // guard against a phantom synth point
+            p.touchAim.justReleasedTakeover = true;
         } else {
             uinput_up(p.touchAim.slot);
         }
@@ -1077,29 +1031,24 @@ void syncAimPage() {
     }
 
     if (p.touchAim.drivingReal) {
-        // Still driving a real finger. Re-takeover if the player swapped to a
-        // different in-area finger; otherwise just keep moving it.
-        if (!wantTakeover || p.touchAim.realId != realId) {
+        // Fusion OFF: takeover mode — re-takeover if finger changed or left.
+        if (!realFingerInArea || p.touchAim.realId != realId) {
             uinput_release_takeover();
-            p.touchAim.justReleasedTakeover = true;  // guard against a phantom synth point
+            p.touchAim.justReleasedTakeover = true;
             p.touchAim.drivingReal = false;
             p.touchAim.realId      = -1;
-            p.touchAim.phase = TouchAimState::Phase::Idle;  // re-init next frame
+            p.touchAim.phase = TouchAimState::Phase::Idle;
             return;
         }
-        driveAimToTarget(p.touchAim, p.touchAim.slot, target, screenCenter, io, deadzonePx, yDzPx);
+        driveAimToTarget(p.touchAim, p.touchAim.slot, target, screenCenter, io,
+                         deadzonePx, yDzPx, 0.0f, 0.0f);
         return;
     }
 
-    // Synthetic finger: if fusion now wants a real finger, lift the synthetic
-    // first so there is never more than one active touch point (no duel).
-    if (wantTakeover) {
-        uinput_up(p.touchAim.slot);
-        p.touchAim.release();
-        return;  // next frame takes over the real finger
-    }
-
-    driveAimToTarget(p.touchAim, p.touchAim.slot, target, screenCenter, io, deadzonePx, yDzPx);
+    // Fusion ON path: synthetic finger + physical delta blend.
+    // Fusion OFF path (no real finger): pure synthetic.
+    driveAimToTarget(p.touchAim, p.touchAim.slot, target, screenCenter, io,
+                     deadzonePx, yDzPx, physDeltaX, physDeltaY);
 
     // Drag safety (synthetic only): if the finger has travelled too far from its
     // press point, lift it. The next frame re-presses at the touch area, so the

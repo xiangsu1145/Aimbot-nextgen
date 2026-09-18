@@ -207,6 +207,38 @@ bool clicked(const Rect& r);
 /// other layer.
 void consumeTap();
 
+/// Called once per frame (from drawHud) before any widget is drawn, so the
+/// per-frame "gesture consumed" flag starts clear. Every widget checks this
+/// and bails out, which is what stops a tap from leaking through to a control
+/// painted underneath it (see the touch-through fix in widgets.cpp).
+void beginFrame();
+
+/// True when some widget already handled the press/release this frame.
+bool gestureConsumed();
+
+/// Marks the press/release as handled, so widgets drawn later in the same
+/// frame ignore it. Every widget calls this the moment it acts on a tap.
+void consumeGesture();
+
+/// True when a widget is currently dragging the finger across frames
+/// (e.g. a slider whose `dragging` flag flipped true on a press-down).
+/// Stays set for as long as the drag is in flight, even on frames between
+/// press-down and release where no IsMouseClicked fires. Reset once per
+/// frame by beginFrame() — call it the frame after the drag releases.
+///
+/// Used by the right-pane scroll handler to keep the page still while a
+/// slider thumb is under the finger; otherwise the page would start
+/// scrolling the moment the user grabbed a control.
+bool widgetDraggingActive();
+
+/// Mark that some widget has claimed the finger and is dragging it.
+void setWidgetDragging();
+
+/// Clear the drag latch when the drag releases. Must be paired with every
+/// setWidgetDragging() that fires, so the next press-down does not see a
+/// stale "still dragging" flag from the previous one.
+void clearWidgetDragging();
+
 /// True the frame a tap fully outside `r` is released (press AND release
 /// outside) — the scrim-dismiss gesture for dialogs.
 bool clickedOutside(const Rect& r);

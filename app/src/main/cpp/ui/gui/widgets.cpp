@@ -18,6 +18,32 @@ namespace aimbotng {
 namespace ui {
 namespace widgets {
 
+// Set the moment any widget acts on the press/release this frame. Lets every
+// other widget bail out so a tap cannot leak through to a control painted
+// underneath (the "触摸穿透" fix). Reset once per frame by beginFrame().
+//
+// Lives at namespace scope rather than inside the per-file anonymous namespace
+// because the switch code sits *between* the two anonymous namespaces below
+// and needs to read this flag too. Same goes for the press-origin latch
+// (g_pressPos / g_pressValid) — they would be invisible from that gap, so
+// they live here too. pollPressOrigin() itself stays in the second anonymous
+// namespace with the other click helpers, since the switch code calls it but
+// does not need its symbol to be visible — only to be reachable, which is the
+// same thing once `g_gestureConsumed` and the latch are visible above.
+bool g_gestureConsumed = false;
+ImVec2 g_pressPos{0.0f, 0.0f};
+bool   g_pressValid = false;
+/// Set the frame a widget grabs a drag (e.g. slider press-down). Stays set
+/// on every subsequent frame until the drag releases, so the page's scroll
+/// handler can leave the page still while the thumb is moving under the
+/// finger. Reset every frame by beginFrame() before any widget runs.
+bool   g_widgetDragging = false;
+
+// Forward-declared so the switch code in the gap between the two anonymous
+// namespaces can call it; the definition lives further down in the second
+// anonymous namespace near the click helpers.
+void pollPressOrigin();
+
 namespace {
 
 using namespace theme;
@@ -141,18 +167,44 @@ void roundSegment(ImDrawList* dl, const ImVec2& a, const ImVec2& b, float r, ImU
  * ([switchToggle]) so the two can never drift apart: the groove blends
  * grey -> accent as it turns on while the knob crosses it on the very same eased
  * value, which is what makes colour and motion read as one movement.
+ *
+ * `trackRect` (out) receives the groove's rectangle in the same coordinate
+ * space as `r`, so the caller can hit-test the toggle on its actual visual
+ * target instead of the row's full bounding box. The hit area is the groove
+ * itself, NOT the whole row — a tap on the label or the empty space beside
+ * the track is inert, which is what makes the switch feel precise.
  */
-void drawSwitchTrack(ImDrawList* dl, const Rect& r, float anim, float s) {
+void drawSwitchTrack(ImDrawList* dl, const Rect& r, float anim, float s,
+                     Rect* trackRect, float dim = 1.0f) {
     const float cy     = r.y + r.h * 0.5f;
     const float trackW = kSwitchTrackW * s;
     const float trackH = kSwitchTrackH * s;
     const ImVec2 min(r.x + r.w - trackW, cy - trackH * 0.5f);
 
+    // `dim` lerps the accent contribution toward zero so an "off because the
+    // caller decided it cannot fire" switch still reads as a switch but in
+    // the muted-track colour, not the on colour. Default 1.0 leaves the
+    // active state untouched — only switchToggle() with interactive=false
+    // passes a smaller value.
     dl->AddRectFilled(min, ImVec2(min.x + trackW, min.y + trackH),
-                      fadeCol(lerpColor(Track, Accent, anim)), trackH * 0.5f);
+                      fadeCol(lerpColor(Track, Accent, anim * dim)),
+                      trackH * 0.5f);
 
     const float knobX = min.x + trackH * 0.5f + (trackW - trackH) * anim;
-    dl->AddCircleFilled(ImVec2(knobX, cy), kSwitchKnobR * s, fadeCol(Knob));
+    // Knob alpha tracks dim the same way so the two halves fade together —
+    // a half-bright knob on a half-bright track would read as a broken
+    // gradient rather than a "disabled" state.
+    const uint32_t knobA = static_cast<uint32_t>(
+        (static_cast<float>((Knob >> IM_COL32_A_SHIFT) & 0xFFu)) * dim);
+    const ImU32 knob = (Knob & 0x00FFFFFFu) | (knobA << IM_COL32_A_SHIFT);
+    dl->AddCircleFilled(ImVec2(knobX, cy), kSwitchKnobR * s, fadeCol(knob));
+
+    if (trackRect != nullptr) {
+        trackRect->x = min.x;
+        trackRect->y = min.y;
+        trackRect->w = trackW;
+        trackRect->h = trackH;
+    }
 }
 
 }  // namespace
@@ -169,14 +221,30 @@ bool switchButton(ImDrawList* dl, const Rect& r, SwitchState& st,
     // Label on the left, toggle flush with the row's right edge — the layout a
     // settings pane wants, rather than the label-hugging-a-dot look.
     textLeft(dl, r.x, r.y + r.h * 0.5f, kLabelSize * s, TextPrimary, label);
-    drawSwitchTrack(dl, r, st.anim, s);
+    Rect track{};
+    drawSwitchTrack(dl, r, st.anim, s, &track);
+
+    // Hit area = the groove's own rectangle, NOT the row. The label and the
+    // empty space beside the track are inert — the switch only flips when the
+    // finger lands on the visible toggle. A small vertical pad lets a thumb
+    // hit the rounded ends without having to land the pixel on the curve.
+    const float padY = 10.0f * s;
+    const Rect hit{track.x, track.y - padY, track.w, track.h + padY * 2.0f};
 
     // Fire on release: a finger that lands here, slides off and lifts should
     // not toggle anything, and there is no hover to tell us that on touch.
+    // Also require the press to have *begun* inside the hit area — otherwise
+    // a scroll drag that starts on empty space and ends over the switch
+    // would flip it. A prior widget that already claimed the gesture skips us.
     bool changed = false;
-    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && inside(mouse, r)) {
-        st.value = !st.value;
-        changed = true;
+    if (!g_gestureConsumed) {
+        pollPressOrigin();
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+            g_pressValid && inside(g_pressPos, hit) && inside(mouse, hit)) {
+            st.value = !st.value;
+            changed = true;
+            consumeGesture();
+        }
     }
     return changed;
 }
@@ -185,16 +253,34 @@ bool switchToggle(ImDrawList* dl, const Rect& r, SwitchState& st, float s,
                   bool interactive) {
     st.anim = approach(st.anim, st.value ? 1.0f : 0.0f, kSwitchAnimRate,
                        ImGui::GetIO().DeltaTime);
-    drawSwitchTrack(dl, r, st.anim, s);
+    // When the caller says "do not fire" we still paint the track, but in the
+    // muted colour rather than the accent one — the user can see the row is
+    // there and which way it is pointing, while a tap that lands on it is
+    // ignored. 0.0 would draw a flat muted track; 0.45 keeps enough accent
+    // bleed that the "on" position is still distinguishable from the "off".
+    const float dim = interactive ? 1.0f : 0.45f;
+    Rect track{};
+    drawSwitchTrack(dl, r, st.anim, s, &track, dim);
+
+    // Hit area = the track itself, not the padded caller rect. The caller
+    // passes `r` that already includes some touch-pad (a finger is bigger
+    // than the toggle), so we re-derive the visual target instead of trusting
+    // `r`. A small vertical pad keeps the rounded ends easy to hit.
+    const float padY = 10.0f * s;
+    const Rect hit{track.x, track.y - padY, track.w, track.h + padY * 2.0f};
 
     // Same release semantics as the labelled switch — see switchButton.
     // `interactive` lets a modal layer above paint the switch dead: it still
     // animates, it just stops listening.
     bool changed = false;
-    if (interactive && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
-        inside(ImGui::GetIO().MousePos, r)) {
-        st.value = !st.value;
-        changed = true;
+    if (interactive && !g_gestureConsumed) {
+        pollPressOrigin();
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+            g_pressValid && inside(g_pressPos, hit) && inside(ImGui::GetIO().MousePos, hit)) {
+            st.value = !st.value;
+            changed = true;
+            consumeGesture();
+        }
     }
     return changed;
 }
@@ -212,10 +298,31 @@ bool sliderFloat(ImDrawList* dl, const Rect& r, SliderState& st,
         st.placed = true;
     }
 
-    // Grab anywhere on the row, not just the 8 px groove — touch has no hover,
-    // so a thin target is a missed target.
-    if (!st.dragging && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && inside(mouse, r)) {
+    // Hit area = the track itself, with a generous vertical pad so a finger
+    // can land near the groove without having to be precise. The label and
+    // the value readout are inert — tapping them does nothing. Skip when a
+    // sibling has already claimed the gesture (touch-through fix).
+    const float titleCy = r.y + kSliderTitleCy * s;
+    const float trackCy = r.y + kSliderTrackCy * s;
+    const float trackH  = kSliderTrackH * s;
+    const float thumbR  = kSliderThumbR * s * (1.0f + kSliderThumbGrow * st.press);
+    const float trackX0 = r.x + kSliderThumbR * s;
+    const float trackX1 = r.x + r.w - kSliderThumbR * s;
+    const float trackW  = trackX1 - trackX0;
+    // Vertical pad = thumb radius + a bit, so the rounded ends of the thumb
+    // are as easy to land on as the line. Horizontal = the thumb at rest.
+    const float hitPadY = (kSliderThumbR + 6.0f) * s;
+    const Rect hit{trackX0 - thumbR, trackCy - hitPadY,
+                   trackW + thumbR * 2.0f, hitPadY * 2.0f};
+    if (!st.dragging && !g_gestureConsumed &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left) && inside(mouse, hit)) {
         st.dragging = true;
+        consumeGesture();
+        // Mark a drag is in flight for as long as the finger is down. The
+        // page's scroll handler reads this and keeps the page still while the
+        // user is moving the thumb — otherwise the page would scroll under
+        // the finger while the slider was being dragged.
+        setWidgetDragging();
     }
     const bool dragging = st.dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left);
 
@@ -225,13 +332,7 @@ bool sliderFloat(ImDrawList* dl, const Rect& r, SliderState& st,
     // finger is read against does not shift while the thumb is growing.
     st.press = approach(st.press, dragging ? 1.0f : 0.0f, kSliderPressRate, io.DeltaTime);
 
-    const float titleCy = r.y + kSliderTitleCy * s;
-    const float trackCy = r.y + kSliderTrackCy * s;
-    const float trackH  = kSliderTrackH * s;
-    const float thumbR  = kSliderThumbR * s * (1.0f + kSliderThumbGrow * st.press);
-    const float trackX0 = r.x + kSliderThumbR * s;
-    const float trackX1 = r.x + r.w - kSliderThumbR * s;
-    const float trackW  = trackX1 - trackX0;
+    // Geometry already computed above (hit area uses the same constants).
 
     const float before = st.value;
 
@@ -242,6 +343,7 @@ bool sliderFloat(ImDrawList* dl, const Rect& r, SliderState& st,
         st.value = st.min + st.target * span;
     } else if (st.dragging) {
         st.dragging = false;
+        clearWidgetDragging();
         // Released. Snap the value onto a step boundary and aim the drawn thumb
         // at where that ended up, so it eases in instead of jerking — this is
         // the behaviour worth keeping from Rise's renderNumberSetting.
@@ -313,9 +415,25 @@ bool dropdown(ImDrawList* dl, const Rect& r, DropdownState& st,
 
     // ── Hit test first, so a tap on an item is not also read as a tap on the
     //    row underneath it ────────────────────────────────────────────────────
+    //
+    // Press-down pre-claim: a slider painted right below would otherwise grab
+    // the press on the press-down frame (sliders grab on press-down, not
+    // release) and continue to drag through the release. Pre-claiming here
+    // keeps the slider quiet. See the matching fix in multiSelect().
+    if (!g_gestureConsumed && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        bool inMe = inside(mouse, r);
+        if (st.open) {
+            for (int i = 0; i < count; ++i) {
+                const Rect item{field.x, listTop + i * itemH, field.w, itemH};
+                if (inside(mouse, item)) { inMe = true; break; }
+            }
+        }
+        if (inMe) consumeGesture();
+    }
+
     int picked = -1;
     const bool released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
-    if (released) {
+    if (!g_gestureConsumed && released) {
         if (st.open) {
             for (int i = 0; i < count; ++i) {
                 const Rect item{field.x, listTop + i * itemH, field.w, itemH};
@@ -330,10 +448,13 @@ bool dropdown(ImDrawList* dl, const Rect& r, DropdownState& st,
                 st.value = picked;
             }
             st.open = false;
+            consumeGesture();            // claim it so the row below doesn't also fire
         } else if (inside(mouse, r)) {
             st.open = !st.open;          // tapping the row toggles the list
+            consumeGesture();
         } else if (st.open) {
             st.open = false;             // tapping anywhere else closes it
+            consumeGesture();
         }
     }
 
@@ -653,9 +774,26 @@ bool multiSelect(ImDrawList* dl, const Rect& r, MultiSelectState& st,
     // Priority: a tap on an open-list item flips its bit *and* keeps the list
     // open (multi-select convention). A tap on the row toggles open/close.
     // A tap outside both closes.
+    //
+    // The press-down half is what stops the touch-through: a slider painted
+    // right below this row would otherwise grab the press the moment it
+    // lands (sliders grab on press-down, not release), and on the release
+    // frame the toggle would fire here *and* the slider would already have a
+    // finger in its row. Pre-claiming on press-down keeps the slider quiet.
     int toggledIdx = -1;
     const bool released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
-    if (released) {
+    if (!g_gestureConsumed && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (st.open) {
+            for (int i = 0; i < count; ++i) {
+                const Rect item{field.x, listTop + i * itemH, field.w, itemH};
+                if (inside(mouse, item)) { consumeGesture(); break; }
+            }
+            if (!g_gestureConsumed && inside(mouse, r)) consumeGesture();
+        } else if (inside(mouse, r)) {
+            consumeGesture();
+        }
+    }
+    if (!g_gestureConsumed && released) {
         if (st.open) {
             for (int i = 0; i < count; ++i) {
                 const Rect item{field.x, listTop + i * itemH, field.w, itemH};
@@ -666,11 +804,15 @@ bool multiSelect(ImDrawList* dl, const Rect& r, MultiSelectState& st,
             if (toggledIdx < kMSMaxItems) {
                 st.mask ^= (1u << toggledIdx);
             }
-            // Keep open — multi-select does not auto-close.
+            // Keep open — multi-select does not auto-close. Claim the gesture so
+            // the control below (whose row the list may overlap) does not fire.
+            consumeGesture();
         } else if (inside(mouse, r)) {
             st.open = !st.open;
+            consumeGesture();
         } else if (st.open) {
             st.open = false;
+            consumeGesture();
         }
     }
 
@@ -779,8 +921,9 @@ bool tapped(const Rect& r) {
 // button now fires only when the press began inside it AND the release lands
 // inside it (the convention dropdown/multi-select already used).
 namespace {
-ImVec2 g_pressPos{0.0f, 0.0f};
-bool   g_pressValid = false;
+// g_pressPos / g_pressValid / g_gestureConsumed live at namespace scope (see
+// top of file) so the switch code between the two anonymous namespaces can
+// read them too.
 }  // namespace
 
 /// Remembers the press origin once per gesture. Idempotent — every widget
@@ -804,16 +947,49 @@ void pollPressOrigin() {
 
 /** True the frame the finger lifts inside `r` after pressing down inside it. */
 bool clicked(const Rect& r) {
+    if (g_gestureConsumed) return false;
     pollPressOrigin();
     const ImGuiIO& io = ImGui::GetIO();
-    return g_pressValid && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+    const bool fired = g_pressValid && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
            hit(io.MousePos, r) && hit(g_pressPos, r);
+    if (fired) consumeGesture();
+    return fired;
 }
 
 /** Drops the in-flight gesture, so a layer transition (dialog open/close)
 /// never hands its release to the layer underneath. */
 void consumeTap() {
     g_pressValid = false;
+    g_gestureConsumed = true;
+}
+
+void beginFrame() {
+    g_gestureConsumed = false;
+    // g_widgetDragging stays true across frames (it represents an in-flight
+    // drag, not a one-shot gesture). The widget that owns the drag clears it
+    // when the drag releases; for safety the scroll handler also clears it
+    // when its own drag ends, so a slider drag that finishes on the same
+    // frame as a release leaves no stale latch behind.
+}
+
+bool gestureConsumed() {
+    return g_gestureConsumed;
+}
+
+void consumeGesture() {
+    g_gestureConsumed = true;
+}
+
+bool widgetDraggingActive() {
+    return g_widgetDragging;
+}
+
+void setWidgetDragging() {
+    g_widgetDragging = true;
+}
+
+void clearWidgetDragging() {
+    g_widgetDragging = false;
 }
 
 /** True the frame a tap fully outside `r` is released (press AND release
@@ -821,10 +997,13 @@ void consumeTap() {
 /// start outside keeps a slider drag that slides out of the dialog from
 /// counting as a dismiss. */
 bool clickedOutside(const Rect& r) {
+    if (g_gestureConsumed) return false;
     pollPressOrigin();
     const ImGuiIO& io = ImGui::GetIO();
-    return g_pressValid && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+    const bool fired = g_pressValid && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
            !hit(io.MousePos, r) && !hit(g_pressPos, r);
+    if (fired) consumeGesture();
+    return fired;
 }
 
 /** Drive the press ease for the duration the finger is on the button. */
@@ -1018,13 +1197,14 @@ bool textField(ImDrawList* dl, const Rect& r, DialogField& f,
     const ImGuiIO& io = ImGui::GetIO();
     bool focusChanged = false;
 
-    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (!g_gestureConsumed && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const bool inside = hit(io.MousePos, r);
         const bool wasFocused = f.focused;
         f.focused = inside;
         // First-frame caret: drop the caret at the end of the existing text.
         if (inside && !wasFocused) f.caret = f.len;
         focusChanged = wasFocused != inside;
+        if (focusChanged) consumeGesture();
     }
     paintField(dl, r, f, placeholder, s, /*multiline=*/false);
     return focusChanged;
@@ -1038,8 +1218,17 @@ bool multilineField(ImDrawList* dl, const Rect& r, DialogField& f,
     return false;   // view-only widget: the caller drives editing
 }
 
-/** A pill with the model path on the left and a "..." button on the right.
- *  The pill greys out while the file picker is open elsewhere. */
+/** A pill with the model path on the left and a "..." glyph on the right.
+ *  The whole pill is the hit target — the glyph is decoration only. The pill
+ *  greys out while the file picker is open elsewhere.
+ *
+ *  NOTE: the click target used to be only the tiny "..." disc. That made the
+ *  control feel dead: `clicked()` requires BOTH the press and the release to
+ *  land inside the target rect, and the disc is only ~btnSize wide, so any
+ *  sub-pixel finger drift on release slipped out of it and the tap was eaten.
+ *  Now pressing anywhere on the pill lights it (held) and releasing anywhere
+ *  on the pill opens the browser — "lift to open", with a target hundreds of
+ *  pixels wide instead of a 40px dot. */
 bool pathPill(ImDrawList* dl, const Rect& r, const char* path, int pathLen,
               bool picking, float s) {
     if (r.w <= 1.0f || r.h <= 1.0f) return false;
@@ -1052,12 +1241,8 @@ bool pathPill(ImDrawList* dl, const Rect& r, const char* path, int pathLen,
     const ImVec2 mn(r.x, r.y);
     const ImVec2 mx(r.x + r.w, r.y + r.h);
 
-    // The button lives *inside* the pill on the right.
-    const ImVec2 btnMn(mx.x - btnSize - pad * 0.5f, mn.y + (r.h - btnSize) * 0.5f);
-    const ImVec2 btnMx(mx.x - pad * 0.5f,        btnMn.y + btnSize);
-    const Rect btnRect{btnMn.x, btnMn.y, btnSize, btnSize};
-
-    const Rect pillRect{mn.x, mn.y, mx.x - mn.x - btnSize - btnGap, r.h};
+    // The entire pill is the hit target.
+    const Rect pillRect{mn.x, mn.y, mx.x - mn.x, r.h};
     const ImVec2 pillMin(pillRect.x, pillRect.y);
     const ImVec2 pillMax(pillRect.x + pillRect.w, pillRect.y + pillRect.h);
     dl->AddRectFilled(pillMin, pillMax,
@@ -1093,11 +1278,13 @@ bool pathPill(ImDrawList* dl, const Rect& r, const char* path, int pathLen,
                     fadeCol(TextMuted), picking ? "opening…" : "(no model selected)");
     }
 
-    // The "..." button — a small disc.
-    const bool btnHeld = ImGui::IsMouseDown(ImGuiMouseButton_Left) && hit(
-        ImGui::GetIO().MousePos, btnRect);
+    // The "..." glyph — decoration only; the whole pill is clickable.
+    const ImVec2 btnMn(mx.x - btnSize - pad * 0.5f, mn.y + (r.h - btnSize) * 0.5f);
+    const ImVec2 btnMx(mx.x - pad * 0.5f,        btnMn.y + btnSize);
+    const bool pillHeld = ImGui::IsMouseDown(ImGuiMouseButton_Left) && hit(
+        ImGui::GetIO().MousePos, pillRect);
     dl->AddRectFilled(btnMn, btnMx,
-                      fadeCol(btnHeld ? kPathPillBtnFillHi : kPathPillBtnFill),
+                      fadeCol(pillHeld ? kPathPillBtnFillHi : kPathPillBtnFill),
                       btnSize * 0.5f);
     // Three dots centred.
     const float dotR = 3.0f * s;
@@ -1108,7 +1295,10 @@ bool pathPill(ImDrawList* dl, const Rect& r, const char* path, int pathLen,
     dl->AddCircleFilled(ImVec2(cx,        cy), dotR, fadeCol(TextPrimary), 12);
     dl->AddCircleFilled(ImVec2(cx + off, cy), dotR, fadeCol(TextPrimary), 12);
 
-    return clicked(btnRect);
+    // While the picker is already open, swallow the gesture so a stray release
+    // inside the (now covered) pill does not re-trigger it.
+    if (picking) return false;
+    return clicked(pillRect);
 }
 
 // ── Dialog layout ──────────────────────────────────────────────────────────

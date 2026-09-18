@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "input/inject_backend.h"
 #include "input/touch_reader.h"
 #include "ui/gui/hud.h"
 #include "ui/gui/theme.h"
@@ -40,6 +41,13 @@ std::vector<const char*> g_items;
 std::vector<uint8_t>     g_disabled;
 
 const char* kMid = " \xc2\xb7 ";   // U+00B7 middle dot, surrounded by spaces
+
+/// The choices in the 触摸方式 dropdown. Order is the wire contract: the index
+/// is what gets saved in config.json and handed to inject_set_backend(), and
+/// the values are INJECT_BACKEND_* in input/inject_backend.h.
+const char* const kBackendItems[] = {"uinput", "InputManager"};
+constexpr int     kBackendCount   = 2;
+static_assert(kBackendCount == 2, "kBackendItems and INJECT_BACKEND_* must agree");
 
 /// Rebuilds the label / items arrays from the latest panel list, and returns
 /// the index of the panel that matches [targetPath] (or -1 if missing).
@@ -97,7 +105,8 @@ void ensureLoadedLocked() {
 }  // namespace
 
 void drawTouchSection(ImDrawList* dl, float x, float& y, float w,
-                      float /*bottomY*/, float s, float es, const Xf& xf) {
+                      float /*bottomY*/, float s, float es, const Xf& xf,
+                      Scroll& sc) {
     const float gap   = 12.0f * s;
     const float rowDd = widgets::kDropdownRowH * s;
 
@@ -108,48 +117,123 @@ void drawTouchSection(ImDrawList* dl, float x, float& y, float w,
 
     ensureLoadedLocked();
 
+    // Capture the first row's on-screen rect BEFORE `y` moves on, and pass
+    // `drawListInline=false` so its open list is painted later via
+    // dropdownList(). The HUD shares one foreground draw list, so call order
+    // is paint order — and without this the 触摸方式 row drawn next would
+    // paint over 触摸设备's list, making it look like the list sits *below*
+    // 触摸方式. This is the deferred-list pattern used by Aim's category
+    // filter and by the model dialog.
+    const float firstRowY = sc.screenY(y);
+    widgets::Rect firstRowR = wRect(x, firstRowY, w, rowDd);
+
     // The widget takes a `const char* const*`; g_items is rebuilt only when
     // the panel list changes, so its pointers stay valid for the frame.
-    widgets::dropdown(dl, wRect(x, y, w, rowDd), g_pageTouch.device,
+    widgets::dropdown(dl, firstRowR, g_pageTouch.device,
                       "触摸设备",
                       g_items.empty() ? nullptr : g_items.data(),
                       static_cast<int>(g_items.size()), es,
-                      /*drawListInline=*/true,
+                      /*drawListInline=*/false,
                       g_disabled.empty() ? nullptr
                                          : reinterpret_cast<const bool*>(g_disabled.data()));
     y += rowDd + gap;
+
+    // ── Injection backend ──────────────────────────────────────────────────
+    // Which of the two ways a touch leaves this process. The label carries the
+    // state as well as the name, because the failure this setting is here to
+    // expose — "selected, and the platform will not let us inject" — has no
+    // other symptom: the menu still works (it reads the panel directly) and the
+    // phone simply ignores everything we send.
+    const int chosenBackend = g_pageTouch.injectBackend.value;
+    const bool backendOk = ::inject_is_ready() != 0;
+    const bool backendName = chosenBackend == INJECT_BACKEND_INPUT_MANAGER;
+
+    static std::string s_backendLabel;
+    s_backendLabel = "触摸方式";
+    if (!backendOk) {
+        // inject_is_ready() answers for whichever backend is LIVE, so only
+        // annotate when the selection and the live one agree — otherwise the
+        // note would belong to the backend being switched away from.
+        if (::inject_get_backend() == chosenBackend) {
+            s_backendLabel += " (注入不可用)";
+        }
+    }
+
+    const float secondRowY = sc.screenY(y);
+    widgets::dropdown(dl, wRect(x, secondRowY, w, rowDd), g_pageTouch.injectBackend,
+                      s_backendLabel.c_str(), kBackendItems, kBackendCount, es);
+    y += rowDd + gap;
+
+    // Deferred list for 触摸设备. Painting it here — AFTER 触摸方式's row — is
+    // what makes it sit ABOVE 触摸方式 rather than below. No-op while the list
+    // is closed (anim ≈ 0), so a closed dropdown costs nothing.
+    widgets::dropdownList(dl, firstRowR, g_pageTouch.device,
+                          g_items.empty() ? nullptr : g_items.data(),
+                          static_cast<int>(g_items.size()), es,
+                          g_disabled.empty() ? nullptr
+                                             : reinterpret_cast<const bool*>(g_disabled.data()));
 }
 
 void syncTouchPage() {
-    // Only one switch on this page, and only the dropdown needs to reach into
-    // the daemon. Mirrors syncCapturePage() / syncModelPage() — one frame
-    // per state change.
+    // Two rows here reach into the daemon: the panel dropdown picks which
+    // /dev/input node the reader mirrors, and the backend dropdown picks how a
+    // touch gets back out. Both follow the same rhythm as syncCapturePage() /
+    // syncSettingsPage() — one call per actual change, never per frame.
+
+    // ── Which panel ─────────────────────────────────────────────────────────
     static int lastChosen = -1;
 
     const int chosen = g_pageTouch.device.value;
-    if (chosen == lastChosen) return;
-    lastChosen = chosen;
+    if (chosen != lastChosen) {
+        lastChosen = chosen;
 
-    if (chosen < 0 || chosen >= static_cast<int>(g_panels.size())) {
-        LOGW("touch dropdown chose out-of-range index %d", chosen);
-        return;
-    }
-    // Last line of defence: the widget already refuses to set a disabled
-    // value on a tap, but if anything else ever drives g_pageTouch.device
-    // directly (a preset, a future feature) this still gates the call.
-    if (g_panels[chosen].ownVirtual) {
-        LOGW("touch dropdown tried to commit own-virtual device; ignored");
-        lastChosen = chosen;   // keep state coherent so we don't loop-log
-        return;
+        if (chosen < 0 || chosen >= static_cast<int>(g_panels.size())) {
+            LOGW("touch dropdown chose out-of-range index %d", chosen);
+        } else if (g_panels[chosen].ownVirtual) {
+            // Last line of defence: the widget already refuses to set a disabled
+            // value on a tap, but if anything else ever drives g_pageTouch.device
+            // directly (a preset, a future feature) this still gates the call.
+            LOGW("touch dropdown tried to commit own-virtual device; ignored");
+        } else {
+            const char* path = g_panels[chosen].path;
+            if (!reader_select_panel(path)) {
+                // Selection refused (open / grab failed) — leave the dropdown
+                // where the user put it so they can retry, but log loudly. The
+                // reader is already idle at this point per reader_select_panel's
+                // contract, so any subsequent touch on the panel goes to the
+                // system InputReader.
+                LOGW("reader_select_panel(%s) failed; reader is idle until relaunch", path);
+            }
+        }
     }
 
-    const char* path = g_panels[chosen].path;
-    if (!reader_select_panel(path)) {
-        // Selection refused (open / grab failed) — leave the dropdown where
-        // the user put it so they can retry, but log loudly. The reader is
-        // already idle at this point per reader_select_panel's contract, so
-        // any subsequent touch on the panel goes to the system InputReader.
-        LOGW("reader_select_panel(%s) failed; reader is idle until relaunch", path);
+    // ── Which backend ───────────────────────────────────────────────────────
+    //
+    // `lastBackend` starts below zero rather than at the uinput default so the
+    // first frame pushes whatever config.json says, even when that is uinput.
+    // inject_set_backend() is idempotent, so that costs a compare and nothing
+    // else — and it means the menu and the daemon can never disagree about the
+    // choice, which is the one thing that would make this setting untestable.
+    static int lastBackend = -1;
+    const int nowBackend = g_pageTouch.injectBackend.value;
+    if (nowBackend != lastBackend) {
+        lastBackend = nowBackend;
+        const int ready = ::inject_set_backend(nowBackend);
+        if (ready) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "inject backend -> %s (ready)",
+                                nowBackend == INJECT_BACKEND_INPUT_MANAGER
+                                    ? "InputManager" : "uinput");
+        } else {
+            // Not a rollback: silently going back to the other backend is how
+            // this project has lost faults before. The choice stands, the row
+            // says so, and the reason is in the log.
+            const char* why = aimbotng::input::imBridgeLastError();
+            __android_log_print(ANDROID_LOG_ERROR, TAG,
+                                "inject backend -> %s NOT usable: %s",
+                                nowBackend == INJECT_BACKEND_INPUT_MANAGER
+                                    ? "InputManager" : "uinput",
+                                (why && why[0]) ? why : "unknown");
+        }
     }
 }
 

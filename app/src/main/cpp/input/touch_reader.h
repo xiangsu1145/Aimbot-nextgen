@@ -68,6 +68,14 @@ void reader_set_sink(bool enabled);
 
 bool reader_get_sink(void);
 
+/// Lets the menu own the gestures that start on it (false, the default) or
+/// mirrors every gesture regardless (true — aimbot 1.2.1 behaviour, exposed as
+/// Settings → 允许触摸穿透). Only affects gestures whose first finger landed
+/// inside a published menu rectangle; everything else is mirrored either way.
+void reader_set_pass_through(bool enabled);
+
+bool reader_get_pass_through(void);
+
 /// Publishes the rectangles that must SWALLOW a touch, as a flat
 /// [x, y, w, h, ...] list in screen pixels (`count` rectangles).
 ///

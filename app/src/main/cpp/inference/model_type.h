@@ -9,6 +9,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace aimbotng {
 namespace infer {
@@ -49,6 +50,26 @@ bool detectModelInputSize(const std::string& path, int& w, int& h);
 /// smaller of the two feature dims is the channel count. Returns false (and
 /// leaves w/h/classes unchanged) when the file cannot be read.
 bool detectModelShape(const std::string& path, int& w, int& h, int& classes);
+
+/// Reads the affine quantisation (scale, zero_point) of a .tflite model's
+/// *output* tensors, one entry per output in output order.
+///
+/// These numbers come from the model file itself rather than from whatever
+/// runtime ends up executing it. That distinction is the whole point: for an
+/// int8 model the runtime's own getter is unusable — MediaTek's
+/// `getDequantizedOutputByIndex` is gated on an internal type of 3 (uint8) and
+/// returns empty for every int8 tensor, and the runtime's
+/// `getTensorQuantizeParams` writes a field the daemon cannot rely on (it
+/// measured as all zeroes on a Redmi/dali). The file, meanwhile, is
+/// unambiguous: `TfLiteTensor::params` is exactly the pair that turns the raw
+/// bytes back into floats.
+///
+/// `scales` / `zeroPoints` are resized to the output count. Returns false when
+/// the file is not a readable .tflite, or when an output carries no
+/// quantisation at all (a float model) — the caller keeps whatever it had.
+bool detectTfliteOutputQuant(const std::string& path,
+                             std::vector<float>& scales,
+                             std::vector<int32_t>& zeroPoints);
 
 }  // namespace infer
 }  // namespace aimbotng

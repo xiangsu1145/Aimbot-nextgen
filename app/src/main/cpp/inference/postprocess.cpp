@@ -19,8 +19,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include "inference/postprocess.h"
 
+#include <android/log.h>
+
 #include <algorithm>
 #include <cmath>
+
+#define TAG "AimbotInfer"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
 namespace aimbotng {
 namespace infer {
@@ -262,6 +268,71 @@ PostprocessConfig postprocessFor(int inputSize, int numClasses) {
     PostprocessConfig cfg;
     cfg.numClasses = numClasses > 0 ? numClasses : 1;
     return cfg;
+}
+
+// ── Head layout resolution ──────────────────────────────────────────────────
+
+HeadLayout resolveHeadLayout(int anchors, int channels, bool channelsFirst,
+                             int inputSize, int declaredClasses,
+                             int& numClasses) {
+    const HeadLayout v8 = channelsFirst ? HeadLayout::V8ChannelsFirst
+                                        : HeadLayout::V8Rows;
+
+    // ── 1. A declared count decides ─────────────────────────────────────────
+    //
+    // Both comparisons are guarded on `declaredClasses > 0`, and that guard is
+    // load-bearing rather than tidy. With nothing declared the count is 0, and
+    // a 5-channel head also has `channels - 5 == 0` — so an unguarded test
+    // matches by accident, sets numClasses to 0, and rejects a perfectly
+    // readable head. That is exactly what a 1-class YOLOv8 export ([1,5,1344])
+    // looks like, and it is why such models used to fail to load on every
+    // backend with "could not read the detection head".
+    if (declaredClasses > 0) {
+        if (channels == declaredClasses + 4) {
+            numClasses = declaredClasses;
+            return v8;
+        }
+        if (channels == declaredClasses + 5) {
+            numClasses = declaredClasses;
+            return HeadLayout::V5Objectness;
+        }
+        LOGW("declared %d classes but the head has %d channels — using the head",
+             declaredClasses, channels);
+    }
+
+    // ── 2. The anchor grid decides ──────────────────────────────────────────
+    //
+    // Only reached when the entry is silent, which is the one case the shape
+    // alone has to answer. Requires an exact match against the v8 grid or three
+    // times it, so an unrecognised model falls through instead of being
+    // reinterpreted.
+    if (declaredClasses <= 0 && anchors > 0 && inputSize > 0) {
+        int grid = 0;
+        for (int stride = 8; stride <= 32; stride *= 2) {
+            const int n = inputSize / stride;
+            if (n > 0) grid += n * n;
+        }
+        if (grid > 0 && anchors == 3 * grid && channels >= 6) {
+            numClasses = channels - 5;
+            LOGI("no classes declared; %d anchors is 3x the %dpx grid (%d) — "
+                 "decoding as v5/objectness, %d classes",
+                 anchors, inputSize, grid, numClasses);
+            return HeadLayout::V5Objectness;
+        }
+        if (grid > 0 && anchors == grid && channels >= 5) {
+            numClasses = channels - 4;
+            LOGI("no classes declared; %d anchors is the %dpx grid — "
+                 "decoding as v8, %d classes",
+                 anchors, inputSize, numClasses);
+            return v8;
+        }
+    }
+
+    // ── 3. v8, the default ──────────────────────────────────────────────────
+    numClasses = channels > 4 ? channels - 4 : 1;
+    LOGI("head %d channels / %d anchors — assuming v8, %d classes",
+         channels, anchors, numClasses);
+    return v8;
 }
 
 }  // namespace infer

@@ -135,6 +135,23 @@ const char* const kLiteRtGpu[] = {
     nullptr,
 };
 
+/// LiteRT 2.x NPU: the runtime plus the MediaTek dispatch and compiler plugin.
+///
+/// This backend only ships the MediaTek pair. Snapdragon devices run NPU
+/// inference through the existing `Ep::Htp` (QNN TFLite delegate) path instead,
+/// so no Qualcomm dispatch/plugin is bundled — that keeps the APK smaller and
+/// avoids a second, version-matched QNN stack. `epAvailable()` therefore greys
+/// the NPU row on a Qualcomm SoC (the `libLiteRtDispatch_Qualcomm.so` it would
+/// need is not present) and only offers it on MediaTek. The MediaTek libraries
+/// depend only on `libLiteRt.so` plus system libraries, so they load fine even
+/// on a Snapdragon where they are never actually exercised.
+const char* const kLiteRtNpu[] = {
+    "libLiteRt.so",
+    "libLiteRtDispatch_MediaTek.so",
+    "libLiteRtCompilerPlugin_MediaTek.so",
+    nullptr,
+};
+
 /// The QNN delegate, which pulls the QNN stack in behind it.
 ///
 /// Order matters. The TFLite JNI runtime is the base — its C API symbols must
@@ -221,17 +238,29 @@ const HtpStack& htpStack() {
 
 }  // namespace
 
+/// Length of a nullptr-terminated list. Every list above ends in nullptr, so
+/// counting beats a literal: a literal is one more thing to forget when a
+/// library is added, and forgetting it means preload() silently stops after
+/// the first N entries.
+static int listLen(const char* const* list) {
+    int n = 0;
+    while (list != nullptr && list[n] != nullptr) ++n;
+    return n;
+}
+
 const char* const* runtimeLibraries(Runtime runtime, Ep ep, int& count) {
     count = 0;
     switch (runtime) {
         case Runtime::LiteRT:
             switch (ep) {
                 case Ep::Gpu:
-                    count = 2; return kLiteRtGpu;
+                    count = listLen(kLiteRtGpu); return kLiteRtGpu;
                 case Ep::Htp:
-                    count = 2; return kLiteRtQnn;
+                    count = listLen(kLiteRtQnn); return kLiteRtQnn;
+                case Ep::Npu:
+                    count = listLen(kLiteRtNpu); return kLiteRtNpu;
                 default:
-                    count = 1; return kLiteRtBase;
+                    count = listLen(kLiteRtBase); return kLiteRtBase;
             }
         case Runtime::Qnn: {
             const HtpStack& s = htpStack();

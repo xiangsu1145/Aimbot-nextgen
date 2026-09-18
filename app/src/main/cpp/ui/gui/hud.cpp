@@ -23,10 +23,12 @@
 #include <cstdio>
 
 #include "ui/gui/float_button.h"
+#include "ui/gui/notify.h"
 #include "config/config_manager.h"
 #include "inference/model_runtime.h"
 #include "tracking/kalman_tracker.h"
 #include "ui/gui/sections/aim_section.h"
+#include "ui/gui/sections/backflash_section.h"
 #include "ui/gui/sections/capture_section.h"
 #include "ui/gui/sections/model_section.h"
 #include "ui/gui/sections/settings_section.h"
@@ -142,7 +144,7 @@ constexpr float kTitleRuleGap   = 24.0f;  // title -> hairline
 constexpr float kFirstRowGap    = 30.0f;  // hairline -> first control
 
 // The rail's labels, in MenuSection order.
-const char* kNavLabels[] = {"Aim", "Trigger", "Model", "Touch", "Capture", "Settings"};
+const char* kNavLabels[] = {"自瞄", "扳机", "背闪", "模型", "触摸", "截图", "设置"};
 static_assert(sizeof(kNavLabels) / sizeof(kNavLabels[0]) ==
                   static_cast<size_t>(MenuSection::Count),
               "kNavLabels must have one entry per MenuSection");
@@ -171,6 +173,19 @@ MenuSection g_section = MenuSection::Aim;
 // Top edge of the sliding highlight, in surface pixels. Negative until the
 // first frame places it, so the very first paint does not fly in from y=0.
 float   g_highlightY = -1.0f;
+
+// Per-page vertical scroll offset (surface px) for the right-pane sections, so a
+// page whose rows overflow the board can be dragged like a native scroll view.
+// One slot per MenuSection; survives page switches (each page keeps its place).
+float g_scroll[static_cast<int>(MenuSection::Count)] = {0};
+bool  g_scrollDrag       = false;  // a scroll drag is in progress
+float g_scrollDragStartY = 0.0f;  // mouse.y when the drag began
+float g_scrollDragStart  = 0.0f;  // g_scroll value when the drag began
+/// Pixels of movement before a press becomes a scroll drag. Anything shorter
+/// is treated as a tap and stays available to whatever widget is under the
+/// finger. Below this distance the offset does not move, so a tap on an empty
+/// strip does not nudge the page.
+constexpr float kScrollSlop = 8.0f;
 
 // HUD visibility animation state. g_hudVisibleTarget is what the user asked
 // for (true = board should be shown); g_hudAnim is the eased 0..1 progress
@@ -319,11 +334,12 @@ void drawRail(ImDrawList* dl, const HudRect& r, float s, float railW, const Xf& 
  */
 widgets::SwitchState* masterSwitch(MenuSection section) {
     switch (section) {
-        case MenuSection::Aim:     return &sections::g_pageAim.enabled;
-        case MenuSection::Trigger: return &sections::g_pageTrigger.enabled;
-        case MenuSection::Capture: return &sections::g_pageCapture.enabled;
-        case MenuSection::Model:   return &sections::g_pageModel.enabled;
-        default:                   return nullptr;
+        case MenuSection::Aim:       return &sections::g_pageAim.enabled;
+        case MenuSection::Trigger:   return &sections::g_pageTrigger.enabled;
+        case MenuSection::BackFlash: return &sections::g_pageBackFlash.enabled;
+        case MenuSection::Capture:   return &sections::g_pageCapture.enabled;
+        case MenuSection::Model:     return &sections::g_pageModel.enabled;
+        default:                     return nullptr;
     }
 }
 
@@ -381,11 +397,32 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
         // while everything around it scales about the centre.
         const ImVec2 swPos = xf.pt(ImVec2(
             switchLeft, titleY + (titleSize - trackH) * 0.5f - padTouch * 0.5f));
-        // Dead while a Model dialog owns the board (same reason as the rail
-        // below): taps outside the dialog card are the dialog's to dismiss.
+
+        // The Model page's master switch owns "is inference running at all",
+        // and that is the Settings page's "持续推理" switch's decision when
+        // continuous mode is on. In triggered mode (continuous off) the
+        // inference-area circle is the one that arms/disarms, so letting the
+        // user flip the Model switch here would silently fight the trigger:
+        // the user would think they are turning it on, and the next finger-out
+        // would yank it back. Greying the row and swallowing taps keeps the
+        // surface honest — there is exactly one knob in each mode, and which
+        // knob it is changes with the Settings switch.
+        bool modelSwitchLive = !sections::anyDialogOpen();
+        if (g_section == MenuSection::Model) {
+            const bool continuous = sections::g_pageSettings.continuousInference.value;
+            modelSwitchLive = modelSwitchLive && continuous;
+            // Force the bit off if the user landed here with continuous off
+            // (typical: opened the Model page first, then visited Settings and
+            // flipped it). The previous state lingers in the SwitchState's
+            // animation ease, but the logical value is what syncModelPage()
+            // reads — leaving it on would have the runtime running while the
+            // user cannot reach the off switch.
+            if (!continuous) sections::g_pageModel.enabled.value = false;
+        }
+
         widgets::switchToggle(dl,
             {swPos.x, swPos.y, xf.s(trackW + padTouch), xf.s(trackH + padTouch)},
-            *master, es, !sections::anyDialogOpen());
+            *master, es, modelSwitchLive);
     }
 
     // What that switch is costing, on the same line. It belongs here rather than
@@ -422,6 +459,21 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
     dl->AddLine(xf.pt(ImVec2(x, ruleY)), xf.pt(ImVec2(x + w, ruleY)),
                 xf.col(Divider), xf.s(1.0f * s));
 
+    // ── Re-clip below the hairline ──────────────────────────────────────────
+    // The outer clip is the full board, so the title + hairline above this
+    // point stay visible. Sections, however, draw at `y - sc.offset`: a deep
+    // scroll would push the top rows' screenY above the hairline and the outer
+    // clip would let them paint right over the title. Pop the outer clip and
+    // push a narrower one that starts at the hairline, so anything scrolled
+    // above it is cut off instead of overpainting. The bottom still matches
+    // the board so a dropdown opening downward is still cut off by the panel.
+    // Applied to every page — the dispatch is the same path for all of them,
+    // and Capture's offset is always 0 so it is unaffected.
+    dl->PopClipRect();
+    dl->PushClipRect(xf.pt(ImVec2(r.x, ruleY)),
+                     xf.pt(ImVec2(r.x + r.w, r.y + r.h)),
+                     true);
+
     // ── Dispatch to the active section ───────────────────────────────────────
     // The cursor `y` starts just under the hairline; each section's draw
     // function advances it past every row it owns. The capture section uses
@@ -429,29 +481,129 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
     float y = ruleY + kFirstRowGap * s;
     const float bottomY = r.y + r.h - pad;
 
+    // ── Per-page vertical scroll ─────────────────────────────────────────────
+    // The active section draws into a virtual content track whose top-left is
+    // shifted up by `sc.offset`. The clip is the board, so anything scrolled
+    // past the top/bottom is just hidden — same look as a native scroll view.
+    // We clamp the offset to the page's actual content height, which the
+    // section reports back by leaving `y` in natural (un-scrolled) coordinates.
+    const int secIdx = static_cast<int>(g_section);
+    const float viewH    = bottomY - (ruleY + kFirstRowGap * s);
+    const widgets::Rect scrollRect{x, ruleY + kFirstRowGap * s, w, viewH};
+
+    // Scroll gesture detection runs BEFORE the section, so it can claim the
+    // gesture on the same frame a press-down crosses into scroll-drag
+    // territory — widgets then see a consumed gesture and stay inert.
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        const ImVec2 mouse = io.MousePos;
+        // Arm the drag on press-down inside the scrollable area. Stays "armed
+        // but dormant" until the finger travels past kScrollSlop — a small tap
+        // stays available to whatever control is underneath. Skip if a widget
+        // is already dragging the finger: the slider owns the gesture for as
+        // long as it's tracking the thumb, and the page must stay still.
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !widgets::gestureConsumed() &&
+            !widgets::widgetDraggingActive() &&
+            inside(mouse,
+                   ImVec2(scrollRect.x, scrollRect.y),
+                   ImVec2(scrollRect.x + scrollRect.w, scrollRect.y + scrollRect.h))) {
+            g_scrollDrag = true;
+            g_scrollDragStartY = mouse.y;
+            g_scrollDragStart  = g_scroll[secIdx];
+        }
+        // Release ends the drag. Only consume the gesture if the finger
+        // actually travelled past the slop — a short tap that armed the drag
+        // but never moved must still reach the widget under the finger (a
+        // tap on a closed multi-select row to open it, for example).
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && g_scrollDrag) {
+            const float dy = mouse.y - g_scrollDragStartY;
+            if (fabsf(dy) > kScrollSlop) widgets::consumeGesture();
+            g_scrollDrag = false;
+            // The page owned the finger for this drag — clear any widget-drag
+            // latch that some widget might have set on the same press frame
+            // (defensive: slider should not grab a drag whose press-down
+            // started in empty space, but a stale flag is cheap to nuke).
+            widgets::clearWidgetDragging();
+        }
+    }
+
+    Scroll sc;
+    sc.offset = g_scroll[secIdx];
+
+    // While a scroll drag is in flight past the slop, claim the gesture BEFORE
+    // the section runs — otherwise a slider/switch the finger is "passing over"
+    // while dragging the page would still fire. The slop check matches the
+    // one below, so a near-press that has not yet moved does NOT pre-empt
+    // widgets; the user can still tap a control whose hit area sits in the
+    // scrollable region.
+    if (g_scrollDrag) {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const float dy = mouse.y - g_scrollDragStartY;
+        if (fabsf(dy) > kScrollSlop) widgets::consumeGesture();
+    }
+
     switch (g_section) {
         case MenuSection::Aim:
-            sections::drawAimSection(dl, x, y, w, bottomY, s, es, xf);
+            sections::drawAimSection(dl, x, y, w, bottomY, s, es, xf, sc);
             break;
         case MenuSection::Trigger:
-            sections::drawTriggerSection(dl, x, y, w, bottomY, s, es, xf);
+            sections::drawTriggerSection(dl, x, y, w, bottomY, s, es, xf, sc);
+            break;
+        case MenuSection::BackFlash:
+            sections::drawBackFlashSection(dl, x, y, w, bottomY, s, es, xf, sc);
             break;
         case MenuSection::Model:
-            sections::drawModelSection(dl, x, y, w, bottomY, s, es, xf);
+            sections::drawModelSection(dl, x, y, w, bottomY, s, es, xf, sc);
             break;
         case MenuSection::Touch:
-            sections::drawTouchSection(dl, x, y, w, bottomY, s, es, xf);
+            sections::drawTouchSection(dl, x, y, w, bottomY, s, es, xf, sc);
             break;
         case MenuSection::Capture:
-            sections::drawCaptureSection(dl, x, y, w, bottomY, s, es, xf);
+            sections::drawCaptureSection(dl, x, y, w, bottomY, s, es, xf, sc);
             break;
         case MenuSection::Settings:
-            sections::drawSettingsSection(dl, x, y, w, bottomY, s, es, xf);
+            sections::drawSettingsSection(dl, x, y, w, bottomY, s, es, xf, sc);
             break;
         default:
             break;
     }
 
+    // ── Scroll clamp + commit the drag offset ────────────────────────────────
+    // `y` is now the page's natural bottom (header offset + every row's
+    // height + every gap). The scrollable range is the excess over the
+    // viewport. Once a drag is in flight we move the offset to follow the
+    // finger until slop is exceeded, then consume the gesture.
+    const float contentH = y - (ruleY + kFirstRowGap * s);
+    sc.maxOffset = (contentH > viewH) ? (contentH - viewH) : 0.0f;
+
+    if (sectionIsScrollable(g_section) && sc.active()) {
+        if (sc.offset > sc.maxOffset) sc.offset = sc.maxOffset;
+        if (sc.offset < 0.0f) sc.offset = 0.0f;
+
+        if (g_scrollDrag) {
+            const ImGuiIO& io = ImGui::GetIO();
+            const ImVec2 mouse = io.MousePos;
+            const float dy = mouse.y - g_scrollDragStartY;
+            if (fabsf(dy) > kScrollSlop) {
+                sc.offset = g_scrollDragStart - dy;
+                if (sc.offset < 0.0f) sc.offset = 0.0f;
+                if (sc.offset > sc.maxOffset) sc.offset = sc.maxOffset;
+                widgets::consumeGesture();
+            }
+        }
+        g_scroll[secIdx] = sc.offset;
+    } else {
+        // Page does not (currently) need scrolling; park the offset so a
+        // future overflow does not start mid-scroll, and make sure no in-flight
+        // drag from a different page bleeds across.
+        g_scroll[secIdx] = 0.0f;
+        g_scrollDrag = false;
+    }
+
+    // Drops the narrow "below the hairline" clip pushed after the header.
+    // The outer full-board clip was already popped just before the section
+    // dispatch — this one matches that inner push.
     dl->PopClipRect();
 }
 
@@ -608,6 +760,10 @@ void drawHud() {
     const float dh = io.DisplaySize.y;
     if (dw <= 1.0f || dh <= 1.0f) return;  // no surface yet
 
+    // Reset the per-frame "gesture consumed" flag before any widget is drawn,
+    // so a tap cannot leak through to a control underneath it this frame.
+    widgets::beginFrame();
+
     // Detections first, so the board paints over them: a box belongs to the
     // screen behind the menu, not on top of it. Drawn before the hidden-case
     // early return below, which is the whole point — the menu being out of the
@@ -623,6 +779,15 @@ void drawHud() {
     // Trigger overlays (fire box + hold circle). Independent geometry from the
     // Aim page — same layer, same lifetime rules.
     sections::drawTriggerOverlays();
+    // Inference-area circle (from Settings page). Same layer, shown only when
+    // continuous inference is OFF and the area overlay toggle is on.
+    sections::drawInferenceAreaOverlay();
+    // Back-flash overlay (touch-area dashed box). Same pattern as the Aim and
+    // Trigger overlays: independent geometry, same layer rules. Drawn here
+    // (before the board) so the menu still sits above the dashed box when
+    // the menu is open, and so the user can see where the swipe operates
+    // after the menu is dismissed.
+    sections::drawBackFlashOverlays();
 
     // The pages' switches are published here rather than from inside the board,
     // because they describe *system* state and not a rendering concern. While
@@ -631,6 +796,13 @@ void drawHud() {
     // model marked as loaded while the menu was out of the way would not take
     // effect until it came back. Both are idempotent and act only on a change,
     // which is what keeps a model load off the per-frame path.
+    //
+    // syncBackFlashPage() runs FIRST so its `blockingAim=true` is in effect
+    // before syncAimPage() reads it on the gate path. Aim and back-flash share
+    // UINPUT_SLOT_PRIMARY, so the order matters: if aim ran first it would
+    // press a finger this frame and back-flash would clobber it the next.
+    // Running back-flash first lets aim see the flag and skip its press.
+    sections::syncBackFlashPage();
     sections::syncAimPage();
     // After syncAimPage (which keeps the Kalman tracker warm) so the trigger
     // reads smoothed tracks from this very frame.
@@ -664,6 +836,12 @@ void drawHud() {
         g_rect = HudRect{};
         g_hudAlpha = 0.0f;
         drawFloatButton();
+        // Toasts are drawn on the hidden path too, and deliberately: the moment
+        // a person most needs to be told "the graph is compiling" or "there is
+        // no frame source" is when they are holding a finger on the inference
+        // area with the board out of the way. They are non-modal and take no
+        // touch, so showing them here costs nothing.
+        notify::draw();
         return;
     }
 
@@ -711,6 +889,12 @@ void drawHud() {
     g_hudAlpha = g_hudAnim;  // widgets read this and fade themselves.
 
     drawBoard(ImGui::GetForegroundDrawList(), g_rect, g_scale, xf);
+
+    // Toasts last of all: they belong to the layer rather than to any page, and
+    // a status line that the board can cover is a status line the user has to
+    // hunt for. Drawn above the float button too, because the button sits in a
+    // corner and a compiling notice must not be hidden behind it.
+    notify::draw();
 
     // The float button is the always-on toggle that opens and closes this
     // board. Draw it last so it sits above every other piece of UI the menu

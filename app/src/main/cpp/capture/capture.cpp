@@ -39,7 +39,20 @@ constexpr uint64_t kLogEvery = 60;
 std::atomic<bool>  g_enabled{false};
 std::atomic<int>   g_size{640};
 std::atomic<bool>  g_running{false};
+
+// "Somebody is watching the pixels right now" — the *frames* question, as
+// opposed to the *menu switch* question above. Two different things, and the
+// gap between them is where the silent-capture bug lived: a caller that only
+// needs frames (the inference pump) used to be counted as a reason to keep the
+// virtual display alive, which made the capture switch look broken because
+// turning it off changed nothing.
 std::atomic<bool>  g_consuming{false};
+
+// The reader half of the supervisor's `enabled() && previewWanted()`. Set to
+// "somebody is reading pixels" — which includes inference, not just the preview
+// page. See the header: keeping inference off this flag is what starved the
+// detector whenever the Capture page was closed.
+std::atomic<bool>  g_previewWanted{false};
 
 // ── Frame rate ───────────────────────────────────────────────────────────────
 //
@@ -152,6 +165,26 @@ bool peekSize(int& outW, int& outH) {
     return true;
 }
 
+void invalidateFrames() {
+    std::lock_guard<std::mutex> lock(g_frameMutex);
+    // Bumped, not zeroed — see the header. Every consumer holding a last-seen id
+    // now finds it stale and re-reads, whichever path it came in through.
+    ++g_frameId;
+    // The dimensions go with it. A consumer that asks peekSize() before probing
+    // for pixels must not be handed the shape of a frame that can no longer be
+    // produced: the next producer may have a different screen behind it, and a
+    // copy sized from the old geometry is a torn frame rather than a stale one.
+    g_frameW = 0;
+    g_frameH = 0;
+    g_frame.clear();
+    // The crop origin describes where the *gone* frame sat on the *gone* screen.
+    // Kept, it would have onResult() translate detections from a dead frame by
+    // the offset of a screen that may since have rotated.
+    g_cropX = 0;
+    g_cropY = 0;
+    LOGI("frames invalidated (generation -> %llu)", (unsigned long long)g_frameId);
+}
+
 bool copyLatestInto(void* dst, size_t dstBytes, int& outW, int& outH,
                     uint64_t& lastId) {
     if (dst == nullptr) return false;
@@ -179,8 +212,21 @@ int frameRate() {
     return g_fps.load(std::memory_order_relaxed);
 }
 
-void setConsuming(bool on) { g_consuming.store(on, std::memory_order_relaxed); }
+void setConsuming(bool on) {
+    const bool prev = g_consuming.exchange(on, std::memory_order_relaxed);
+    if (prev != on) {
+        LOGI("capture: consuming %s->%s", prev ? "on" : "off", on ? "on" : "off");
+    }
+}
 bool consuming() { return g_consuming.load(std::memory_order_relaxed); }
+
+void setPreviewWanted(bool on) {
+    const bool prev = g_previewWanted.exchange(on, std::memory_order_relaxed);
+    if (prev != on) {
+        LOGI("capture: preview wanted %s->%s", prev ? "on" : "off", on ? "on" : "off");
+    }
+}
+bool previewWanted() { return g_previewWanted.load(std::memory_order_relaxed); }
 
 bool cropOrigin(int& outX, int& outY) {
     std::lock_guard<std::mutex> lock(g_frameMutex);

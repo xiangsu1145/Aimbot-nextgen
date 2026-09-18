@@ -217,6 +217,14 @@ object ScreenCapture {
         crop = Crop(0, 0, 0)
         geometry = null
         ShellNative.captureSetRunning(false)
+        // Every frame this mirror ever produced is now unreachable, and saying so
+        // is what keeps a consumer from reading one of them. The frame generation
+        // is process-lifetime, so without this the next mirror's first frame
+        // compares as "newer" than the last one the detector saw — and the
+        // detector runs on pixels from a display that has been released, with the
+        // crop origin of a screen that may since have rotated. See
+        // ShellNative.captureInvalidateFrames.
+        ShellNative.captureInvalidateFrames()
 
         val t = pump
         pump = null

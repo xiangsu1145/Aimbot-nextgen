@@ -2,7 +2,11 @@ package io.github.xiangsu1145.aimbotnextgen.shell
 
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.os.Binder
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
+import android.util.Size
 import android.view.Surface
 import java.lang.reflect.Method
 
@@ -36,6 +40,10 @@ import java.lang.reflect.Method
  *    UID, but this layer belongs to the shell process — so the menu is invisible
  *    to screenshots, screen recording and casting while still fully visible on
  *    the panel to the eye, and to HDMI out.
+ *  • The layer survives Android 12+'s *untrusted touch* rule, because it now
+ *    carries an explicit input window that says "not an occluder". See
+ *    [applyInputWindowInfo] — without it, every touch that passes through the
+ *    board is dropped by InputDispatcher on strict ROMs.
  *
  * ── Geometry notes (both learned the hard way) ───────────────────────────────
  *
@@ -120,7 +128,20 @@ object ShellLayerHost {
     fun start(w: Int, h: Int, report: (String) -> Unit): String {
         if (running) return "already-running"
         return try {
-            build(w, h, report)
+            // Timed because this is the other half of "the daemon is up but the
+            // menu never appears": `daemon ready` only proves the TCP port is
+            // listening, and everything the user actually sees is built here —
+            // SurfaceControl reflection, the transaction, the Vulkan device and
+            // the render thread's first frame. Each phase reports its own cost,
+            // so a capture shows which one stalled.
+            val t0 = SystemClock.elapsedRealtime()
+            var tPrev = t0
+            val timed: (String) -> Unit = { line ->
+                val now = SystemClock.elapsedRealtime()
+                report("$line [+${now - tPrev}ms / total ${now - t0}ms]")
+                tPrev = now
+            }
+            build(w, h, timed)
             running = true
             "on"
         } catch (t: Throwable) {
@@ -251,6 +272,10 @@ object ShellLayerHost {
         // runCatching covers the OEMs that don't expose this method.
         runCatching { invoke(txnCls, txn, "setSkipScreenshot", sc, skipScreenshot) }
             .onFailure { report("LAYER skipScreenshot unavailable: ${it.javaClass.simpleName}") }
+        // Declare the layer's input window *before* the transaction is applied, so
+        // it lands in the same commit as the geometry. This is the fix for
+        // Android 12+'s "Untrusted touch due to occlusion" — see the function.
+        applyInputWindowInfo(txnCls, txn, sc, w, h, report)
         invoke(txnCls, txn, "show", sc)
         txnCls.getMethod("apply").invoke(txn)
     }
@@ -270,6 +295,258 @@ object ShellLayerHost {
         session = null
     }
 
+    // ── Untrusted touch (Android 12+ occlusion) ──────────────────────────────
+
+    /**
+     * Gives the layer an explicit input window that says *"I must not be counted
+     * as an occluder"*, which is what lets touches pass through the board again.
+     *
+     * ── The problem ──────────────────────────────────────────────────────────
+     *
+     * Android 12+ drops any touch that is occluded by a window the platform does
+     * not trust (`touchOcclusionMode = BLOCK_UNTRUSTED` is the default). A layer
+     * built straight on SurfaceFlinger never had an input window of its own, so
+     * it got that default — and since it is full-screen and opaque, InputDispatcher
+     * rejected *every* touch underneath it, injected ones included:
+     *
+     *     Dropping untrusted touch event due to occlusion by aimbot-ui
+     *
+     * Touches delivered to the menu itself keep working, because the menu never
+     * goes through the dispatcher — it reads `/dev/input` and feeds ImGui
+     * directly. "The board clicks, nothing else does" is that bug's fingerprint.
+     *
+     * ── Why this knob and no other ───────────────────────────────────────────
+     *
+     * `SurfaceFlinger/Layer.cpp`:
+     *
+     *     void Layer::fillTouchOcclusionMode(WindowInfo& info) {
+     *         sp<Layer> p = sp<Layer>::fromExisting(this);      // ← starts at SELF
+     *         while (p && !p->hasInputInfo()) p = p->mDrawingParent.promote();
+     *         if (p) info.touchOcclusionMode = p->mDrawingState.inputInfo.touchOcclusionMode;
+     *     }
+     *
+     *     bool Layer::hasInputInfo() const { return mDrawingState.inputInfo.token != nullptr; }
+     *
+     * The walk starts at the layer itself, so the value we set is the value that
+     * wins — **provided `hasInputInfo()` is true**. That is why `token` below is
+     * not optional: without it the loop climbs to a parent this root layer does
+     * not have, writes nothing, and the layer silently stays on BLOCK_UNTRUSTED
+     * even though we "set" a different mode. Everything else here is detail.
+     *
+     * Two assumptions this deliberately does *not* make:
+     *  • alpha — the warning has no `(obscuring opacity = …, maximum allowed = …)`
+     *    suffix, so this is the hard-block branch; fading the board would only
+     *    change how it looks and fix nothing.
+     *  • touchableRegion — the region is irrelevant to the judgement (the layer
+     *    was already `<empty>` while occluding), so shrinking or punching holes
+     *    in it changes nothing either.
+     *
+     * Nothing about the layer's looks is touched: no alpha, no geometry, no
+     * buffer, no z-order. Only the input metadata the compositor forwards.
+     *
+     * Everything is best-effort by design: a field this OEM build does not have
+     * costs that one field (logged), never the layer.
+     */
+    private fun applyInputWindowInfo(
+        txnCls: Class<*>,
+        txn: Any,
+        sc: Any,
+        w: Int,
+        h: Int,
+        report: (String) -> Unit,
+    ) {
+        val handle: Any
+        val notes: String
+        try {
+            val built = buildInputWindowHandle(w, h, report)
+            handle = built.first
+            notes = built.second
+        } catch (t: Throwable) {
+            Log.w(TAG, "input-window handle build failed", t)
+            report("LAYER input-window unavailable: ${t.javaClass.simpleName}: ${t.message}")
+            return
+        }
+
+        try {
+            invokeBest(txnCls, txn, "setInputWindowInfo", sc, handle)
+            // Logged straight to logcat as well as to the app: the socket copy is
+            // what the app shows, but a field report is read out of logcat, and
+            // this line is the one that says whether the fix is live.
+            Log.i(TAG, "input window: $notes")
+            report("LAYER input-window set: $notes")
+        } catch (t: Throwable) {
+            Log.w(TAG, "setInputWindowInfo failed", t)
+            report("LAYER setInputWindowInfo failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
+
+        // The same bit WindowManager sets on its own overlays. Some builds honour
+        // it and skip the occlusion check outright — an independent second way
+        // out, so ask for it too.
+        runCatching { invokeBest(txnCls, txn, "setTrustedOverlay", sc, true) }
+            .onFailure { Log.i(TAG, "setTrustedOverlay not available (${it.javaClass.simpleName})") }
+    }
+
+    /**
+     * Builds the platform's input window object, filling only the fields that
+     * matter, and reports which of them this build actually has.
+     *
+     * @return the object to hand to `setInputWindowInfo`, plus a one-line summary
+     *         of what went in — the summary is what the daemon log shows, and it
+     *         is the thing to compare against `dumpsys input` on a strict device.
+     */
+    private fun buildInputWindowHandle(w: Int, h: Int, report: (String) -> Unit): Pair<Any, String> {
+        val cls = HANDLE_CLASSES.firstNotNullOfOrNull { runCatching { Class.forName(it) }.getOrNull() }
+            ?: error("no InputWindowHandle class on this build")
+
+        // The application handle is part of the window's identity to the
+        // dispatcher. A real one (rather than null) keeps the JNI-side conversion
+        // on a path that is known to be exercised by WindowManager every day.
+        val appCls = runCatching { Class.forName("android.view.InputApplicationHandle") }.getOrNull()
+        val appHandle = appCls?.let { c ->
+            runCatching {
+                c.getConstructor(android.os.IBinder::class.java, String::class.java,
+                    java.lang.Long.TYPE).newInstance(Binder(), LAYER_NAME, 5_000L)
+            }.getOrNull()
+        }
+
+        val handle = runCatching {
+            cls.getConstructor(appCls, java.lang.Integer.TYPE).newInstance(appHandle, 0)
+        }.getOrElse { cls.getDeclaredConstructor().newInstance() }
+
+        val occlusion = resolveOcclusionAllow(report)
+        val inputConfig = resolveInputConfig(report)
+
+        val values = linkedMapOf<String, Any?>(
+            // ★ The one that decides whether any of the rest is even read —
+            //   see the note above `Layer::hasInputInfo()`.
+            "token" to Binder(),
+            "name" to LAYER_NAME,
+            "packageName" to LAYER_PACKAGE,
+            "ownerUid" to Process.myUid(),
+            "ownerPid" to Process.myPid(),
+            "displayId" to 0,                 // layer stack 0 — see applyGeometry
+            // Never intercept. The menu reads /dev/input itself, and everything
+            // that is not the menu must keep going where it always went.
+            "layoutParamsFlags" to (0x00000010 or 0x00000020), // NOT_TOUCHABLE | NOT_TOUCH_MODAL
+            "inputConfig" to inputConfig,
+            "touchOcclusionMode" to occlusion,
+            "trustedOverlay" to true,
+            "scaleFactor" to 1.0f,            // 0 would be a zero-sized input window
+            "alpha" to 1.0f,                  // SurfaceFlinger re-reads the layer's own
+            "canOccludePresentation" to false,
+            "replaceTouchableRegionWithCrop" to false,
+        )
+
+        val applied = ArrayList<String>()
+        val missing = ArrayList<String>()
+        for ((name, value) in values) {
+            if (value == null) { missing += name; continue }
+            if (setMember(handle, name, value)) applied += "$name=$value" else missing += name
+        }
+
+        // `frame` and `touchableRegion` are final Rects/Regions: mutate in place.
+        // An empty touchable region is exactly what we want — it is the state the
+        // layer was already in, and it is not what decides the occlusion.
+        runCatching {
+            (cls.getField("frame").get(handle) as Rect).set(0, 0, w, h)
+            applied += "frame=[0,0,$w,$h]"
+        }
+        // `contentSize` is an immutable Size, so it needs the field route.
+        setMember(handle, "contentSize", Size(w, h))
+
+        val note = "${cls.simpleName}[" + applied.joinToString(" ") +
+            if (missing.isEmpty()) "]" else "] missing=${missing.joinToString(",")}"
+        return handle to note
+    }
+
+    /**
+     * Resolves `touchOcclusionMode = ALLOW` by name.
+     *
+     * The constant moves around between API levels (`android.gui.TouchOcclusionMode`
+     * on 13+, an `android.view` copy on 12, and some builds only expose the
+     * `TOUCH_OCCLUSION_*` spelling). A wrong literal here would silently mean
+     * `BLOCK_UNTRUSTED` — the bug — so the value is looked up, and only then
+     * allowed to fall back.
+     */
+    private fun resolveOcclusionAllow(report: (String) -> Unit): Int {
+        for (clsName in OCCLUSION_CLASSES) {
+            val cls = runCatching { Class.forName(clsName) }.getOrNull() ?: continue
+            for (fieldName in OCCLUSION_FIELDS) {
+                val v = runCatching { cls.getField(fieldName).get(null) }.getOrNull() ?: continue
+                val n = when (v) {
+                    is Number -> v.toInt()
+                    is Enum<*> -> v.ordinal // AIDL enums are declared in value order
+                    else -> continue
+                }
+                report("LAYER occlusion ALLOW: $clsName.$fieldName = $n")
+                Log.i(TAG, "occlusion ALLOW = $n (from $clsName.$fieldName)")
+                return n
+            }
+        }
+        report("LAYER occlusion ALLOW: no constant found, falling back to $OCCLUSION_ALLOW_FALLBACK")
+        Log.i(TAG, "occlusion ALLOW = $OCCLUSION_ALLOW_FALLBACK (fallback)")
+        return OCCLUSION_ALLOW_FALLBACK
+    }
+
+    /**
+     * Resolves the input-config flag bits (not touchable / not focusable / no
+     * input channel / trusted overlay).
+     *
+     * Returns null when no constants can be read, in which case the field is left
+     * alone on purpose: the layer already lets everything through (empty touchable
+     * region), and guessing bit values here could accidentally make it *touchable*
+     * — which would be far worse than the bug being fixed.
+     */
+    private fun resolveInputConfig(report: (String) -> Unit): Int? {
+        for (clsName in INPUT_CONFIG_CLASSES) {
+            val cls = runCatching { Class.forName(clsName) }.getOrNull() ?: continue
+            var flags = 0
+            var found = 0
+            for (flag in INPUT_CONFIG_FLAGS) {
+                val v = runCatching { cls.getField(flag).get(null) }.getOrNull()
+                if (v is Number) { flags = flags or v.toInt(); found++ }
+            }
+            if (found > 0) {
+                report("LAYER inputConfig: $clsName $found/${INPUT_CONFIG_FLAGS.size}" +
+                    " = 0x${Integer.toHexString(flags)}")
+                Log.i(TAG, "inputConfig = 0x${Integer.toHexString(flags)} (from $clsName)")
+                return flags
+            }
+        }
+        report("LAYER inputConfig: constants unreadable — leaving the field alone")
+        Log.i(TAG, "inputConfig: constants unreadable — field left alone")
+        return null
+    }
+
+    /**
+     * Writes one field on a hidden platform class: public field, then private
+     * field, then a `setXxx` setter. Returns false when the build simply has no
+     * such member; never throws, and refuses to touch final fields.
+     */
+    private fun setMember(target: Any, name: String, value: Any): Boolean {
+        val cls = target.javaClass
+        val field = runCatching { cls.getField(name) }.getOrNull()
+            ?: runCatching { cls.getDeclaredField(name) }.getOrNull()
+        if (field != null && !java.lang.reflect.Modifier.isFinal(field.modifiers)) {
+            val ok = runCatching {
+                field.isAccessible = true
+                field.set(target, value)
+            }.isSuccess
+            if (ok) return true
+        }
+        val setterName = "set" + name.replaceFirstChar { it.uppercaseChar() }
+        val m = runCatching {
+            cls.methods.firstOrNull { it.name == setterName && it.parameterTypes.size == 1 }
+        }.getOrNull()
+        if (m != null) {
+            return runCatching {
+                m.isAccessible = true
+                m.invoke(target, value)
+            }.isSuccess
+        }
+        return false
+    }
+
     /** Calls a hidden method by name + arity, so exact signatures need not match. */
     private fun invoke(cls: Class<*>, target: Any, name: String, vararg args: Any?): Any? {
         val m: Method = cls.declaredMethods.firstOrNull {
@@ -278,4 +555,70 @@ object ShellLayerHost {
         m.isAccessible = true
         return m.invoke(target, *args)
     }
+
+    /**
+     * Like [invoke], but only accepts the overload whose parameters actually take
+     * [args] — needed where a name has several same-arity overloads.
+     */
+    private fun invokeBest(cls: Class<*>, target: Any, name: String, vararg args: Any?): Any? {
+        val m = cls.declaredMethods.firstOrNull { c ->
+            c.name == name && c.parameterTypes.size == args.size &&
+                c.parameterTypes.indices.all { accepts(c.parameterTypes[it], args[it]) }
+        } ?: throw NoSuchMethodException("$name/$args")
+
+        m.isAccessible = true
+        return m.invoke(target, *args)
+    }
+
+    private fun accepts(param: Class<*>, arg: Any?): Boolean {
+        if (arg == null) return !param.isPrimitive
+        val boxed = when (param.name) {
+            "boolean" -> java.lang.Boolean::class.java
+            "int" -> java.lang.Integer::class.java
+            "long" -> java.lang.Long::class.java
+            "float" -> java.lang.Float::class.java
+            "double" -> java.lang.Double::class.java
+            "short" -> java.lang.Short::class.java
+            "byte" -> java.lang.Byte::class.java
+            "char" -> java.lang.Character::class.java
+            else -> param
+        }
+        return boxed.isInstance(arg)
+    }
+
+    // ── Untrusted-touch constants ────────────────────────────────────────────
+
+    /** Carriers of the input window, newest first-seen name first. */
+    private val HANDLE_CLASSES = listOf(
+        "android.view.InputWindowHandle",   // 12–15, the one WindowManager itself uses
+        "android.window.InputWindowHandle",
+        "android.window.InputWindowInfo",
+    )
+
+    /** Carriers of the `ALLOW` constant, per API level. */
+    private val OCCLUSION_CLASSES = listOf(
+        "android.gui.TouchOcclusionMode",
+        "android.view.TouchOcclusionMode",
+        "android.window.InputWindowInfo",
+        "android.view.InputWindowHandle",
+    )
+
+    private val OCCLUSION_FIELDS = listOf("ALLOW", "TOUCH_OCCLUSION_ALLOW")
+
+    /** Last resort only; a wrong value here is the bug, so it never wins. */
+    private const val OCCLUSION_ALLOW_FALLBACK = 2
+
+    /** Carriers of the input-config flag bits, per API level. */
+    private val INPUT_CONFIG_CLASSES = listOf(
+        "android.os.InputConfig",
+        "android.view.InputWindowHandle\$InputConfig",
+        "android.window.InputWindowHandle\$InputConfig",
+        "android.window.InputWindowInfo\$InputConfig",
+    )
+
+    private val INPUT_CONFIG_FLAGS =
+        listOf("NOT_FOCUSABLE", "NOT_TOUCHABLE", "NO_INPUT_CHANNEL", "TRUSTED_OVERLAY")
+
+    /** Cosmetic: only surfaces in `dumpsys input`. */
+    private const val LAYER_PACKAGE = "io.github.xiangsu1145.aimbotnextgen"
 }

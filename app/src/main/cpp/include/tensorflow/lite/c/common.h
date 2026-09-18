@@ -900,6 +900,23 @@ typedef struct TfLiteRegistration {
   // Note: It is the responsibility of the registration binder to set this
   // properly.
   int version;
+
+  // The external registration this one was built from, or null for a
+  // registration the caller assembled itself.
+  //
+  // This field is 0x48 away from the start of the struct and is *not*
+  // optional padding: `TfLiteRegistration` is handed to the runtime **by
+  // value**, so the caller materialises a copy and the callee takes the
+  // pointer to it. The runtime reads this slot unconditionally
+  // (TfLiteInterpreterCreate -> ReplaceNodeSubsetsWithDelegateKernels does
+  //   registration->builtin_code = kTfLiteBuiltinDelegate;      // +0x28
+  //   if (registration->registration_external != nullptr)       // +0x40
+  //     registration->registration_external->builtin_code = ... // +0x38
+  // ), so a caller whose copy is one field short leaves these eight bytes as
+  // whatever the stack held, and the runtime writes through that garbage.
+  // Observed as SIGSEGV / SEGV_ACCERR inside libtensorflowlite_jni.so on the
+  // first partition the APU accepted.
+  struct TfLiteRegistrationExternal* registration_external;
 } TfLiteRegistration;
 
 // The flags used in `TfLiteDelegate`. Note that this is a bitmask, so the

@@ -16,6 +16,7 @@
 //  rejected write.
 // ─────────────────────────────────────────────────────────────────────────────
 #include "uinput_inject.h"
+#include "inject_backend.h"
 
 #include <fcntl.h>
 #include <linux/input.h>
@@ -29,23 +30,48 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <time.h>
 
 #include <android/log.h>
 
 #define LOG_TAG "AimbotInput"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
 
 constexpr int kMaxFingers = 10;
-constexpr int kMaxEvents = 512;
+/// First tracking id the mirror hands out. 1.2.1 uses
+/// `(devIdx * 2 + 1) * maxF + slot` with maxF = 10, so device 0 starts at 10.
+constexpr int kMirrorIdBase = 10;
 
-// A rejected uinput write is retried this many times, kWriteSpinUs apart, before
-// the frame is declared lost. The input core drains independently of us, so a
-// short wait is normally all an EAGAIN needs.
-constexpr int kMaxWriteSpins = 20;
-constexpr int kWriteSpinUs   = 250;
+/// A slot's panel id while it is carrying nobody. Not 0: a panel id of 0 is a
+/// perfectly ordinary tracking id, and reading "empty" as "finger 0" is how a
+/// slot gets handed the identity of a finger that is not there.
+constexpr int kNoPanelId = -1;
+
+/// Finger identities arrive from the reader out of two sources that share one
+/// numeric range: a protocol-B panel's own tracking id (0..65535) and the id the
+/// reader invents for protocol-A frames, which live in 60000..63999 (see
+/// kSyntheticBase / kSyntheticMax in touch_reader.cpp). They are mapped to
+/// disjoint bands here, because on the InputManager backend the external id is
+/// the *entire* identity of a pointer — two fingers sharing one is a frozen
+/// pointer with no trace on this side.
+constexpr int kPanelSyntheticBase = 60000;
+constexpr int kPanelSyntheticMax  = 63999;
+constexpr int kMirrorExtIdBase    = 100000;   // protocol B: base + tracking id
+constexpr int kSyntheticExtIdBase = 200000;   // protocol A: base + (id - 60000)
+
+/// The identity a mirrored finger is known by on the InputManager backend.
+/// The aim's and the trigger's fixed ids are 1000 / 2000, clear of both bands.
+int mirrorExtId(int panelId) {
+    if (panelId >= kPanelSyntheticBase && panelId <= kPanelSyntheticMax)
+        return kSyntheticExtIdBase + (panelId - kPanelSyntheticBase);
+    return kMirrorExtIdBase + panelId;
+}
+
+constexpr int kMaxEvents = 512;
 
 struct Vec2 {
     float x = 0.0f, y = 0.0f;
@@ -55,7 +81,28 @@ struct Vec2 {
 
 /// One finger slot on the virtual device.
 struct TouchObj {
+    /// Panel coordinates — what the uinput frame carries. A mirror slot is
+    /// filled with the exact numbers the panel reported; an aim slot with the
+    /// conversion of screenToTouch().
     Vec2 pos{};
+    /// The same finger in screen pixels, which is what a MotionEvent needs.
+    /// Both are kept because the two backends want different things and
+    /// converting at the last moment would mean either a round trip through
+    /// truncating integer pixels (uinput) or a rotation-dependent inverse
+    /// (InputManager), and this module used to get that wrong precisely because
+    /// the value had to be reconstructed rather than remembered.
+    Vec2 sPos{};
+    /// The identity this finger is known by **outside** this file — what the
+    /// InputManager backend keys its pointers on.
+    ///
+    /// Deliberately not [id]. [id] is the *wire* identity of a slot (`10 + k`,
+    /// assigned by the position a finger happens to occupy), which is exactly
+    /// right for uinput, where a slot is a lane the kernel tracks, and exactly
+    /// wrong for a MotionEvent, where an id identifies the finger itself. Two
+    /// physical fingers keep their panel tracking ids for as long as they are
+    /// down, so those are what a pointer is keyed on here; the aim's and the
+    /// trigger's ids go in as they are, in a range the panel cannot produce.
+    int extId = 0;
     int id = 0;
     bool isDown = false;
 };
@@ -70,6 +117,23 @@ std::mutex g_mutex;
 
 int  g_outputFd = -1;        // /dev/uinput handle
 bool g_initialized = false;
+
+// ── Which way the frame leaves ───────────────────────────────────────────────
+//
+// Only the last hop differs between the two backends; everything above (slots,
+// ids, the mirror mapping, the aim's takeover) is one implementation. See
+// input/inject_backend.h for why both exist and why switching is destructive.
+int  g_backend = INJECT_BACKEND_UINPUT;
+/// Whether the InputManager path is usable. Only meaningful while g_backend is
+/// INJECT_BACKEND_INPUT_MANAGER, and set from the Kotlin side's own answer —
+/// never assumed, because "the reflection call returned" is not "the platform
+/// accepted the event".
+bool g_imReady = false;
+
+/// Can the selected backend deliver a frame right now?
+bool backendReadyLocked() {
+    return g_backend == INJECT_BACKEND_INPUT_MANAGER ? g_imReady : g_initialized;
+}
 
 // Panel the caller wants us to clone (set by uinput_set_source_panel). When
 // empty we fall back to discovering it with `getevent -p`.
@@ -91,6 +155,30 @@ char g_ourVirtualSysname[64] = {};
 TouchObj g_fingers[kMaxFingers]{};
 bool     g_uploaded[kMaxFingers]{};   // what the kernel currently believes
 
+/// The PANEL's tracking id currently sitting in each mirror slot, or
+/// kNoPanelId. This is what makes a slot belong to a *finger* rather than to a
+/// position.
+///
+/// The wire carries a constant synthetic id per slot (kMirrorIdBase + slot),
+/// which is what aimbot 1.2.1 sends and what this file was aligned to; keeping
+/// the panel id here is what lets the slot follow the finger instead.
+///
+/// That distinction is the whole point. The reader hands us a compacted list —
+/// the gaps where lifted fingers used to be are gone — so the index a finger
+/// appears at changes as its neighbours come and go. Assigning slots by that
+/// index (which 1.2.1 can afford to do, because it indexes by the panel's own
+/// slot number and never compacts) means the finger in slot 1 moves to slot 0
+/// the moment the finger in slot 0 lifts; since a slot's wire identity is fixed,
+/// the app is then told that pointer 10 walked from one finger's position to the
+/// other's. That is the "two touch points jumping between positions" fault, and
+/// this array is the fix: a slot keeps its owner until that owner is gone.
+///
+/// It is also the only way to answer "which slot is carrying the finger the
+/// player is holding right now" for touch fusion — the wire id cannot, since it
+/// is a constant per slot.
+int g_panelIds[kMaxFingers] = {kNoPanelId, kNoPanelId, kNoPanelId, kNoPanelId, kNoPanelId,
+                               kNoPanelId, kNoPanelId, kNoPanelId, kNoPanelId, kNoPanelId};
+
 // "Touch fusion" takeover: while >= 0, uinput_mirror_physical() leaves this
 // mirror slot alone (neither re-updates nor lifts it) so the aim loop can drive
 // the real finger that lives there directly. Set by uinput_takeover_physical_id()
@@ -98,6 +186,26 @@ bool     g_uploaded[kMaxFingers]{};   // what the kernel currently believes
 // cleared by uinput_release_takeover(). Keeping the slot down while aim owns it
 // avoids the down/up/down flicker that two writers on one slot would cause.
 int g_takeoverSlot = -1;
+/// The PANEL tracking id aim reserved — i.e. the argument it passed to
+/// uinput_takeover_physical_id().
+///
+/// The slot index alone is not sufficient. Slots are claimed by finger, so a
+/// given finger does keep the same index — but the *exclusion* has to survive
+/// the finger changing places too (a slot released and re-claimed differently
+/// after a hand-off), and matching on the panel id is the form that stays true
+/// under all of it. Excluding by index would exclude whichever finger happens to
+/// sit there now, and the finger aim is driving could end up in a slot nobody is
+/// excluding — the two-writers-on-one-slot situation all over again.
+int g_takeoverPanelId = -1;
+
+/// Whether the finger aim is driving showed up in the most recent mirror frame.
+///
+/// uinput_release_takeover() lifts the slot it hands back, because a finger that
+/// is already physically gone will never be re-reported and the slot would stay
+/// down as a phantom point forever. But if the finger is *still* down, lifting
+/// it is pure noise: the mirror presses it again one frame later and the app
+/// sees a pointer blink out and return. That flag tells the two apart.
+bool g_takeoverSeen = false;
 
 // Raised when a frame did not reach the kernel in full. The next frame then
 // re-states every slot from scratch instead of sending deltas against a state
@@ -157,59 +265,170 @@ void screenToTouch(int sx, int sy, float& tx, float& ty) {
     ty = py * g_scaleY;
 }
 
+// ── Injection health line ────────────────────────────────────────────────────
+//
+// Written for the case where we are NOT looking at the device. A remote report
+// arrives as "his phone has no touch", and the one thing nobody can tell us is
+// where along 面板 → grab → mirror → write → InputReader → App the signal died.
+// Everything from write() rightwards is invisible here, so the best we can do
+// is make the left half unambiguous — and it has to speak even when nobody is
+// touching anything, because "nothing happened" and "nothing happened *yet*"
+// look identical in a log that only records taps.
+//
+// So once every kHealthPeriodMs the whole injection state is summarised in one
+// line, always:
+//   +0 frames over a whole minute  → nothing ever called the mirror, i.e. the
+//                                    fault is upstream of us (reader / grab);
+//   frames climbing, failures=0    → frames reached write() and the kernel took
+//                                    them, so the fault is downstream (InputReader,
+//                                    the OEM stack) and no amount of staring at
+//                                    this module will find it;
+//   failures climbing              → the frames are being refused right here.
+constexpr long long kHealthPeriodMs = 10'000;
+
+long      g_uploadFrames    = 0;    // every frame that reached write()
+long      g_restateFrames   = 0;    // frames that were full re-states (resyncs)
+long long g_lastHealthMs    = 0;
+long      g_lastHealthFrames = 0;
+
+long long monotonicMs() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+/// Prints the periodic summary described above. Called from upload() so the
+/// line doubles as proof that the mirror is still being driven.
+void maybeLogHealth() {
+    const long long now = monotonicMs();
+    if (g_lastHealthMs == 0) {
+        g_lastHealthMs = now;
+        g_lastHealthFrames = g_uploadFrames;
+        return;
+    }
+    if (now - g_lastHealthMs < kHealthPeriodMs) return;
+
+    // Which fingers are down, and where each of them came from. "Nothing gets
+    // injected" has two causes that look identical from the outside — the
+    // mirror never sees a physical finger, or aim never asks for one — and a
+    // single `down=1` cannot tell them apart. Splitting the count by origin
+    // does, from one line, without a second collection round trip.
+    //
+    // A slot with a panel id is one the reader is mirroring (or one aim has
+    // taken over); a slot without one was asked for by program logic.
+    int down = 0, mirrorDown = 0, aimDown = 0;
+    for (int i = 0; i < kMaxFingers; ++i) {
+        if (!g_fingers[i].isDown) continue;
+        ++down;
+        if (g_panelIds[i] != kNoPanelId) ++mirrorDown; else ++aimDown;
+    }
+
+    LOGI("health %lldms: frames=%+ld/%ld restates=%ld failures=%d force_restate=%d "
+         "down=%d mirror=%d aim=%d backend=%s fd=%d ready=%d take=%d our=%s",
+         now - g_lastHealthMs,
+         g_uploadFrames - g_lastHealthFrames, g_uploadFrames, g_restateFrames,
+         g_writeFailures, g_forceRestate ? 1 : 0, down, mirrorDown, aimDown,
+         g_backend == INJECT_BACKEND_INPUT_MANAGER ? "inputmgr" : "uinput",
+         g_outputFd,
+         g_initialized ? 1 : 0, g_takeoverSlot,
+         g_ourVirtualPath[0] != '\0' ? g_ourVirtualPath : "(none)");
+
+    g_lastHealthMs = now;
+    g_lastHealthFrames = g_uploadFrames;
+}
+
 // ── Frame writer ─────────────────────────────────────────────────────────────
+
+/// The ABS codes this device actually declared, in declaration order.
+///
+/// Printed in the `uinput ready` line. Without it a log cannot answer two
+/// questions that came up the hard way: which build of this file is running
+/// (does the set contain ABS_X/ABS_Y?), and whether the declared axes are the
+/// ones we think they are. Two sessions of remote debugging went into guessing
+/// at exactly that, so it is now stated rather than assumed.
+char g_declaredAbs[192] = {};
+
+void recordDeclaredAbs(int code) {
+    const size_t used = strlen(g_declaredAbs);
+    if (used >= sizeof(g_declaredAbs) - 8) return;
+    snprintf(g_declaredAbs + used, sizeof(g_declaredAbs) - used, "%s%d",
+             used != 0 ? "," : "", code);
+}
 
 /// Emits one complete multitouch frame describing every finger slot.
 ///
-/// The frame leaves as one `write`, and that write is the only thing keeping the
-/// kernel's copy of the touch state in step with g_fingers / g_uploaded. Two
-/// ways it used to lose that step, both with the same consequence:
+/// aimbot 1.2.1 verbatim (touch_core.cpp -> upload()): one `write` per frame,
+/// no retry, no restate. Per active finger: SLOT, TRACKING_ID (only when the
+/// kernel is not already believed to hold it), POSITION_X/Y, then PRESSURE /
+/// TOUCH_MAJOR / WIDTH_MAJOR with a random value inside a small slice of the
+/// panel's own maximum — but only for the axes the cloned panel advertises
+/// (`g_*Max > 0`), because reporting a value on an axis the panel does not have
+/// is itself a tell. The tail is BTN_TOUCH, the five BTN_TOOL_* bits and the
+/// terminating SYN_REPORT.
 ///
-///   * the fd is O_NONBLOCK, so a full input-core buffer answers EAGAIN and the
-///     entire frame was dropped — including the TRACKING_ID events that begin
-///     and end pointers;
-///   * a short write left the frame unterminated, so its tail (BTN_TOUCH, the
-///     TOOL bits and the terminating SYN_REPORT) never landed.
+/// Absolute coordinates go out raw: the reader stores what the panel reported
+/// and this writes it back unchanged, which is what 1.2.1 does (its s2tx/s2ty
+/// are 1.0 by construction). No ABS_X/ABS_Y are sent, because the device does
+/// not declare them — 1.2.1 does not either.
+/// InputManager half of upload(): hands the complete desired pointer set to the
+/// Kotlin state machine and lets it work out what changed.
 ///
-/// Either one desyncs the two sides permanently, because g_uploaded[] was
-/// updated whether or not the bytes went out: the next frame then believes the
-/// kernel already knows a finger's tracking id and does not re-send it, so every
-/// frame from then on is a delta against a state the device never had. The panel
-/// is grabbed by this process, so "the device stopped understanding touch" means
-/// the whole phone stops responding until the daemon restarts — which is what a
-/// sustained swipe, the highest event rate this path ever sees, could trigger.
+/// The division of labour is the point. This side knows which slots exist and
+/// what should be under each of them *now*; the other side knows what it told
+/// Android last time, and therefore what the correct action for this change is
+/// (DOWN vs POINTER_DOWN, which pointer index a POINTER_UP refers to, when the
+/// gesture's downTime started). Neither half can be split any further without
+/// somebody reconstructing the other's state, which is exactly how the previous
+/// implementation ended up with two pointers sharing one id.
 ///
-/// So the write is retried through EAGAIN and continued through short writes,
-/// and a frame that ultimately fails raises g_forceRestate so that the next one
-/// re-states everything rather than building on a frame that never arrived.
+/// Screen pixels, not panel raw: a MotionEvent is in display coordinates.
+/// `sPos` is filled by whichever call put the finger down — the mirror from the
+/// reader's own screen conversion, aim from the coordinates it was given — so
+/// nothing is recomputed here.
+void uploadViaInputManager() {
+    int ids[kMaxFingers];
+    int xs[kMaxFingers];
+    int ys[kMaxFingers];
+    int n = 0;
+
+    for (int fi = 0; fi < kMaxFingers; ++fi) {
+        if (!g_fingers[fi].isDown) continue;
+        ids[n] = g_fingers[fi].extId;
+        xs[n] = static_cast<int>(g_fingers[fi].sPos.x);
+        ys[n] = static_cast<int>(g_fingers[fi].sPos.y);
+        ++n;
+    }
+    aimbotng::input::imBridgePushFrame(ids, xs, ys, n);
+}
+
 void upload() {
+    ++g_uploadFrames;
+    maybeLogHealth();
+
+    if (g_backend == INJECT_BACKEND_INPUT_MANAGER) {
+        if (g_imReady) uploadViaInputManager();
+        return;
+    }
+
     if (g_outputFd < 0) return;
 
     int count = 0;
-    int active = 0;
-    bool anyDown = false;
-
-    // A restate frame ignores what the kernel is believed to know: every slot
-    // gets its identity again, up or down, which is what resynchronises the two
-    // sides after a lost write.
-    const bool restate = g_forceRestate;
+    int activeFingerCount = 0;
+    bool hasActiveFinger = false;
 
     for (int fi = 0; fi < kMaxFingers; ++fi) {
         const TouchObj& finger = g_fingers[fi];
-        // What the kernel was last told about this slot. A restate frame
-        // deliberately reports "nothing known", so every slot is described
-        // again from scratch.
-        const bool kernelHolds = g_uploaded[fi] && !restate;
+        const bool wasUploaded = g_uploaded[fi];
 
         if (finger.isDown) {
-            anyDown = true;
-            ++active;
+            hasActiveFinger = true;
+            ++activeFingerCount;
             count = pushEvent(count, EV_ABS, ABS_MT_SLOT, fi);
-            if (!kernelHolds) count = pushEvent(count, EV_ABS, ABS_MT_TRACKING_ID, finger.id);
+            if (!wasUploaded)
+                count = pushEvent(count, EV_ABS, ABS_MT_TRACKING_ID, finger.id);
             count = pushEvent(count, EV_ABS, ABS_MT_POSITION_X, static_cast<int>(finger.pos.x));
             count = pushEvent(count, EV_ABS, ABS_MT_POSITION_Y, static_cast<int>(finger.pos.y));
-            // Real fingers report pressure / contact area every frame, within a
-            // small slice of the panel's reported max.
+            // Only emit axes the cloned panel advertises.
             if (g_pressureMax > 0)
                 count = pushEvent(count, EV_ABS, ABS_MT_PRESSURE,
                                   randInRange(g_pressureMax / 333, g_pressureMax / 40));
@@ -220,72 +439,30 @@ void upload() {
                 count = pushEvent(count, EV_ABS, ABS_MT_WIDTH_MAJOR,
                                   randInRange(g_widthMajorMax / 12, g_widthMajorMax / 4));
             g_uploaded[fi] = true;
-        } else if (g_uploaded[fi] || restate) {
-            // ↑ `g_uploaded[fi] || restate`, NOT `!kernelHolds`.
-            //
-            // The kernel is still holding this slot down (or we are restating
-            // blind, having lost a frame and learned nothing from it), so the
-            // pointer has to be told to end. Testing the *negation* here did the
-            // exact opposite — it ended pointers the kernel never had and left
-            // every real lift unsent, so one pointer per touch stayed stuck in
-            // the kernel forever. The physical panel is grabbed, so a stuck
-            // pointer is the whole phone: nothing else can deliver touch until
-            // the daemon restarts.
+        } else if (wasUploaded) {
             count = pushEvent(count, EV_ABS, ABS_MT_SLOT, fi);
             count = pushEvent(count, EV_ABS, ABS_MT_TRACKING_ID, -1);
             g_uploaded[fi] = false;
         }
     }
 
-    count = pushEvent(count, EV_KEY, BTN_TOUCH, anyDown ? 1 : 0);
-    count = pushEvent(count, EV_KEY, BTN_TOOL_FINGER, active == 1 ? 1 : 0);
-    count = pushEvent(count, EV_KEY, BTN_TOOL_DOUBLETAP, active == 2 ? 1 : 0);
-    count = pushEvent(count, EV_KEY, BTN_TOOL_TRIPLETAP, active == 3 ? 1 : 0);
-    count = pushEvent(count, EV_KEY, BTN_TOOL_QUADTAP, active == 4 ? 1 : 0);
-    count = pushEvent(count, EV_KEY, BTN_TOOL_QUINTTAP, active >= 5 ? 1 : 0);
+    count = pushEvent(count, EV_KEY, BTN_TOUCH, hasActiveFinger ? 1 : 0);
+    count = pushEvent(count, EV_KEY, BTN_TOOL_FINGER, activeFingerCount == 1 ? 1 : 0);
+    count = pushEvent(count, EV_KEY, BTN_TOOL_DOUBLETAP, activeFingerCount == 2 ? 1 : 0);
+    count = pushEvent(count, EV_KEY, BTN_TOOL_TRIPLETAP, activeFingerCount == 3 ? 1 : 0);
+    count = pushEvent(count, EV_KEY, BTN_TOOL_QUADTAP, activeFingerCount == 4 ? 1 : 0);
+    count = pushEvent(count, EV_KEY, BTN_TOOL_QUINTTAP, activeFingerCount >= 5 ? 1 : 0);
     count = pushEvent(count, EV_SYN, SYN_REPORT, 0);
 
     const size_t total = sizeof(input_event) * static_cast<size_t>(count);
-    const auto*  bytes = reinterpret_cast<const uint8_t*>(g_buffer.events);
-
-    size_t written = 0;
-    int    spins   = 0;
-    while (written < total) {
-        const ssize_t n = write(g_outputFd, bytes + written, total - written);
-        if (n > 0) {
-            written += static_cast<size_t>(n);
-            continue;
+    const ssize_t n = write(g_outputFd, g_buffer.events, total);
+    if (n < 0) {
+        ++g_writeFailures;
+        if (g_writeFailures == 1 || (g_writeFailures % 120) == 0) {
+            LOGE("upload: write failed errno=%d (failures=%d)", errno, g_writeFailures);
         }
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (++spins > kMaxWriteSpins) break;
-            usleep(kWriteSpinUs);
-            continue;
-        }
-        break;  // EPIPE / ENODEV / anything else — the device is gone
-    }
-
-    if (written == total) {
-        // The two sides agree, so the next frame may go back to being a delta.
-        g_forceRestate = false;
-        if (g_writeFailures > 0) {
-            LOGD("upload: resynced after %d failed frame(s)", g_writeFailures);
-            g_writeFailures = 0;
-        }
-        return;
-    }
-
-    // The frame did not land, and how much of it did is not knowable — the
-    // kernel may hold a prefix of it. Nothing may be assumed from here on, so
-    // the next frame restates every slot rather than compounding the damage.
-    g_forceRestate = true;
-    if (++g_writeFailures == 1 || (g_writeFailures % 120) == 0) {
-        LOGE("upload: short write (%zu/%zu bytes) errno=%d — restating next frame "
-             "(failures=%d)", written, total, errno, g_writeFailures);
     }
 }
-
-// ── Physical panel discovery ─────────────────────────────────────────────────
 
 /// Finds the real touchscreen by parsing `getevent -p`. Doing it through
 /// getevent avoids needing a direct /dev/input fd just to enumerate devices.
@@ -365,13 +542,35 @@ bool detectTouchDeviceViaGetevent(char* outPath, size_t pathSize, int& outMaxX, 
 /// identity and capability set as we can read from `sourceFd` (may be -1).
 bool createUinputDevice(int screenX, int screenY, int sourceFd) {
     uinput_user_dev dev{};
+    g_declaredAbs[0] = '\0';   // fresh declaration list per device
     g_outputFd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (g_outputFd < 0) {
         LOGE("open /dev/uinput failed errno=%d", errno);
         return false;
     }
 
-    // ── Identity: clone the real panel so we appear as a genuine touchscreen ──
+    // ══════════════════════════════════════════════════════════════════════
+    //  The rest of this function is aimbot 1.2.1 VERBATIM.
+    //
+    //  Source: G:\ai\Aimbot-ai\android-client @ 1.2.1
+    //          app/src/main/cpp/src/injection/touch_core.cpp
+    //          -> createUinputDevice()
+    //
+    //  Everything below this banner is a line-for-line copy, and the same is
+    //  true of upload() and uinput_mirror_physical() further down. The point is
+    //  not tidiness: 1.2.1 is the build that was measured working on the device
+    //  we cannot reproduce, with uinput, and every "improvement" this fork had
+    //  layered on top of it (random device name, a reduced ABS set, added
+    //  ABS_X/Y, per-gesture mirror gating) moved it further from that build.
+    //  So the injection path is now that build, and nothing else.
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── Device identity: clone from the real panel when we have its fd ──
+    // 1.2.1 deliberately clones the panel's own identity: a cloned
+    // bustype/vendor/product/name makes /proc/bus/input/devices and
+    // InputDevice enumeration match a genuine touchscreen. Without a source fd
+    // it falls back to plausible values (BUS_I2C is the common touch bus)
+    // rather than the illegal bustype=0 a bare uinput device would expose.
     input_id realId{};
     bool haveRealId = (sourceFd >= 0 && ioctl(sourceFd, EVIOCGID, &realId) == 0);
 
@@ -391,47 +590,65 @@ bool createUinputDevice(int screenX, int screenY, int sourceFd) {
     if (haveRealId) {
         dev.id = realId;
     } else {
-        dev.id.bustype = BUS_I2C;  // the usual bus for touch controllers
+        dev.id.bustype = BUS_I2C;
         dev.id.vendor = rand() % 10 + 5;
         dev.id.product = rand() % 10 + 5;
         dev.id.version = rand() % 10 + 5;
     }
 
-    // ── Properties (INPUT_PROP_DIRECT / POINTER / ...) ──
+    // Clone input device properties (INPUT_PROP_DIRECT, INPUT_PROP_POINTER, ...)
+    // from the real panel. Different vendors set different prop combinations —
+    // a OnePlus panel is INPUT_PROP_DIRECT alone, some Samsung panels also set
+    // INPUT_PROP_POINTER, etc. Falling back to INPUT_PROP_DIRECT if the clone
+    // fails keeps the device at least minimally registerable.
     bool clonedProps = false;
     if (sourceFd >= 0) {
         uint8_t propBits[64]{};
         ssize_t propRes = ioctl(sourceFd, EVIOCGPROP(sizeof(propBits)), propBits);
         if (propRes > 0) {
-            int n = static_cast<int>(propRes) < static_cast<int>(sizeof(propBits))
-                        ? static_cast<int>(propRes)
-                        : static_cast<int>(sizeof(propBits));
-            for (int j = 0; j < n; ++j)
-                for (int k = 0; k < 8; ++k)
-                    if (propBits[j] & (1 << k)) ioctl(g_outputFd, UI_SET_PROPBIT, j * 8 + k);
+            int propCount = static_cast<int>(propRes) < static_cast<int>(sizeof(propBits))
+                                ? static_cast<int>(propRes)
+                                : static_cast<int>(sizeof(propBits));
+            for (int j = 0; j < propCount; ++j) {
+                for (int k = 0; k < 8; ++k) {
+                    int code = j * 8 + k;
+                    if (propBits[j] & (1 << k)) {
+                        ioctl(g_outputFd, UI_SET_PROPBIT, code);
+                    }
+                }
+            }
             clonedProps = true;
         }
     }
-    if (!clonedProps) ioctl(g_outputFd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+    if (!clonedProps) {
+        ioctl(g_outputFd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+    }
 
     ioctl(g_outputFd, UI_SET_EVBIT, EV_ABS);
     ioctl(g_outputFd, UI_SET_EVBIT, EV_SYN);
     ioctl(g_outputFd, UI_SET_EVBIT, EV_KEY);
 
-    // Mandatory axes. ABS_X / ABS_Y are deliberately NOT registered: real panels
-    // here report coordinates via ABS_MT_POSITION_X/Y only, and a ghost ABS_X/Y
-    // axis is a strong uinput tell.
+    // Mandatory axes for our multitouch injection. Note: we intentionally do NOT
+    // register ABS_X/ABS_Y — real panels (including this device's "touchpanel")
+    // report coordinates via ABS_MT_POSITION_X/Y only. A ghost ABS_X/Y axis is
+    // a strong uinput tell. SLOT/POSITION ranges are overridden to the panel's
+    // actual coordinate extent below.
     ioctl(g_outputFd, UI_SET_ABSBIT, ABS_MT_SLOT);
     ioctl(g_outputFd, UI_SET_ABSBIT, ABS_MT_POSITION_X);
     ioctl(g_outputFd, UI_SET_ABSBIT, ABS_MT_POSITION_Y);
     ioctl(g_outputFd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID);
+    recordDeclaredAbs(ABS_MT_SLOT);
+    recordDeclaredAbs(ABS_MT_POSITION_X);
+    recordDeclaredAbs(ABS_MT_POSITION_Y);
+    recordDeclaredAbs(ABS_MT_TRACKING_ID);
 
     char randomPhys[16]{};
     genRandomString(randomPhys, sizeof(randomPhys));
     ioctl(g_outputFd, UI_SET_PHYS, randomPhys);
 
-    // ── Clone every ABS axis (incl. pressure / touch major / width) preserving
-    // min/max/fuzz/flat, so we advertise the same capability set as the panel. ──
+    // ── Clone every ABS axis (incl. pressure / touch major / width) from the
+    // real panel, preserving each axis's min/max/fuzz/flat. This adds the
+    // pressure and contact-area capability bits a genuine touchscreen has. ──
     g_pressureMax = g_touchMajorMax = g_widthMajorMax = 0;
     if (sourceFd >= 0) {
         uint8_t* absBits = nullptr;
@@ -450,6 +667,7 @@ bool createUinputDevice(int screenX, int screenY, int sourceFd) {
                 input_absinfo ai{};
                 if (ioctl(sourceFd, EVIOCGABS(code), &ai) != 0) continue;
                 ioctl(g_outputFd, UI_SET_ABSBIT, code);
+                recordDeclaredAbs(code);
                 dev.absmin[code] = ai.minimum;
                 dev.absmax[code] = ai.maximum;
                 dev.absfuzz[code] = ai.fuzz;
@@ -462,32 +680,45 @@ bool createUinputDevice(int screenX, int screenY, int sourceFd) {
         free(absBits);
     }
 
-    // ── Clone the panel's KEY capabilities verbatim (no hardcoded BTN_TOOL_*),
-    // falling back to the minimum multitouch set when there is no source. ──
-    uint8_t* keyBits = nullptr;
-    ssize_t keySize = 0;
-    int keyRes = 0;
+    // Clone the real panel's KEY capabilities (button set) verbatim. We do NOT
+    // hardcode any BTN_TOOL_* bits — doing so would diverge from the real panel
+    // (which is a strong uinput tell). Fall back to the minimum required
+    // multitouch set (BTN_TOUCH + BTN_TOOL_FINGER) if no source fd is available.
+    uint8_t* bits = nullptr;
+    ssize_t bitsSize = 0;
+    int res = 0;
     bool clonedKeys = false;
     if (sourceFd >= 0) {
         while (true) {
-            keyRes = ioctl(sourceFd, EVIOCGBIT(EV_KEY, keySize), keyBits);
-            if (keyRes < keySize) break;
-            keySize = keyRes + 16;
-            keyBits = static_cast<uint8_t*>(realloc(keyBits, keySize * 2));
+            res = ioctl(sourceFd, EVIOCGBIT(EV_KEY, bitsSize), bits);
+            if (res < bitsSize) break;
+            bitsSize = res + 16;
+            bits = static_cast<uint8_t*>(realloc(bits, bitsSize * 2));
         }
-        for (int j = 0; j < keyRes; ++j)
-            for (int k = 0; k < 8; ++k)
-                if (keyBits[j] & (1 << k)) ioctl(g_outputFd, UI_SET_KEYBIT, j * 8 + k);
-        clonedKeys = keyRes > 0;
+        for (int j = 0; j < res; ++j) {
+            for (int k = 0; k < 8; ++k) {
+                int code = j * 8 + k;
+                if (bits[j] & (1 << k)) {
+                    ioctl(g_outputFd, UI_SET_KEYBIT, code);
+                }
+            }
+        }
+        clonedKeys = res > 0;
     }
-    free(keyBits);
+    free(bits);
     if (!clonedKeys) {
         ioctl(g_outputFd, UI_SET_KEYBIT, BTN_TOUCH);
         ioctl(g_outputFd, UI_SET_KEYBIT, BTN_TOOL_FINGER);
     }
 
-    // Pin the axes we drive. SLOT keeps whatever the panel reported; the
-    // remaining ranges are set explicitly as a safety net.
+    // Override ranges for axes we drive. The ABS-bit loop above already copied
+    // min/max from the real panel for every axis (including SLOT, POSITION_X/Y,
+    // PRESSURE, TOUCH_MAJOR). We only re-pin:
+    //   - POSITION_X/Y to the panel's actual coordinate extent
+    //   - TRACKING_ID to 65535 so we never run out of IDs internally.
+    // ABS_MT_SLOT is left as the real panel reported it (Pixel/older panels
+    // declare 5 slots, OnePlus/Samsung declare 10). Fall back to 9 only when no
+    // real-panel data was available.
     if (dev.absmax[ABS_MT_SLOT] == 0) {
         dev.absmin[ABS_MT_SLOT] = 0;
         dev.absmax[ABS_MT_SLOT] = kMaxFingers - 1;
@@ -533,9 +764,38 @@ bool createUinputDevice(int screenX, int screenY, int sourceFd) {
     return true;
 }
 
+/// Lifts everything, one frame. Caller must hold g_mutex.
+///
+/// Used before the virtual device is destroyed and before the backend is
+/// swapped. A device that disappears while a slot is down leaves that pointer
+/// pressed on the far side for as long as the app believes it exists, and on
+/// the InputManager path there is no device teardown that would end the gesture
+/// implicitly — the MotionEvent stream has to say so itself.
+///
+/// The call is unconditional rather than "only if something was down": the
+/// other side's idea of what is held is its own, and the one time it disagrees
+/// is exactly the one time this needs to speak.
+void liftAllLocked() {
+    for (int i = 0; i < kMaxFingers; ++i) g_fingers[i].isDown = false;
+    g_takeoverSlot    = -1;
+    g_takeoverPanelId = -1;
+    g_takeoverSeen    = false;
+    upload();
+}
+
 /// Destroys the virtual device. Caller must hold g_mutex.
 void closeLocked() {
     if (!g_initialized && g_outputFd < 0) return;
+
+    // Logged every time, including when it is invoked implicitly by another
+    // call (uinput_init calls this first). A device silently losing its state
+    // mid-session used to be invisible: nothing said when, or why, and the
+    // symptom was just "touch stopped somewhere further down".
+    LOGI("uinput teardown: initialized=%d fd=%d frames=%ld restates=%ld failures=%d "
+         "path='%s'",
+         g_initialized ? 1 : 0, g_outputFd, g_uploadFrames, g_restateFrames,
+         g_writeFailures,
+         g_ourVirtualPath[0] != '\0' ? g_ourVirtualPath : "(none)");
 
     if (g_outputFd >= 0) {
         ioctl(g_outputFd, UI_DEV_DESTROY);
@@ -547,6 +807,15 @@ void closeLocked() {
     memset(g_buffer.events, 0, sizeof(g_buffer.events));
     memset(g_fingers, 0, sizeof(g_fingers));
     memset(g_uploaded, 0, sizeof(g_uploaded));
+    // Not memset: the empty value is kNoPanelId, not 0. Zeroing would make every
+    // slot claim to be carrying the finger whose tracking id is 0.
+    for (int& panelId : g_panelIds) panelId = kNoPanelId;
+    // The takeover has to die with the device: its id would otherwise survive
+    // into the next device's life and make the mirror silently skip whichever
+    // fresh finger happened to be handed that same panel tracking id.
+    g_takeoverSlot    = -1;
+    g_takeoverPanelId = -1;
+    g_takeoverSeen    = false;
     g_initialized = false;
 }
 
@@ -627,13 +896,28 @@ extern "C" bool uinput_init(int screenW, int screenH) {
     g_scaleY = static_cast<float>(panelMaxY) / static_cast<float>(portraitH > 0 ? portraitH : 1);
 
     g_initialized = true;
-    LOGD("uinput ready scale=%.3f,%.3f", g_scaleX, g_scaleY);
+    // Everything a remote report needs to reconstruct this device, at INFO so
+    // it survives a `*：I` filter: compare it against the tester's
+    // `getevent -p` and we learn both whether our clone came up and what it
+    // cloned. Panels whose ABS range is a multiple of the pixel size (MTK ships
+    // 100x) are the ones where a wrong scale shows up as a badly offset touch.
+    LOGI("uinput ready: screen=%dx%d landscape=%d panel=%dx%d scale=%.3f,%.3f "
+         "slots=%d clone='%s' sysname='%s' fd=%d abs=[%s]",
+         screenW, screenH, g_landscape ? 1 : 0, panelMaxX, panelMaxY,
+         g_scaleX, g_scaleY, kMaxFingers,
+         panelPath[0] != '\0' ? panelPath : "(none)",
+         g_ourVirtualSysname[0] != '\0' ? g_ourVirtualSysname : "(none)",
+         g_outputFd, g_declaredAbs);
     return true;
 }
 
 extern "C" void uinput_close(void) {
+    LOGI("uinput_close requested (was initialized=%d fd=%d)", g_initialized ? 1 : 0, g_outputFd);
     std::lock_guard<std::mutex> guard(g_mutex);
-    g_takeoverSlot = -1;
+    // Lift first, destroy second. The other order would tear the device out
+    // from under whatever it was holding, and every pointer still down at that
+    // moment stays down as far as the app underneath is concerned.
+    liftAllLocked();
     closeLocked();
 }
 
@@ -648,33 +932,45 @@ extern "C" void uinput_close(void) {
 
 extern "C" int uinput_takeover_physical_id(int id) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    if (!g_initialized) return -1;
+    if (!backendReadyLocked()) return -1;
+    // Matched against g_panelIds, NOT g_fingers[].id: the frame carries a
+    // synthetic id per slot (see the note on g_panelIds), so the panel tracking
+    // id the caller has in hand only ever appears there.
     for (int i = 0; i < UINPUT_MIRROR_SLOTS; ++i) {
-        if (g_fingers[i].isDown && g_fingers[i].id == id) {
-            g_takeoverSlot = i;
+        if (g_fingers[i].isDown && g_panelIds[i] == id) {
+            g_takeoverSlot    = i;
+            g_takeoverPanelId = id;
+            g_takeoverSeen    = true;   // it is down right now by definition
             return i;
         }
     }
-    g_takeoverSlot = -1;
+    g_takeoverSlot    = -1;
+    g_takeoverPanelId = -1;
     return -1;
 }
 
 extern "C" void uinput_release_takeover(void) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    // Lift the taken-over slot immediately. When the real finger is already
-    // physically lifted the mirror will never re-report it, so without this the
-    // kernel keeps that slot stuck down as a phantom touch point — and the next
-    // frame's synthetic press then produces a second, "extra" point. Sending the
-    // up here guarantees the hand-off is always clean. If the finger is still
-    // physically down the mirror re-presses it next frame; at most a one-frame
-    // flicker, which is far better than a stuck ghost.
-    if (g_takeoverSlot >= 0 && g_takeoverSlot < kMaxFingers) {
-        if (g_fingers[g_takeoverSlot].isDown) {
-            g_fingers[g_takeoverSlot].isDown = false;
-            upload();
-        }
+    // Hand the slot back to the mirror by lifting it immediately.
+    //
+    // This is unconditional — we lift even when the finger is still physically
+    // down. The alternative (keep the slot down and let the next mirror frame
+    // snap it to the real finger) makes the pointer slide continuously from the
+    // aim target to the player's thumb, i.e. a visible screen jump. Lifting first
+    // makes the pointer blink out and re-appear at the real position one frame
+    // later — a 1-frame flicker, but no teleport. That is the behaviour the
+    // pre-regression build had, and it is what we want.
+    //
+    // The reservation (`g_panelIds`) survives the lift, so the finger is
+    // re-pressed in the same slot, under the same wire id the app already knows.
+    if (g_takeoverSlot >= 0 && g_takeoverSlot < kMaxFingers &&
+        g_fingers[g_takeoverSlot].isDown) {
+        g_fingers[g_takeoverSlot].isDown = false;
+        upload();
     }
-    g_takeoverSlot = -1;
+    g_takeoverSlot    = -1;
+    g_takeoverPanelId = -1;
+    g_takeoverSeen    = false;
 }
 
 extern "C" bool uinput_is_ready(void) { return g_initialized; }
@@ -691,8 +987,111 @@ extern "C" const char* uinput_get_our_sysname(void) {
     return g_ourVirtualSysname;
 }
 
-extern "C" int uinput_write_failures(void) {
+// ── Backend selection ────────────────────────────────────────────────────────
+//
+// See input/inject_backend.h for the two backends and why switching between
+// them has to be destructive. What is worth repeating here is the order of the
+// three steps, because two of them are irreversible and one of them can fail:
+//
+//   1. lift everything the CURRENT backend is holding, while it is still alive
+//      enough to carry the lift (a uinput frame with every TRACKING_ID back to
+//      -1, or an empty pointer set for InputManager);
+//   2. tear the current backend down — UI_DEV_DESTROY and close for uinput,
+//      nothing at all for InputManager, whose whole existence is a Java object;
+//   3. bring the new one up, and report whether it came up.
+//
+// The reporting is not decoration. If InputManager is selected and the platform
+// refuses to let us inject, the correct outcome is a loud one-line failure and
+// a phone whose menu still works but whose touches do not arrive — NOT a silent
+// slide back to uinput, because that would hide the fault behind a symptom that
+// disappears, which is the exact failure this project keeps running into.
+
+extern "C" int inject_set_backend(int backend) {
+    if (backend != INJECT_BACKEND_UINPUT && backend != INJECT_BACKEND_INPUT_MANAGER) {
+        LOGE("inject: refusing unknown backend %d", backend);
+        return 0;
+    }
+
+    int screenW = 0;
+    int screenH = 0;
+    {
+        std::lock_guard<std::mutex> guard(g_mutex);
+        if (g_backend == backend) {
+            if (backendReadyLocked()) return 1;
+            // Selected already, but not usable. Retry rather than keep reporting
+            // the same failure: the reason it failed can change without the
+            // selection changing — the usual one is `INJECT_EVENTS`, which is a
+            // settings toggle the user may have just flipped.
+            if (backend == INJECT_BACKEND_INPUT_MANAGER) {
+                g_imReady = aimbotng::input::imBridgeInit();
+                return g_imReady ? 1 : 0;
+            }
+            return 0;
+        }
+
+        screenW = g_screenW;
+        screenH = g_screenH;
+
+        // Step 1 + 2, for the backend we are leaving.
+        liftAllLocked();
+        if (g_backend == INJECT_BACKEND_UINPUT) {
+            closeLocked();          // UI_DEV_DESTROY + close(fd), logged
+        } else {
+            g_imReady = false;
+        }
+
+        g_backend = backend;
+        g_imReady = false;
+    }
+
+    if (backend == INJECT_BACKEND_INPUT_MANAGER) {
+        // Step 3. Off the lock: this one touches the JVM, and the first call
+        // into it may have to attach the calling thread.
+        g_imReady = aimbotng::input::imBridgeInit();
+        const char* err = aimbotng::input::imBridgeLastError();
+        if (g_imReady) {
+            LOGI("inject: backend = InputManager (uinput device destroyed)");
+        } else {
+            LOGE("inject: backend = InputManager but it is NOT usable: %s "
+                 "— the virtual touchscreen has already been destroyed, so "
+                 "nothing will be injected until this is fixed",
+                 (err && err[0]) ? err : "unknown reason");
+        }
+        return g_imReady ? 1 : 0;
+    }
+
+    // Back to uinput: rebuild the device. It has to be rebuilt rather than
+    // resurrected — the kernel destroyed it step 2 — and the screen size is the
+    // one that was in force, so a device brought back after a rotation still
+    // maps the same pixels.
+    if (screenW <= 0 || screenH <= 0) {
+        LOGE("inject: cannot rebuild the uinput device, screen size unknown");
+        return 0;
+    }
+    if (!uinput_init(screenW, screenH)) {
+        LOGE("inject: uinput device could not be rebuilt (%dx%d)", screenW, screenH);
+        return 0;
+    }
+    LOGI("inject: backend = uinput (device rebuilt %dx%d)", screenW, screenH);
+    return uinput_is_ready() ? 1 : 0;
+}
+
+extern "C" int inject_get_backend(void) {
     std::lock_guard<std::mutex> guard(g_mutex);
+    return g_backend;
+}
+
+extern "C" int inject_is_ready(void) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    return backendReadyLocked() ? 1 : 0;
+}
+
+extern "C" void inject_release_all(void) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    liftAllLocked();
+}
+
+extern "C" int uinput_write_failures(void) {    std::lock_guard<std::mutex> guard(g_mutex);
     return g_writeFailures;
 }
 
@@ -707,132 +1106,221 @@ extern "C" void uinput_set_screen_params(int w, int h, bool landscape) {
 
 extern "C" void uinput_down(int slot, int id, int screenX, int screenY) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    if (!g_initialized || slot < 0 || slot >= kMaxFingers) return;
+    if (!backendReadyLocked() || slot < 0 || slot >= kMaxFingers) return;
 
     float tx, ty;
     screenToTouch(screenX, screenY, tx, ty);
     g_fingers[slot].id = id;
+    g_fingers[slot].extId = id;   // the caller's id already identifies the finger
     g_fingers[slot].pos = Vec2(tx, ty);
+    g_fingers[slot].sPos = Vec2(static_cast<float>(screenX), static_cast<float>(screenY));
     g_fingers[slot].isDown = true;
     upload();
 }
 
 extern "C" void uinput_move(int slot, int screenX, int screenY) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    if (!g_initialized || slot < 0 || slot >= kMaxFingers) return;
+    if (!backendReadyLocked() || slot < 0 || slot >= kMaxFingers) return;
     if (!g_fingers[slot].isDown) return;
 
     float tx, ty;
     screenToTouch(screenX, screenY, tx, ty);
     g_fingers[slot].pos = Vec2(tx, ty);
+    g_fingers[slot].sPos = Vec2(static_cast<float>(screenX), static_cast<float>(screenY));
     upload();
 }
 
 extern "C" void uinput_up(int slot) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    if (!g_initialized || slot < 0 || slot >= kMaxFingers) return;
+    if (!backendReadyLocked() || slot < 0 || slot >= kMaxFingers) return;
     if (!g_fingers[slot].isDown) return;
 
     g_fingers[slot].isDown = false;
     upload();
 }
 
-extern "C" void uinput_mirror_physical(const int* ids, const int* xs, const int* ys, int n) {
+extern "C" void uinput_mirror_physical(const int* ids, const int* rawXs, const int* rawYs,
+                                      const int* screenXs, const int* screenYs, int n) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    if (!g_initialized) return;
+    if (!backendReadyLocked()) return;
     if (n < 0) n = 0;
     if (n > UINPUT_MIRROR_SLOTS) n = UINPUT_MIRROR_SLOTS;
 
-    const int takeover = g_takeoverSlot;   // -1 when aim is not driving a real finger
+    const int takeoverId = g_takeoverPanelId;   // -1 when aim owns no real finger
+    g_takeoverSeen = false;   // set below when the driven finger is still there
 
-    // Slots are assigned BY FINGER ID, not by array position.
+    // Slot assignment: a finger keeps the slot it already owns.
     //
-    // Position-based assignment only works while the reader hands the fingers
-    // over in a stable order. It does not for Protocol A — that protocol has no
-    // slot and no guaranteed ordering, so when one of several fingers lifts,
-    // the survivors shift down an index. The finger that used to be index 1
-    // becomes index 0, inherits slot 0 (whose tracking id is only re-sent when
-    // the slot goes down, see upload()) and the app underneath sees the pointer
-    // that was already there teleport. The same happens on Protocol B when a
-    // finger other than the last one lifts, because rebuildPointersLocked()
-    // compacts the active slots.
+    // aimbot 1.2.1 gets this for free — it indexes its finger array with the
+    // panel's own slot number, so a finger's slot is a property of the finger and
+    // cannot change while it is down. That is exactly why 1.2.1 is safe here and
+    // why copying only its frame format was not enough: we are handed a
+    // COMPACTED list, so the same property has to be reconstructed. `g_panelIds`
+    // records who owns each slot, and a finger that is still down is always put
+    // back where it was; a slot changes hands only when its owner is gone.
     //
-    // Keying on the id instead makes a finger keep its slot for its whole life,
-    // so each one reads as one continuous press.
-    bool slotTaken[UINPUT_MIRROR_SLOTS] = {};
+    // Position-based assignment is the fault this replaces. With two fingers
+    // down, the moment the first one lifts the second finger's list index
+    // becomes 0 — so its position is written into slot 0, whose constant wire
+    // id is still live, and slot 1 (a different wire id, the one the app was
+    // tracking for that finger) is lifted. The app is told pointer 10 slid from
+    // the lifted finger's position to the surviving one's and pointer 11
+    // vanished: two pointers, one finger, swapping places. Slot mixing.
+    //
+    // EXCEPT for the finger aim has taken over. There is only ever ONE writer
+    // per slot: while `takeoverId` is set, this function must neither move that
+    // finger nor lift it — the aim loop owns its position, and its `isDown` was
+    // already reported by us. Two writers on one slot is the same fault by
+    // another route (the slot alternating between the finger's position and the
+    // aim target's), which is why the takeover exists at all.
+    bool claimed[UINPUT_MIRROR_SLOTS] = {};
 
-    // Pass 1 — reserve the slot that currently carries each id still present.
-    // Skip the finger whose slot aim has taken over (it belongs to aim now).
-    for (int k = 0; k < n; ++k) {
-        if (takeover >= 0 && g_fingers[takeover].isDown && g_fingers[takeover].id == ids[k])
-            continue;
-        for (int i = 0; i < UINPUT_MIRROR_SLOTS; ++i) {
-            if (slotTaken[i]) continue;
-            if (g_fingers[i].isDown && g_fingers[i].id == ids[k]) {
-                slotTaken[i] = true;
-                break;
-            }
+    // Ownership, not occupancy: a slot is its owner's for as long as the owner is
+    // down, and a slot whose owner has been momentarily lifted (see
+    // uinput_release_takeover) is still reserved. Pressing that finger again
+    // therefore lands it back in the slot it had, under the wire id it had.
+    auto ownerOf = [&](int panelId) -> int {
+        if (panelId == kNoPanelId) return -1;
+        for (int k = 0; k < UINPUT_MIRROR_SLOTS; ++k) {
+            if (g_panelIds[k] == panelId) return k;
         }
+        return -1;
+    };
+
+    // Pass 1 — a finger that still has a slot keeps it; only its position is
+    // refreshed. Nothing about its identity changes, so no TRACKING_ID is
+    // re-sent and the app sees a pointer that moved rather than one that was
+    // replaced.
+    for (int i = 0; i < n; ++i) {
+        const int k = ownerOf(ids[i]);
+        if (k < 0 || claimed[k]) continue;   // claimed: the same id listed twice
+        claimed[k] = true;
+        // Aim owns this finger's position for as long as it holds it.
+        if (takeoverId >= 0 && ids[i] == takeoverId) {
+            g_takeoverSeen = true;
+            continue;
+        }
+
+        if (!g_fingers[k].isDown) {
+            // Reserved, but not currently pressed — the hand-off back from aim.
+            // Re-press it under the id it already had.
+            g_fingers[k].isDown = true;
+            g_uploaded[k]       = false;   // it was lifted, so TRACKING_ID again
+        }
+        g_fingers[k].pos  = Vec2(static_cast<float>(rawXs[i]),
+                                 static_cast<float>(rawYs[i]));
+        g_fingers[k].sPos = Vec2(static_cast<float>(screenXs[i]),
+                                 static_cast<float>(screenYs[i]));
     }
 
-    // Pass 2 — place every finger, reusing a reserved slot when it has one and
-    // taking the lowest free slot otherwise. Again skip the taken-over finger.
-    for (int k = 0; k < n; ++k) {
-        if (takeover >= 0 && g_fingers[takeover].isDown && g_fingers[takeover].id == ids[k])
-            continue;
-        int slot = -1;
-        for (int i = 0; i < UINPUT_MIRROR_SLOTS; ++i) {
-            if (slotTaken[i] && g_fingers[i].isDown && g_fingers[i].id == ids[k]) {
-                slot = i;
-                break;
-            }
-        }
-        if (slot < 0) {
-            for (int i = 0; i < UINPUT_MIRROR_SLOTS; ++i) {
-                if (!slotTaken[i]) { slot = i; break; }
-            }
-        }
-        if (slot < 0) break;  // more fingers than slots: drop the extras
-
-        slotTaken[slot] = true;
-
-        float tx, ty;
-        screenToTouch(xs[k], ys[k], tx, ty);
-
-        if (!g_fingers[slot].isDown) {
-            g_fingers[slot].id = ids[k];
-            g_fingers[slot].isDown = true;
-        } else if (g_fingers[slot].id != ids[k]) {
-            // The slot changed identity. Force upload() to re-send TRACKING_ID
-            // so the app ends the old pointer and starts the new one instead of
-            // silently teleporting it.
-            g_fingers[slot].id = ids[k];
-            g_uploaded[slot] = false;
-        }
-        g_fingers[slot].pos = Vec2(tx, ty);
+    // Pass 2 — a slot whose finger is gone is lifted and returned to the pool.
+    // Never the slot aim is driving: its release belongs to
+    // uinput_release_takeover(). The aim and trigger slots live outside
+    // UINPUT_MIRROR_SLOTS, so they are never touched here either.
+    //
+    // This runs before allocation on purpose. "Which slots are free" is
+    // completely determined by the incoming list, so reaping first means a slot
+    // freed this frame is immediately available to a finger arriving in the same
+    // frame — and, more importantly, that a slot which is merely reserved (its
+    // owner momentarily lifted by a takeover hand-off) is not stolen by the new
+    // finger, which would cost the returning finger its wire id.
+    for (int k = 0; k < UINPUT_MIRROR_SLOTS; ++k) {
+        if (claimed[k]) continue;
+        if (takeoverId >= 0 && g_panelIds[k] == takeoverId) continue;
+        g_fingers[k].isDown = false;
+        g_panelIds[k]       = kNoPanelId;
     }
 
-    // Pass 3 — whatever no finger claimed has been lifted. The taken-over slot
-    // is left exactly as aim last set it (kept down, position untouched), so the
-    // real finger does not flicker while aim drives it.
-    for (int i = 0; i < UINPUT_MIRROR_SLOTS; ++i) {
-        if (i == takeover) continue;
-        if (!slotTaken[i]) g_fingers[i].isDown = false;
+    // Pass 3 — a finger that was not down before takes the lowest free slot.
+    for (int i = 0; i < n; ++i) {
+        if (ownerOf(ids[i]) >= 0) continue;
+        // A takeover only ever names a finger that is already down, so this is
+        // a cannot-happen; leaving the slot untouched is still the right answer.
+        if (takeoverId >= 0 && ids[i] == takeoverId) continue;
+
+        int k = -1;
+        for (int c = 0; c < UINPUT_MIRROR_SLOTS; ++c) {
+            if (g_fingers[c].isDown) continue;   // reserved or live
+            k = c;
+            break;
+        }
+        if (k < 0) continue;   // more physical fingers than there are mirror slots
+
+        g_panelIds[k]        = ids[i];
+        g_fingers[k].id      = kMirrorIdBase + k;
+        g_fingers[k].extId   = mirrorExtId(ids[i]);
+        g_fingers[k].pos     = Vec2(static_cast<float>(rawXs[i]),
+                                    static_cast<float>(rawYs[i]));
+        g_fingers[k].sPos    = Vec2(static_cast<float>(screenXs[i]),
+                                    static_cast<float>(screenYs[i]));
+        g_fingers[k].isDown  = true;
+        g_uploaded[k]        = false;   // force TRACKING_ID on the next frame
     }
 
     upload();
 }
 
+extern "C" void uinput_mirror_slots(const int* slotIds, const int* rawXs, const int* rawYs,
+                                    const int* screenXs, const int* screenYs, int maxSlots) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    if (!backendReadyLocked()) return;
+    if (!slotIds || !rawXs || !rawYs || !screenXs || !screenYs) return;
+    if (maxSlots < 0) maxSlots = 0;
+    if (maxSlots > kMaxFingers) maxSlots = kMaxFingers;
+    const int limit = (maxSlots < UINPUT_MIRROR_SLOTS) ? maxSlots : UINPUT_MIRROR_SLOTS;
+    const int takeoverId = g_takeoverPanelId;
+    g_takeoverSeen = false;
+    // Direct 1:1 mapping: panel slot k -> virtual slot k (old touch_core.cpp model).
+    // No compact allocation, so lift and down never share one wire id in one SYN_REPORT.
+    for (int k = 0; k < UINPUT_MIRROR_SLOTS; ++k) {
+        const bool hasFinger = (k < limit && slotIds[k] != kNoPanelId && slotIds[k] >= 0);
+        if (hasFinger && takeoverId >= 0 && slotIds[k] == takeoverId) {
+            g_takeoverSeen = true;
+            continue;
+        }
+        if (takeoverId >= 0 && g_panelIds[k] == takeoverId) continue;
+        if (hasFinger) {
+            const int panelId = slotIds[k];
+            if (!g_fingers[k].isDown) g_uploaded[k] = false;
+            // Keep g_panelIds in sync for takeover lookup.
+            g_panelIds[k] = panelId;
+            g_fingers[k].id = kMirrorIdBase + k;
+            g_fingers[k].extId = mirrorExtId(panelId);
+            g_fingers[k].pos = Vec2(static_cast<float>(rawXs[k]), static_cast<float>(rawYs[k]));
+            g_fingers[k].sPos = Vec2(static_cast<float>(screenXs[k]), static_cast<float>(screenYs[k]));
+            g_fingers[k].isDown = true;
+        } else {
+            g_fingers[k].isDown = false;
+            g_panelIds[k] = kNoPanelId;
+        }
+    }
+    // Clear any excess mirror slots beyond limit (should already be handled).
+    upload();
+}
+
 extern "C" void uinput_mirror_clear(void) {
     std::lock_guard<std::mutex> guard(g_mutex);
-    if (!g_initialized) return;
+    if (!backendReadyLocked()) return;
+
+    // A swallowed gesture clears the mirror, but it must not clear the finger
+    // aim is driving: that pointer belongs to aim for the whole time it is
+    // around, and lifting it here would make the aim point blink out and be
+    // re-pressed — the same flicker, by a different route. aim's own
+    // uinput_release_takeover() is what ends it.
+    const int takeoverId = g_takeoverPanelId;
 
     bool any = false;
     for (int i = 0; i < UINPUT_MIRROR_SLOTS; ++i) {
+        if (takeoverId >= 0 && g_panelIds[i] == takeoverId) continue;
         if (g_fingers[i].isDown) {
             g_fingers[i].isDown = false;
             any = true;
         }
+        // Hand the slot back even when it was already up: a cleared gesture
+        // ends every claim, and a stale owner would make the next finger with
+        // that id look like it was still here — the mirror would then move it
+        // instead of pressing it, so it would never be announced at all.
+        g_panelIds[i] = kNoPanelId;
     }
     if (any) upload();
 }
