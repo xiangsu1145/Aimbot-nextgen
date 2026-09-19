@@ -2,6 +2,7 @@ package io.github.xiangsu1145.aimbotnextgen.ui
 
 import android.content.Context
 import android.graphics.Typeface
+import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
@@ -20,6 +21,16 @@ fun Context.dp(value: Int): Int =
 /** A vertical gap of [height] dp. */
 fun Context.gap(height: Int): View = View(this).apply {
     layoutParams = LinearLayout.LayoutParams(1, dp(height))
+}
+
+/**
+ * Press feedback for icon-only buttons built in code: replaces the default
+ * grey ImageButton background with a borderless ripple (image + tap animation).
+ */
+fun View.borderlessRipple() {
+    val tv = TypedValue()
+    context.theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, tv, true)
+    setBackgroundResource(tv.resourceId)
 }
 
 /** A horizontal gap of [width] dp. */

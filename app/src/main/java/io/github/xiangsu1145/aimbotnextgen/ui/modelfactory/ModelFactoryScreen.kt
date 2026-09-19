@@ -28,6 +28,7 @@ import io.github.xiangsu1145.aimbotnextgen.ui.dp
 import io.github.xiangsu1145.aimbotnextgen.download.ModelDownloadManager
 import io.github.xiangsu1145.aimbotnextgen.model.ModelInfo
 import io.github.xiangsu1145.aimbotnextgen.model.ModelRepository
+import io.github.xiangsu1145.aimbotnextgen.ui.borderlessRipple
 import io.github.xiangsu1145.aimbotnextgen.ui.gap
 import io.github.xiangsu1145.aimbotnextgen.ui.theme.AimbotColors
 
@@ -73,6 +74,9 @@ class ModelFactoryScreen(
     private lateinit var downloadedEmpty: TextView
     private lateinit var tasksPage: DownloadTasksScreen
     private lateinit var filterButton: ImageButton
+
+    /** Notified when the 下载任务 sub page opens/closes (hides the toolbar entry). */
+    var onTasksPageVisibilityChanged: ((Boolean) -> Unit)? = null
 
     init {
         build()
@@ -318,6 +322,7 @@ class ModelFactoryScreen(
             .setDuration(260)
             .setInterpolator(DecelerateInterpolator(1.5f))
             .start()
+        onTasksPageVisibilityChanged?.invoke(true)
     }
 
     /** Slides the 下载任务 sub page back out to the right. */
@@ -334,6 +339,7 @@ class ModelFactoryScreen(
                 tasksPage.alpha = 1f
             }
             .start()
+        onTasksPageVisibilityChanged?.invoke(false)
     }
 
     /** Returns true when this call closed the tasks page (consumed the back key). */
@@ -434,7 +440,7 @@ internal fun buildSearchBar(
             setImageResource(R.drawable.ic_filter)
             contentDescription = "过滤"
             setColorFilter(AimbotColors.ON_SURFACE_VARIANT)
-            background = null
+            borderlessRipple()
             layoutParams = LinearLayout.LayoutParams(context.dp(40), context.dp(40))
             setOnClickListener { onFilterClick() }
         }

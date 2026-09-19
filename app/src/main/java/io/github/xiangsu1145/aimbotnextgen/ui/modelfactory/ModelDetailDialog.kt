@@ -175,8 +175,8 @@ class ModelDetailDialog(
                 minimumHeight = ctx.dp(40)
                 minWidth = ctx.dp(72)
                 if (filled) {
-                    setTextColor(AimbotColors.ON_PRIMARY_CONTAINER)
-                    setBackgroundColor(AimbotColors.PRIMARY_CONTAINER)
+                    setTextColor(AimbotColors.ON_PRIMARY)
+                    setBackgroundColor(AimbotColors.PRIMARY)
                 } else {
                     setTextColor(AimbotColors.PRIMARY)
                     setBackgroundColor(android.graphics.Color.TRANSPARENT)

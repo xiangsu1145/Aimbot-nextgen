@@ -43,6 +43,7 @@ import io.github.xiangsu1145.aimbotnextgen.shell.ShellManager
 import io.github.xiangsu1145.aimbotnextgen.shell.ShellOutputAdapter
 import io.github.xiangsu1145.aimbotnextgen.ui.AppDialogs
 import io.github.xiangsu1145.aimbotnextgen.ui.modelfactory.ModelFactoryScreen
+import io.github.xiangsu1145.aimbotnextgen.ui.borderlessRipple
 import io.github.xiangsu1145.aimbotnextgen.ui.dp
 import io.github.xiangsu1145.aimbotnextgen.ui.gap
 import io.github.xiangsu1145.aimbotnextgen.ui.matchParent
@@ -266,6 +267,7 @@ class MainActivity : AppCompatActivity() {
             setImageResource(R.drawable.ic_download_tasks)
             contentDescription = "下载任务"
             setColorFilter(AimbotColors.ON_SURFACE)
+            borderlessRipple()
             layoutParams = Toolbar.LayoutParams(
                 dp(44), dp(44), Gravity.END or Gravity.CENTER_VERTICAL
             )
@@ -316,7 +318,14 @@ class MainActivity : AppCompatActivity() {
                 when (screen) {
                     Screen.MAIN -> buildMainScreen()
                     Screen.MODEL_FACTORY ->
-                        ModelFactoryScreen(this).also { f -> factoryScreen = f }
+                        ModelFactoryScreen(this).also { f ->
+                            factoryScreen = f
+                            // 下载任务 sub page covers the toolbar entry — hide it.
+                            f.onTasksPageVisibilityChanged = { shown ->
+                                downloadTasksButton?.visibility =
+                                    if (shown) View.GONE else View.VISIBLE
+                            }
+                        }
                 },
                 matchParent(), matchParent()
             )

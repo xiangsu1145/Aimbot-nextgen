@@ -80,12 +80,19 @@ _crop_head.png
 _shot_verify.png
 dis.txt
 
-# ── Model binaries: device-local only (Android/data/<pkg>/models/) ───
-# The repo carries code + models.json metadata templates exclusively;
-# no .tflite/.onnx payload may ever be committed or released via git.
+# ── Model files: only the official cloud set is committed ────────────
+# models/models.json + the two models/tflite files ARE the cloud source
+# the app downloads from (via GitHub proxy); every other model binary
+# stays device-local and must never be committed.
 *.tflite
 *.onnx
 *.part
+/models/*
+!/models/models.json
+!/models/tflite/
+/models/tflite/*
+!/models/tflite/WA_YOLOV8n_256_3_int8.tflite
+!/models/tflite/valorant_256_v26n.tflite
 
 # ── Local test-run artifacts ─────────────────────────────────────────
 scripts/test_report.txt
@@ -99,7 +106,6 @@ app/src/main/cpp/inference/litert_npu_engine.cpp
 .tmp_ref/
 .mcp.json
 buckup/
-models/
 probe/
 pid.cpp
 calibration_image_sample_data_20x128x128x3_float32.npy

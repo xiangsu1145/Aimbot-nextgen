@@ -22,9 +22,9 @@ import java.net.URL
  */
 object ModelRepository {
 
-    /** Cloud manifest, published in this very repository. */
+    /** Cloud manifest, published in this very repository (models/models.json). */
     const val CLOUD_MANIFEST_URL: String =
-        "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models.json"
+        "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/models.json"
 
     /**
      * Free GitHub acceleration proxies (prefix style: proxy + original URL).

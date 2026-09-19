@@ -24,6 +24,7 @@ import io.github.xiangsu1145.aimbotnextgen.R
 import io.github.xiangsu1145.aimbotnextgen.ui.dp
 import io.github.xiangsu1145.aimbotnextgen.ui.gap
 import io.github.xiangsu1145.aimbotnextgen.download.ModelDownloadManager
+import io.github.xiangsu1145.aimbotnextgen.ui.borderlessRipple
 import io.github.xiangsu1145.aimbotnextgen.ui.matchParentWrapContent
 import io.github.xiangsu1145.aimbotnextgen.ui.theme.AimbotColors
 
@@ -89,6 +90,7 @@ class DownloadTasksScreen(
             setImageResource(R.drawable.ic_back)
             contentDescription = "返回"
             setColorFilter(AimbotColors.ON_SURFACE)
+            borderlessRipple()
             layoutParams = ViewGroup.LayoutParams(context.dp(44), context.dp(44))
             setOnClickListener { onBack() }
         })
