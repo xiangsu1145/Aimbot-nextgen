@@ -74,6 +74,8 @@ class ModelCardAdapter(
                 (quantizes.isEmpty() || m.quantize in quantizes) &&
                 (resolutions.isEmpty() || m.resolution in resolutions)
         }
+            // Downloaded models float to the top; each group keeps manifest order.
+            .sortedByDescending { isDownloaded(it) }
         notifyDataSetChanged()
     }
 
