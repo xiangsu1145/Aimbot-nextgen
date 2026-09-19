@@ -12,6 +12,7 @@ material = "1.12.0"
 fragmentKtx = "1.8.6"
 recyclerview = "1.4.0"
 constraintlayout = "2.2.1"
+swiperefreshlayout = "1.1.0"
 onnxruntime = "1.29.0"
 
 [libraries]
@@ -26,6 +27,7 @@ material = { group = "com.google.android.material", name = "material", version.r
 androidx-fragment-ktx = { group = "androidx.fragment", name = "fragment-ktx", version.ref = "fragmentKtx" }
 androidx-recyclerview = { group = "androidx.recyclerview", name = "recyclerview", version.ref = "recyclerview" }
 androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
+androidx-swiperefreshlayout = { group = "androidx.swiperefreshlayout", name = "swiperefreshlayout", version.ref = "swiperefreshlayout" }
 # ONNX Runtime for Android. Ships libonnxruntime.so for every ABI, and the
 # prebuilt package includes the XNNPACK execution provider, so "XNNPACK" and
 # "plain ORT" are the same library with a different session option. The public

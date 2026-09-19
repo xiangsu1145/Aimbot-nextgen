@@ -16,10 +16,12 @@ import android.view.Gravity
 import android.view.View
 import android.view.animation.AccelerateDecelerateInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.Toolbar
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -40,6 +42,7 @@ import io.github.xiangsu1145.aimbotnextgen.shell.ShellDaemonService
 import io.github.xiangsu1145.aimbotnextgen.shell.ShellManager
 import io.github.xiangsu1145.aimbotnextgen.shell.ShellOutputAdapter
 import io.github.xiangsu1145.aimbotnextgen.ui.AppDialogs
+import io.github.xiangsu1145.aimbotnextgen.ui.modelfactory.ModelFactoryScreen
 import io.github.xiangsu1145.aimbotnextgen.ui.dp
 import io.github.xiangsu1145.aimbotnextgen.ui.gap
 import io.github.xiangsu1145.aimbotnextgen.ui.matchParent
@@ -59,7 +62,7 @@ import io.github.xiangsu1145.aimbotnextgen.ui.wrapContent
  */
 class MainActivity : AppCompatActivity() {
 
-    private enum class Screen { MAIN, SETTINGS }
+    private enum class Screen { MAIN, MODEL_FACTORY }
 
     companion object {
         /** Set by AdbPairingService on a successful pairing result; tells MainActivity
@@ -70,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     // ── Views ─────────────────────────────────────────────────────────────
     private var rootLayout: LinearLayout? = null
     private var toolbar: MaterialToolbar? = null
+    private var downloadTasksButton: ImageButton? = null
     private var contentContainer: FrameLayout? = null
     private var statusText: TextView? = null
     private var startButton: MaterialButton? = null
@@ -93,6 +97,11 @@ class MainActivity : AppCompatActivity() {
     /** Set while we are waiting for the shell service to come up so we can finish
      *  launching the menu automatically. */
     private var pendingLaunch = false
+
+    /** Active top-level tab; decides the back-key behavior and the toolbar look. */
+    private var currentScreen = Screen.MAIN
+    /** The 模型工厂 page while it is the active tab, for sub-page back handling. */
+    private var factoryScreen: ModelFactoryScreen? = null
 
     // ── Controllers ───────────────────────────────────────────────────────
     private lateinit var shell: ShellController
@@ -244,13 +253,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildToolbar(): MaterialToolbar {
-        return MaterialToolbar(this).apply {
+        val bar = MaterialToolbar(this).apply {
             title = "Aimbot-Nextgen"
             setTitleTextColor(AimbotColors.ON_SURFACE)
             setBackgroundColor(AimbotColors.SURFACE)
             elevation = 0f
             visibility = View.VISIBLE
         }
+        // Top-right 下载任务 entry (模型工厂 tab only). The icon is the inline
+        // SVG VectorDrawable; contentDescription doubles as the test hook.
+        val tasksBtn = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_download_tasks)
+            contentDescription = "下载任务"
+            setColorFilter(AimbotColors.ON_SURFACE)
+            layoutParams = Toolbar.LayoutParams(
+                dp(44), dp(44), Gravity.END or Gravity.CENTER_VERTICAL
+            )
+            visibility = View.GONE
+            setOnClickListener { factoryScreen?.showTasksPage() }
+        }
+        bar.addView(tasksBtn)
+        downloadTasksButton = tasksBtn
+        return bar
     }
 
     private fun buildBottomNav(): BottomNavigationView {
@@ -262,13 +286,13 @@ class MainActivity : AppCompatActivity() {
             menu.clear()
             menu.add(0, Screen.MAIN.ordinal, 0, "主页")
                 .setIcon(android.R.drawable.ic_menu_info_details)
-            menu.add(0, Screen.SETTINGS.ordinal, 1, "设置")
-                .setIcon(android.R.drawable.ic_menu_preferences)
+            menu.add(0, Screen.MODEL_FACTORY.ordinal, 1, "模型工厂")
+                .setIcon(R.drawable.ic_nav_factory)
             selectedItemId = Screen.MAIN.ordinal
             setOnItemSelectedListener {
                 showScreen(
                     when (it.itemId) {
-                        Screen.SETTINGS.ordinal -> Screen.SETTINGS
+                        Screen.MODEL_FACTORY.ordinal -> Screen.MODEL_FACTORY
                         else -> Screen.MAIN
                     }
                 ); true
@@ -277,17 +301,36 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showScreen(screen: Screen) {
-        toolbar?.visibility = if (screen == Screen.MAIN) View.VISIBLE else View.GONE
+        currentScreen = screen
+        toolbar?.visibility = View.VISIBLE
+        downloadTasksButton?.visibility =
+            if (screen == Screen.MODEL_FACTORY) View.VISIBLE else View.GONE
+        toolbar?.title = when (screen) {
+            Screen.MAIN -> "Aimbot-Nextgen"
+            Screen.MODEL_FACTORY -> "模型工厂"
+        }
         contentContainer?.let {
             it.removeAllViews()
+            factoryScreen = null
             it.addView(
                 when (screen) {
                     Screen.MAIN -> buildMainScreen()
-                    Screen.SETTINGS -> buildSettingsScreen()
+                    Screen.MODEL_FACTORY ->
+                        ModelFactoryScreen(this).also { f -> factoryScreen = f }
                 },
                 matchParent(), matchParent()
             )
         }
+    }
+
+    /**
+     * The back key first collapses the 模型工厂 sub pages (下载任务) before
+     * leaving the activity, matching standard MD3 navigation behavior.
+     */
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (currentScreen == Screen.MODEL_FACTORY && factoryScreen?.handleBack() == true) return
+        super.onBackPressed()
     }
 
     // ── Main Screen ───────────────────────────────────────────────────────
@@ -807,12 +850,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun showPermissionCard() {
         AppDialogs.showPermissionHelp(this, shellLabel(), menuLabel())
-    }
-
-    // ── Settings Screen ───────────────────────────────────────────────────
-
-    private fun buildSettingsScreen(): View {
-        return FrameLayout(this)
     }
 
     // ── Status card ───────────────────────────────────────────────────────

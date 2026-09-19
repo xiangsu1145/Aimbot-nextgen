@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TFLite model type icon: block-built "T" glyph plus accent square,
+     echoing the TensorFlow Lite mark. Inline SVG path data in a
+     VectorDrawable so no binary/icon-font asset is needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M3.5,4.5h17v4h-6.5v11h-4v-11H3.5z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M14,14h6.5v6.5H14z" />
+</vector>

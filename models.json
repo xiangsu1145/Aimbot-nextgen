@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "updatedAt": "2026-09-19",
+  "models": [
+    {
+      "modelId": "tflite-wa-yolov8n-256-int8",
+      "modelName": "WA YOLOv8n 256",
+      "modelUrl": "https://github.com/xiangsu1145/Aimbot-nextgen/releases/download/models-v1/WA_YOLOV8n_256_3_int8.tflite",
+      "description": "WA 专用 YOLOv8n 检测模型，256x256 输入，INT8 全量化。体积小、推理快，单类别检测头，适合中低端机型 NPU/GPU 委托执行。",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 1
+    },
+    {
+      "modelId": "tflite-valorant-v26n-256",
+      "modelName": "Valorant v26n 256",
+      "modelUrl": "https://github.com/xiangsu1145/Aimbot-nextgen/releases/download/models-v1/valorant_256_v26n.tflite",
+      "description": "Valorant 专用 v26n 检测模型，256x256 输入，INT8 量化，双类别检测头（头部/身体），输出布局 [1,6,1344]。",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 2
+    }
+  ]
+}

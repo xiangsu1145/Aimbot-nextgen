@@ -80,6 +80,16 @@ _crop_head.png
 _shot_verify.png
 dis.txt
 
+# ── Model binaries: device-local only (Android/data/<pkg>/models/) ───
+# The repo carries code + models.json metadata templates exclusively;
+# no .tflite/.onnx payload may ever be committed or released via git.
+*.tflite
+*.onnx
+*.part
+
+# ── Local test-run artifacts ─────────────────────────────────────────
+scripts/test_report.txt
+
 # ── Neuron/LiteRT-NPU engine (private backend, same policy as above) ──
 app/src/main/cpp/inference/litert_npu_engine.h
 app/src/main/cpp/inference/litert_npu_engine.cpp

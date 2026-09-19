@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.AimbotNextgen" parent="Theme.Material3.DayNight.NoActionBar">
+    <!-- Light-only: the whole app is designed around the light MD3 palette
+         (hardcoded in ui/theme/Color.kt). DayNight would render Material
+         widgets (buttons/chips/tabs) with the dark palette and clash with it. -->
+    <style name="Theme.AimbotNextgen" parent="Theme.Material3.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="colorPrimary">#6750A4</item>
         <item name="colorOnPrimary">#FFFFFF</item>

@@ -147,6 +147,8 @@ dependencies {
     implementation(libs.androidx.fragment.ktx)
     implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.constraintlayout)
+    // Pull-to-refresh for the model factory cloud list.
+    implementation(libs.androidx.swiperefreshlayout)
     implementation("org.bouncycastle:bcpkix-jdk15on:1.70")
     implementation("io.github.vvb2060.ndk:boringssl:20250114")
     implementation("org.conscrypt:conscrypt-android:2.5.2")
