@@ -59,6 +59,7 @@ internal fun newFilterChip(
     label: String,
     selected: MutableSet<String>,
     onChange: () -> Unit,
+    initiallyChecked: Boolean = false,
 ): Chip {
     return Chip(context).apply {
         text = label
@@ -81,5 +82,8 @@ internal fun newFilterChip(
             if (checked) selected.add(label) else selected.remove(label)
             onChange()
         }
+        // Reflect the stored selection on creation (listener above treats this
+        // as a no-op add/remove for labels already in their target state).
+        isChecked = initiallyChecked
     }
 }

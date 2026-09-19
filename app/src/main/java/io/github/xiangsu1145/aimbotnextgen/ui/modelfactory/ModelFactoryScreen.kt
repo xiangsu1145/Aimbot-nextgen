@@ -61,11 +61,8 @@ class ModelFactoryScreen(
     private var tasksShown = false
     private var refreshing = false
 
-    // Multi-select filter state (same semantics as the tasks page: a row with
-    // no selection matches all; rows AND together).
-    private val selFormats = LinkedHashSet<String>()
-    private val selQuantize = LinkedHashSet<String>()
-    private val selResolutions = LinkedHashSet<String>()
+    // Multi-select filter state lives in the process-wide ModelFilterState so
+    // it survives screen recreation (see ModelFilterState doc).
     private val knownResolutions = LinkedHashSet<String>()
 
     private lateinit var cloudPage: SwipeRefreshLayout
@@ -156,6 +153,7 @@ class ModelFactoryScreen(
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
             )
+            visibility = View.GONE // hidden until the 已下载 tab is selected
             addView(RecyclerView(context).apply {
                 layoutManager = LinearLayoutManager(context)
                 adapter = downloadedAdapter
@@ -248,15 +246,20 @@ class ModelFactoryScreen(
     /** Re-runs the cloud/downloaded lists through search + multi-select filters. */
     private fun applyFilters() {
         syncResolutionChips()
-        val hasSelection = selFormats.isNotEmpty() || selQuantize.isNotEmpty() ||
-            selResolutions.isNotEmpty()
         if (::filterButton.isInitialized) {
             filterButton.setColorFilter(
-                if (hasSelection) AimbotColors.PRIMARY else AimbotColors.ON_SURFACE_VARIANT
+                if (ModelFilterState.hasSelection) AimbotColors.PRIMARY
+                else AimbotColors.ON_SURFACE_VARIANT
             )
         }
-        cloudAdapter.filter(cloudQuery, selFormats, selQuantize, selResolutions)
-        downloadedAdapter.filter(cloudQuery, selFormats, selQuantize, selResolutions)
+        // Submit + filter together: a fetch (or cache load) only changes the
+        // backing list here, so both must run on every data/filter change.
+        cloudAdapter.submit(models)
+        cloudAdapter.filter(cloudQuery, ModelFilterState.formats, ModelFilterState.quantize,
+            ModelFilterState.resolutions)
+        downloadedAdapter.submit(models.filter { ModelRepository.isDownloaded(context, it) })
+        downloadedAdapter.filter(cloudQuery, ModelFilterState.formats, ModelFilterState.quantize,
+            ModelFilterState.resolutions)
         applyCloudState()
         applyDownloadedState()
     }
@@ -284,10 +287,7 @@ class ModelFactoryScreen(
     // ── ModelDownloadManager.Listener ─────────────────────────────────────
 
     override fun onTasksChanged() {
-        activity.runOnUiThread {
-            downloadedAdapter.submit(models.filter { ModelRepository.isDownloaded(context, it) })
-            downloadedAdapter.filter(cloudQuery, selFormats, selQuantize, selResolutions)
-        }
+        activity.runOnUiThread { applyFilters() }
     }
 
     // ── Filter dialog ──────────────────────────────────────────────────────
@@ -299,11 +299,11 @@ class ModelFactoryScreen(
             listOf("TFLite", "ONNX"),
             listOf("INT8", "FP16", "FP32", "混合精度"),
             knownResolutions.toList(),
-            selFormats, selQuantize, selResolutions,
+            ModelFilterState.formats, ModelFilterState.quantize, ModelFilterState.resolutions,
         ) { formats, quantizes, resolutions ->
-            selFormats.clear(); selFormats.addAll(formats)
-            selQuantize.clear(); selQuantize.addAll(quantizes)
-            selResolutions.clear(); selResolutions.addAll(resolutions)
+            ModelFilterState.formats.clear(); ModelFilterState.formats.addAll(formats)
+            ModelFilterState.quantize.clear(); ModelFilterState.quantize.addAll(quantizes)
+            ModelFilterState.resolutions.clear(); ModelFilterState.resolutions.addAll(resolutions)
             applyFilters()
         }.show()
     }
@@ -355,8 +355,7 @@ class ModelFactoryScreen(
         showCloud = cloudNow
         val incoming = if (cloudNow) cloudPage else downloadedPage
         val outgoing = if (cloudNow) downloadedPage else cloudPage
-        cloudStatus.visibility =
-            if (cloudNow && models.isEmpty()) View.VISIBLE else View.GONE
+        if (cloudNow) applyCloudState() else cloudStatus.visibility = View.GONE
 
         incoming.visibility = View.VISIBLE
         val dir = if (cloudNow) 1f else -1f

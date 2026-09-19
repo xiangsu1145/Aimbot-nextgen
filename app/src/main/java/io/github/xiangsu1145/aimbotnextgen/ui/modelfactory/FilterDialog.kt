@@ -36,9 +36,10 @@ class FilterDialog(
     private val onConfirm: (Set<String>, Set<String>, Set<String>) -> Unit,
 ) {
 
-    private val selFormats = LinkedHashSet(currentFormats)
-    private val selQuantize = LinkedHashSet(currentQuantize)
-    private val selResolutions = LinkedHashSet(currentResolutions)
+    // Default state = everything checked (nothing stored means "show all").
+    private val selFormats = LinkedHashSet(if (currentFormats.isEmpty()) formatOptions else currentFormats)
+    private val selQuantize = LinkedHashSet(if (currentQuantize.isEmpty()) quantizeOptions else currentQuantize)
+    private val selResolutions = LinkedHashSet(if (currentResolutions.isEmpty()) resolutionOptions else currentResolutions)
 
     private val chipStrips = mutableListOf<LinearLayout>()
     private var dialog: Dialog? = null
@@ -158,7 +159,7 @@ class FilterDialog(
                     layoutParams = LinearLayout.LayoutParams(ctx.dp(6), 1)
                 })
             }
-            strip.addView(newFilterChip(ctx, option, selected) {})
+            strip.addView(newFilterChip(ctx, option, selected, {}, option in selected))
         }
         chipStrips.add(strip)
         return LinearLayout(ctx).apply {
@@ -174,15 +175,15 @@ class FilterDialog(
         }
     }
 
-    /** Clears every temporary selection and unchecks all chips at once. */
+    /** 重置 = back to the default: every option checked. */
     private fun resetSelections() {
-        selFormats.clear()
-        selQuantize.clear()
-        selResolutions.clear()
+        selFormats.clear(); selFormats.addAll(formatOptions)
+        selQuantize.clear(); selQuantize.addAll(quantizeOptions)
+        selResolutions.clear(); selResolutions.addAll(resolutionOptions)
         for (strip in chipStrips) {
             for (j in 0 until strip.childCount) {
                 (strip.getChildAt(j) as? com.google.android.material.chip.Chip)
-                    ?.isChecked = false
+                    ?.isChecked = true
             }
         }
     }

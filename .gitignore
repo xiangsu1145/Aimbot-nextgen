@@ -97,6 +97,9 @@ dis.txt
 # ── Local test-run artifacts ─────────────────────────────────────────
 scripts/test_report.txt
 
+# ── Private working notes (never commit) ─────────────────────────────
+MTK_NPU转换指南.md
+
 # ── Neuron/LiteRT-NPU engine (private backend, same policy as above) ──
 app/src/main/cpp/inference/litert_npu_engine.h
 app/src/main/cpp/inference/litert_npu_engine.cpp
