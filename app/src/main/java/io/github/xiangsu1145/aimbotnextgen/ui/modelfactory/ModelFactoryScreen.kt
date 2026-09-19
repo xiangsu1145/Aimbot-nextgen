@@ -22,7 +22,6 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.google.android.material.card.MaterialCardView
-import com.google.android.material.tabs.TabLayout
 import io.github.xiangsu1145.aimbotnextgen.R
 import io.github.xiangsu1145.aimbotnextgen.ui.dp
 import io.github.xiangsu1145.aimbotnextgen.download.ModelDownloadManager
@@ -36,14 +35,15 @@ import io.github.xiangsu1145.aimbotnextgen.ui.theme.AimbotColors
  * 模型工厂 page (replaces the old empty 设置 tab).
  *
  * Top-level layout:
- *   [ search bar | filter ]  search filters the lists; the trailing funnel
- *                            button expands a multi-select filter panel
- *                            (格式 / 量化 / 分辨率)
- *   [ 云端 | 已下载 ]         MD3 tabs with a shared-axis style cross-fade/slide
- *   [ card list ]            vertical model cards + pull-to-refresh on cloud
+ *   [ search bar | filter ]  search filters the list; the trailing funnel
+ *                            button opens the multi-select filter dialog
+ *   [ card list ]            vertical model cards; downloaded models carry a
+ *                            green 已下载 badge — there is no separate
+ *                            downloaded tab
  *
- * The cloud list comes ONLY from the GitHub manifest (or its local cache) —
- * when neither is available the tab shows an empty state, never sample data.
+ * The list comes ONLY from the GitHub manifest (or its local cache) — when
+ * neither is available the page shows an empty state, never sample data.
+ * Every entry into this page triggers a cloud manifest refresh.
  *
  * The right-hand sub page (下载任务) slides in over this page when the
  * toolbar's download-tasks button is tapped; [handleBack] reverses it.
@@ -52,23 +52,20 @@ class ModelFactoryScreen(
     private val activity: Activity,
 ) : FrameLayout(activity), ModelDownloadManager.Listener {
 
-    private val cloudAdapter = ModelCardAdapter { ModelDetailDialog(activity, it).show() }
-    private val downloadedAdapter = ModelCardAdapter { ModelDetailDialog(activity, it).show() }
+    private val cloudAdapter = ModelCardAdapter(
+        isDownloaded = { ModelRepository.isDownloaded(context, it) },
+        onClick = { ModelDetailDialog(activity, it).show() },
+    )
 
     private var models: List<ModelInfo> = emptyList()
     private var cloudQuery = ""
-    private var showCloud = true
     private var tasksShown = false
     private var refreshing = false
 
-    // Multi-select filter state lives in the process-wide ModelFilterState so
-    // it survives screen recreation (see ModelFilterState doc).
     private val knownResolutions = LinkedHashSet<String>()
 
     private lateinit var cloudPage: SwipeRefreshLayout
-    private lateinit var downloadedPage: FrameLayout
     private lateinit var cloudStatus: TextView
-    private lateinit var downloadedEmpty: TextView
     private lateinit var tasksPage: DownloadTasksScreen
     private lateinit var filterButton: ImageButton
 
@@ -110,35 +107,14 @@ class ModelFactoryScreen(
             }
         })
         column.addView(searchBar.card)
-        column.addView(context.gap(4))
+        column.addView(context.gap(8))
 
-        // ── Tabs (云端 / 已下载) ──
-        val tabs = TabLayout(context).apply {
-            addTab(newTab().setText("云端"))
-            addTab(newTab().setText("已下载"))
-            tabMode = TabLayout.MODE_FIXED
-            tabGravity = TabLayout.GRAVITY_FILL
-            setSelectedTabIndicatorColor(AimbotColors.PRIMARY)
-            setSelectedTabIndicatorHeight(context.dp(3))
-            setTabTextColors(AimbotColors.ON_SURFACE_VARIANT, AimbotColors.PRIMARY)
-            setBackgroundColor(AimbotColors.SURFACE)
-            addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
-                override fun onTabSelected(tab: TabLayout.Tab) {
-                    animateTabSwitch(tab.position == 0)
-                }
-
-                override fun onTabUnselected(tab: TabLayout.Tab) {}
-                override fun onTabReselected(tab: TabLayout.Tab) {}
-            })
-        }
-        column.addView(tabs)
-
-        // ── Tab content: cloud page (pull-to-refresh) + downloaded page ──
+        // ── Model list (pull-to-refresh) ──
         cloudPage = SwipeRefreshLayout(context).apply {
             setColorSchemeColors(AimbotColors.PRIMARY)
             setOnRefreshListener { refreshCloud() }
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
             )
             addView(RecyclerView(context).apply {
                 layoutManager = LinearLayoutManager(context)
@@ -148,28 +124,7 @@ class ModelFactoryScreen(
                 setPadding(0, context.dp(8), 0, context.dp(12))
             })
         }
-
-        downloadedPage = FrameLayout(context).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
-            )
-            visibility = View.GONE // hidden until the 已下载 tab is selected
-            addView(RecyclerView(context).apply {
-                layoutManager = LinearLayoutManager(context)
-                adapter = downloadedAdapter
-                overScrollMode = RecyclerView.OVER_SCROLL_NEVER
-                clipToPadding = false
-                setPadding(0, context.dp(8), 0, context.dp(12))
-            })
-            downloadedEmpty = TextView(context).apply {
-                text = "暂无已下载模型"
-                textSize = 14f
-                setTextColor(AimbotColors.ON_SURFACE_VARIANT)
-                gravity = Gravity.CENTER
-                visibility = View.VISIBLE
-            }
-            addView(downloadedEmpty)
-        }
+        column.addView(cloudPage)
 
         cloudStatus = TextView(context).apply {
             textSize = 14f
@@ -178,19 +133,10 @@ class ModelFactoryScreen(
             setPadding(0, context.dp(32), 0, 0)
             visibility = View.GONE
         }
-
-        val pages = FrameLayout(context).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
-            )
-            addView(downloadedPage)
-            addView(cloudPage) // cloud tab is shown first
-            addView(cloudStatus, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP,
-            ))
-        }
-        column.addView(pages)
+        addView(cloudStatus, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER_VERTICAL,
+        ))
 
         // ── 下载任务 sub page (slides in, hidden by default) ──
         tasksPage = DownloadTasksScreen(context) { showCardsPage() }.apply {
@@ -204,15 +150,14 @@ class ModelFactoryScreen(
     // ── Data ───────────────────────────────────────────────────────────────
 
     private fun loadData() {
-        // Cloud list = last successful cloud fetch (local cache) only. No cache
-        // and no network means an honest empty state — never sample data.
+        // List = last successful cloud fetch (local cache) only. No cache and
+        // no network means an honest empty state — never sample data.
         models = ModelRepository.loadCachedManifest(context) ?: emptyList()
         applyFilters()
-        applyDownloadedState()
         refreshCloud()
     }
 
-    /** Pull-to-refresh + initial sync: fetch the manifest via the proxy list. */
+    /** Pull-to-refresh + entry sync: fetch the manifest via the proxy list. */
     private fun refreshCloud() {
         if (refreshing) return
         refreshing = true
@@ -236,57 +181,45 @@ class ModelFactoryScreen(
                     ).show()
                 }
                 applyFilters()
-                applyDownloadedState()
             }
         }.start()
     }
 
     // ── Filtering ──────────────────────────────────────────────────────────
 
-    /** Re-runs the cloud/downloaded lists through search + multi-select filters. */
+    /** Re-runs the list through search + multi-select filters. */
     private fun applyFilters() {
-        syncResolutionChips()
+        models.forEach { knownResolutions.add(it.resolution) }
         if (::filterButton.isInitialized) {
             filterButton.setColorFilter(
                 if (ModelFilterState.hasSelection) AimbotColors.PRIMARY
                 else AimbotColors.ON_SURFACE_VARIANT
             )
         }
-        // Submit + filter together: a fetch (or cache load) only changes the
-        // backing list here, so both must run on every data/filter change.
         cloudAdapter.submit(models)
-        cloudAdapter.filter(cloudQuery, ModelFilterState.formats, ModelFilterState.quantize,
-            ModelFilterState.resolutions)
-        downloadedAdapter.submit(models.filter { ModelRepository.isDownloaded(context, it) })
-        downloadedAdapter.filter(cloudQuery, ModelFilterState.formats, ModelFilterState.quantize,
-            ModelFilterState.resolutions)
+        cloudAdapter.filter(
+            cloudQuery, ModelFilterState.formats, ModelFilterState.quantize,
+            ModelFilterState.resolutions,
+        )
         applyCloudState()
-        applyDownloadedState()
-    }
-
-    /** Resolution filter options grow with the models that actually exist. */
-    private fun syncResolutionChips() {
-        models.forEach { knownResolutions.add(it.resolution) }
     }
 
     private fun applyCloudState() {
-        cloudStatus.text = if (refreshing && models.isEmpty()) {
-            "正在同步云端清单…"
-        } else {
-            "云端清单加载失败\n检查网络后下拉重试"
+        val filteredEmpty = models.isNotEmpty() && cloudAdapter.itemCount == 0
+        cloudStatus.text = when {
+            refreshing && models.isEmpty() -> "正在同步云端清单…"
+            models.isEmpty() -> "云端清单加载失败\n检查网络后下拉重试"
+            filteredEmpty -> "没有符合过滤条件的模型"
+            else -> ""
         }
-        cloudStatus.visibility = if (models.isEmpty()) View.VISIBLE else View.GONE
-    }
-
-    private fun applyDownloadedState() {
-        val downloaded = models.filter { ModelRepository.isDownloaded(context, it) }
-        downloadedEmpty.visibility =
-            if (downloaded.isEmpty()) View.VISIBLE else View.GONE
+        cloudStatus.visibility =
+            if (models.isEmpty() || filteredEmpty) View.VISIBLE else View.GONE
     }
 
     // ── ModelDownloadManager.Listener ─────────────────────────────────────
 
     override fun onTasksChanged() {
+        // Download complete / deleted: refresh list + 已下载 badges.
         activity.runOnUiThread { applyFilters() }
     }
 
@@ -347,35 +280,6 @@ class ModelFactoryScreen(
         if (!tasksShown) return false
         showCardsPage()
         return true
-    }
-
-    /** Shared-axis style tab transition: incoming slides in, outgoing slides out. */
-    private fun animateTabSwitch(cloudNow: Boolean) {
-        if (cloudNow == showCloud) return
-        showCloud = cloudNow
-        val incoming = if (cloudNow) cloudPage else downloadedPage
-        val outgoing = if (cloudNow) downloadedPage else cloudPage
-        if (cloudNow) applyCloudState() else cloudStatus.visibility = View.GONE
-
-        incoming.visibility = View.VISIBLE
-        val dir = if (cloudNow) 1f else -1f
-        incoming.translationX = 48f * dir
-        incoming.alpha = 0f
-        incoming.animate()
-            .alpha(1f).translationX(0f)
-            .setDuration(240)
-            .setInterpolator(DecelerateInterpolator(1.5f))
-            .start()
-        outgoing.animate()
-            .alpha(0f).translationX(-48f * dir)
-            .setDuration(180)
-            .setInterpolator(AccelerateInterpolator())
-            .withEndAction {
-                outgoing.visibility = View.GONE
-                outgoing.translationX = 0f
-                outgoing.alpha = 1f
-            }
-            .start()
     }
 }
 

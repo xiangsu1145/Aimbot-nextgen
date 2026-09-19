@@ -8,7 +8,6 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.card.MaterialCardView
 import io.github.xiangsu1145.aimbotnextgen.R
@@ -25,12 +24,14 @@ fun modelTypeIcon(format: ModelFormat): Int = when (format) {
 }
 
 /**
- * Adapter for the vertical model-card list (cloud tab / downloaded tab).
+ * Adapter for the model-card list.
  *
  * Card layout — type SVG icon vertically centered on the left, model name as
- * the title and a `量化 · 分辨率 · 类别数` meta line underneath.
+ * the title, a `量化 · 分辨率 · 类别数` meta line underneath, and a green
+ * 已下载 badge on the trailing edge for models already stored locally.
  */
 class ModelCardAdapter(
+    private val isDownloaded: (ModelInfo) -> Boolean,
     private val onClick: (ModelInfo) -> Unit,
 ) : RecyclerView.Adapter<ModelCardAdapter.CardHolder>() {
 
@@ -77,7 +78,8 @@ class ModelCardAdapter(
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): CardHolder =
-        CardHolder(buildModelCard(parent.context))
+        CardHolder(buildModelCard(parent.context), isDownloaded)
+
 
     override fun getItemCount(): Int = shown.size
 
@@ -87,12 +89,16 @@ class ModelCardAdapter(
         holder.card.setOnClickListener { onClick(model) }
     }
 
-    class CardHolder(val card: MaterialCardView) : RecyclerView.ViewHolder(card) {
+    class CardHolder(
+        val card: MaterialCardView,
+        private val isDownloaded: (ModelInfo) -> Boolean,
+    ) : RecyclerView.ViewHolder(card) {
         fun bind(model: ModelInfo) {
-            val (icon, title, meta) = card.tag as CardChildren
+            val (icon, title, meta, badge) = card.tag as CardChildren
             icon.setImageResource(modelTypeIcon(model.format))
             title.text = model.modelName
             meta.text = model.metaLine
+            badge.visibility = if (isDownloaded(model)) View.VISIBLE else View.GONE
             card.contentDescription = model.modelName
         }
     }
@@ -146,8 +152,34 @@ class ModelCardAdapter(
             textCol.addView(meta)
             row.addView(textCol)
 
+            // Trailing 已下载 badge (green check icon + label), shown only for
+            // models whose file already exists in the private models directory.
+            val badge = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                visibility = View.GONE
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { marginStart = context.dp(8) }
+            }
+            badge.addView(ImageView(context).apply {
+                setImageResource(R.drawable.ic_downloaded)
+                setColorFilter(AimbotColors.SHELL_STATUS_RUNNING)
+                layoutParams = LinearLayout.LayoutParams(context.dp(16), context.dp(16))
+            })
+            badge.addView(TextView(context).apply {
+                text = "已下载"
+                textSize = 11f
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setTextColor(AimbotColors.SHELL_STATUS_RUNNING)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { marginStart = context.dp(3) }
+            })
+            row.addView(badge)
+
             card.addView(row)
-            card.tag = CardChildren(icon, title, meta)
+            card.tag = CardChildren(icon, title, meta, badge)
             return card
         }
 
@@ -155,6 +187,7 @@ class ModelCardAdapter(
             val icon: ImageView,
             val title: TextView,
             val meta: TextView,
+            val badge: LinearLayout,
         )
     }
 }

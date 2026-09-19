@@ -97,6 +97,17 @@ object ModelDownloadManager {
         }
     }
 
+    /**
+     * Deletes a downloaded model file from the private models directory and
+     * notifies listeners so the 已下载 list refreshes.
+     */
+    fun delete(context: Context, model: ModelInfo): Boolean {
+        val file = File(ModelRepository.targetDir(context, model.format), model.fileName)
+        val ok = !file.exists() || file.delete()
+        if (ok) notifyChanged()
+        return ok
+    }
+
     /** Removes finished (non-active) tasks from the list view. */
     fun clearFinished() {
         synchronized(tasks) {

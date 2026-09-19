@@ -9,6 +9,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
 import android.widget.LinearLayout
+import android.widget.Toast
 import android.widget.TextView
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.progressindicator.LinearProgressIndicator
@@ -43,6 +44,7 @@ class ModelDetailDialog(
     private var progressBar: LinearProgressIndicator? = null
     private var progressText: TextView? = null
     private var cancelButton: com.google.android.material.button.MaterialButton? = null
+    private var importButton: com.google.android.material.button.MaterialButton? = null
     private var actionButton: com.google.android.material.button.MaterialButton? = null
     private var dialogCard: MaterialCardView? = null
 
@@ -185,7 +187,18 @@ class ModelDetailDialog(
         }
         val cancel = button("取消", filled = false)
         val action = button("下载", filled = true)
+        // 导入：已下载模型的占位入口（真实导入逻辑后续对接）。
+        val import = button("导入", filled = false).apply {
+            setTextColor(AimbotColors.ON_PRIMARY_CONTAINER)
+            setBackgroundColor(AimbotColors.PRIMARY_CONTAINER)
+            setOnClickListener {
+                Toast.makeText(activity, "导入功能对接中", Toast.LENGTH_SHORT).show()
+            }
+        }
+        importButton = import
         btnRow.addView(cancel)
+        btnRow.addView(View(ctx).apply { layoutParams = LinearLayout.LayoutParams(ctx.dp(8), 1) })
+        btnRow.addView(import)
         btnRow.addView(View(ctx).apply { layoutParams = LinearLayout.LayoutParams(ctx.dp(8), 1) })
         btnRow.addView(action)
         body.addView(btnRow)
@@ -207,11 +220,21 @@ class ModelDetailDialog(
         cancel.setOnClickListener { dismiss() }
 
         if (ModelRepository.isDownloaded(activity, model)) {
-            action.text = "已下载"
-            action.alpha = 0.5f
-            action.setOnClickListener(null)
+            // Already on disk: 导入 placeholder + red 删除 instead of 下载.
+            importButton?.visibility = View.VISIBLE
+            action.text = "删除"
+            action.setTextColor(AimbotColors.ON_PRIMARY)
+            setBackgroundColor(action, AimbotColors.ERROR)
+            action.alpha = 1f
+            action.setOnClickListener {
+                ModelDownloadManager.delete(activity, model)
+                dismiss()
+            }
         } else {
+            importButton?.visibility = View.GONE
             action.text = "下载"
+            action.setTextColor(AimbotColors.ON_PRIMARY)
+            setBackgroundColor(action, AimbotColors.PRIMARY)
             action.alpha = 1f
             action.setOnClickListener { startDownload() }
         }
@@ -231,6 +254,7 @@ class ModelDetailDialog(
     private fun renderTask(task: ModelDownloadManager.Task) {
         val cancel = cancelButton ?: return
         val action = actionButton ?: return
+        importButton?.visibility = View.GONE
         progressHost?.visibility = View.VISIBLE
         val text = progressText ?: return
         val bar = progressBar ?: return
@@ -290,6 +314,11 @@ class ModelDetailDialog(
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    /** MaterialButton keeps its ripple when the tint is set via backgroundTint. */
+    private fun setBackgroundColor(button: com.google.android.material.button.MaterialButton, color: Int) {
+        button.backgroundTintList = android.content.res.ColorStateList.valueOf(color)
+    }
 
     private fun paramRow(ctx: android.content.Context, label: String, value: String): LinearLayout {
         return LinearLayout(ctx).apply {
