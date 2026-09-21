@@ -289,14 +289,17 @@ static void driveAimToTarget(TouchAimState& st, int slot,
 
     float pidX = 0.0f, pidY = 0.0f;
     // Controller takes the raw error (target - crosshair) and returns the finger
-    // displacement for this step, in px. The two deadzone flags make that axis
-    // HOLD inside its band: P and D stop driving, the integral is dropped from
-    // the output and bled off (round 15 — before that it kept driving, and that
-    // was the whole static shake and the creep-snap staircase), and the
-    // feed-forward is still added so a target actually moving through the band is
-    // still followed. The raw error still reaches the derivative term so its
-    // state stays continuous; otherwise it spikes every time the target crosses
-    // the stop band.
+    // displacement for this step, in px. The two deadzone flags gate that axis's
+    // integrator RATE, never its CONTRIBUTION: P and D stop driving (they are
+    // what amplify the detector's jitter — the band's real purpose), the trim
+    // stops accumulating and is bled toward the carrier the reconstruction
+    // measures the target to need (carry = ffVel/alpha_hat — 0 at rest, the
+    // standing carrier on a strafe), and it is STILL ADDED to the output. Round
+    // 15 suppressed the contribution as well, which turned the band into a
+    // bang-bang in a per-step DISPLACEMENT and read on the device as 乱甩乱晃;
+    // see the round-16 section of tracking/pid_controller.h. The raw error still
+    // reaches the derivative term so its state stays continuous; otherwise it
+    // spikes every time the target crosses the stop band.
     //
     // `targetChanged` is passed straight through: the selection is "nearest
     // confirmed track", so it can land on a different enemy in one step, and
@@ -334,7 +337,18 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     //             and HOLD there. It is the term that removes the lag without
     //             winding up, so if the aim still trails while `ff` sits near
     //             zero, that is the whole problem and nothing about kp will fix
-    //             it: raise 前馈增益.
+    //             it: raise 前馈增益. At kf = 0 it is zero BY DESIGN — read `cr`.
+    //   cr      : the carrier the reconstruction MEASURES the target to need, in
+    //             finger px/step — the same units as `trim`, and not scaled by
+    //             kf. Read it against `trim`: on a strafe the two should converge
+    //             (they are the same quantity, one measured and one accumulated),
+    //             and at rest both should read 0. trim far above cr on a moving
+    //             target means the trim is carrying more than the measurement
+    //             asks for; trim near 0 while cr is large means the loop is not
+    //             being allowed to build the carrier at all. This field is also
+    //             what the DEADZONE bleeds the trim toward, so while standing
+    //             still with the crosshair on target, cr -> 0 IS the deadzone
+    //             working.
     //   d       : the damping term's contribution, in px. Pinned near 0 with
     //             kd > 0 means the damping term is dead; comparable to the
     //             feedback means kd is carrying the loop and kp has room.
@@ -364,11 +378,12 @@ static void driveAimToTarget(TouchAimState& st, int slot,
         sSumX += dex; sSumY += dey;
         if (++sTick >= 480) {
             LOGI("aim: id=%d mean e=(%.1f,%.1f) tot=(%.2f,%.2f) "
-                 "ff=(%.1f,%.1f) d=(%.2f,%.2f) trim=(%.1f,%.1f) "
+                 "ff=(%.1f,%.1f) cr=(%.1f,%.1f) d=(%.2f,%.2f) trim=(%.1f,%.1f) "
                  "kf=%.2f a=%.2f%s lim=%.0f yard=%.0f dt=%.1fms",
                  st.lastTargetId,
                  sSumX / sTick, sSumY / sTick, pidX, pidY,
                  st.aim.ffX(), st.aim.ffY(),
+                 st.aim.carryX(), st.aim.carryY(),
                  st.aim.derivX(), st.aim.derivY(),
                  st.aim.trimX(), st.aim.trimY(),
                  st.aim.ffGainValue(), st.aim.alphaHatValue(),
@@ -380,14 +395,14 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     }
 
     // The per-axis freeze has ALREADY been applied inside the controller, and it
-    // is not a plain "zero this axis": P and D stop driving, the integral is
-    // dropped from the output AND bled off, and the FEED-FORWARD is still added.
-    // So the caller must NOT zero the axis here — that would throw away the one
-    // term that is legitimately still acting (the measured target velocity), and
-    // turn the band into "the axis stops dead", which on a moving target is the
-    // creep-snap staircase the user reported. See AimController::step() and
-    // PPID::update()'s `frozen` note, and the round-15 section of
-    // tracking/pid_controller.h.
+    // is not a plain "zero this axis" and not a "drop the integral" either: P and
+    // D stop driving, the trim is bled toward the measured carrier — and bled, not
+    // removed — and the FEED-FORWARD is added as always. So the caller must NOT
+    // zero the axis here; that would throw away the one term that is legitimately
+    // still acting and turn the band into "the axis stops dead". Round 15 dropped
+    // the integral's contribution inside the band instead, and with kf = 0 that
+    // zeroed the axis completely: see the round-16 section of
+    // tracking/pid_controller.h and PPID::update()'s `frozen` note.
     float moveX = pidX;
     float moveY = pidY;
 
@@ -837,22 +852,24 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // ── Aim deadzone ────────────────────────────────────────────────────────
     // 0.0 = move onto the target CENTRE; 1.0 = stop at the target EDGE. The stop
     // radius is a fraction of the target box's half-size, so 0.05 still lands on
-    // the target and 1.0 stops at its nearest edge.
+    // the target and 1.0 stops at its nearest edge. Per-axis, not a circle, and
+    // 0.0 disables it.
     //
-    // ROUND 15 — THIS ROW IS THE FIX for "静止不动的时候视角也一直晃" and for the
-    // staircase in Y when the target jumps, and until round 15 it could not have
-    // been: the band only switched off P and D, so the INTEGRAL kept driving the
-    // axis inside it — walking the view off the target until P snapped it back,
-    // over and over. It now holds the axis outright: P, D and I all stop driving,
-    // the integral's charge is bled off rather than held, and only the
-    // feed-forward is still added, which is what keeps a genuinely moving target
-    // followed THROUGH the band.
+    // WHAT IT ACTUALLY DOES (round 16 — the honest version). Inside the band P
+    // and D stop driving, which is what this row is for: those two are what
+    // amplify the detector's jitter. The TRIM is NOT switched off — it stops
+    // accumulating and is pulled toward what the reconstruction measures the
+    // target to need, so at rest it goes to zero on its own (the 静止时一直晃 is
+    // fixed for real) while a strafe keeps the carrier the loop taught it. Round
+    // 15 additionally removed the trim from the output, and that is what made the
+    // aim fling: a per-step displacement switched off and on at the band's own
+    // rate is a velocity step as large as the trim itself, at every crossing.
     //
-    // Keep it SMALL — 0.1…0.3. Inside the band the integral is suppressed, so a
-    // large band with kf = 0 leaves nothing to carry motion and the aim moves in
-    // bursts; the band is for blocking the detector's jitter, not for blocking
-    // the target. Two decimals and a 0.05 step on purpose: finding the smallest
-    // value that does that is the whole exercise.
+    // SO: this row is for detector JITTER only, and it does not need to be big.
+    // 0.1…0.3 quiets a box that twitches; 1.0 also blocks the target's real
+    // motion, and what you feel then is the aim refusing to move. Two decimals
+    // and a 0.05 step on purpose: finding the smallest value that quiets the
+    // jitter is the whole exercise.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.deadzone, "死区", 2, es);
     y += rowSl + gap;
 

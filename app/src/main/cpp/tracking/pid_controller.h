@@ -367,23 +367,31 @@
 //      steps, what the user sees is a STAIRCASE: creep, snap, creep, snap. The
 //      "阶梯状" is a relay limit cycle, not a quantisation artefact.
 //
-//  THE FIX — the band now means "hold", for every term that can move the axis:
+//  THE FIX, and the trap inside the fix (round 16):
 //
-//    1. Inside the band the integral is NOT added to the output. This is the
-//       whole point of the band: a bias has no justification while the aim is
-//       on target, so it must not be what pushes the finger.
-//    2. The charge is DRAINED, not held (kDzTrimDrainTauSec). Holding it only
-//       moves the problem to the band's exit, where it is spent as a lurch —
-//       which is the same failure the round-14 release rate was about, one
-//       order of magnitude smaller.
-//    3. The feed-forward is STILL added. It is a MEASUREMENT of the target's
-//       screen velocity, not an accumulated bias, so it cannot park a charge;
-//       keeping it is what lets a genuinely moving target be followed THROUGH
-//       the band, which is what stops the band from turning a strafe into the
-//       creep-snap staircase above. With kf = 0 there is no such signal, so a
-//       large deadzone plus kf = 0 will always move in bursts — the two knobs
-//       are complementary, and the deadzone belongs at 0.1…0.5 for blocking
-//       detector jitter, not at 1.0 for blocking motion.
+//    1. Inside the band the integral STOPS ACCUMULATING. A bias has no
+//       justification while the aim is on target.
+//    2. Its contribution is NEVER suppressed — only its rate is gated. Round 15
+//       suppressed the contribution (iTerm = 0) as well, and that is the whole
+//       of "乱甩乱晃": u is a per-step displacement, so dropping a trim of N
+//       px/step the moment the band is entered and restoring it on the way out
+//       is a velocity step of N px/step at every band crossing. With kf = 0 the
+//       band therefore zeroed the axis completely (P, D and I all off) and the
+//       axis banged between "nothing" and "everything".
+//    3. Instead it is BLEED TOWARD THE MEASURED CARRIER (kDzTrimBleedTauSec),
+//       not toward zero. carry = ffVel/alpha_hat is what the reconstruction says
+//       the target needs; at rest that is 0 (so the standing charge still dies —
+//       the round-15 complaint is genuinely fixed) and on a strafe it is the
+//       carrier itself (so crossing the band does not cost the target).
+//    4. The feed-forward is still added, unchanged. It is a MEASUREMENT, not an
+//       accumulated charge, and at kf = 0 it contributes nothing while the
+//       measurement it is built on — ffVel — is what the bleed is aimed at, so
+//       it must be computed whether kf is zero or not. That is why the ŵ
+//       low-pass no longer sits behind `if (kf > 0)`.
+//    5. P and D are switched off inside the band, and that switch is NOT the
+//       same problem: inside their band P <= kp x band and D is bounded by the
+//       error's rate, both well under 1 px/step at any sane gain, so the step
+//       they make at the boundary is invisible. The integral's is not.
 //
 //  And kf's range is now the user's: 0.00–0.50, default 0.05. Round 14 argued
 //  for 0.80 from the self-copy stability window; the user's own tuning found
@@ -429,25 +437,43 @@ constexpr float kTrimLimitPx = 150.0f;
 // e = -20 px, 120 Hz that is 3000 frames, twenty-five seconds of "很慢的描回来".
 constexpr float kIntReleaseGain = 6.0f;
 
-// ── The stop band's trim drain (round 15) ───────────────────────────────────
+// ── The stop band's trim bleed (round 15, corrected in round 16) ────────────
 //
-// Inside the deadzone the integral is neither accumulated NOR ADDED TO THE
-// OUTPUT, and whatever charge it holds is bled off with this time constant.
-// Two separate things, and both are needed:
+// Inside the deadzone the integral stops ACCUMULATING and is pulled toward the
+// carrier the target actually needs, with this time constant. Its CONTRIBUTION
+// is never removed. That correction is the whole of round 16, and it is what the
+// user's "乱甩乱晃" was:
 //
-//   * not added, because the band exists to stop the axis moving and the
-//     integral was — before round 15 — the only term the band did not silence.
-//     That is the static shake ("静止不动的时候视角也一直晃 … 原因是ki") and, in
-//     whichever axis crosses the band on a jump, the creep-snap staircase.
-//   * drained, because a charge held through the band is spent the instant the
-//     axis leaves it — the lurch the band was supposed to prevent, just delayed.
+//   A VELOCITY TERM MAY BE GATED IN RATE, NEVER IN CONTRIBUTION. u is finger px
+//   PER STEP, so a trim of 50 px/step is a 6000 px/s slide. Switching that term
+//   off on the frame the band is entered and back on when it is left is a step
+//   in velocity of |trim| px/step, once per band crossing — and a loop handed a
+//   step that large can do nothing but bang between the two states. Round 15
+//   removed the contribution AND bled the charge, so with kf = 0 the band zeroed
+//   the axis outright (P, D and I all off) and the axis alternated between
+//   "nothing" and "the whole command": flinging, at the band's own rate.
 //
-// 0.30 s is a deliberate middle: fast enough that a stationary target's trim is
-// gone before anyone can see it (a 50 px charge is at 2 px after ~40 frames),
-// slow enough that a target merely CROSSING the band does not wipe the carrier
-// the loop built for it. The drain is invisible while the contribution is
-// suppressed — it only decides what is left when the axis leaves.
-constexpr float kDzTrimDrainTauSec = 0.30f;
+// So the band does two things and only two: P and D stop driving — they are the
+// terms that amplify the detector's jitter, which is the band's actual job — and
+// the integral is pulled toward what the loop MEASURES the target to need,
+//
+//     carry = ffVel / alpha_hat        (finger px/step, from the reconstruction)
+//
+// instead of toward zero. That distinction is load-bearing at exactly two
+// moments:
+//
+//   * AT REST carry is 0, so a standing charge is bled off and stops walking the
+//     view off the target — round 15's complaint, still fixed.
+//   * ON A STRAFE carry IS the carrier, so crossing the band no longer destroys
+//     what the loop learned and a moving target is still followed through it —
+//     which is what round 15 broke: it bled to zero, and with kf = 0 there was
+//     then nothing left to carry motion at all (burst, stall, burst).
+//
+// 0.10 s, not 0.30: the bleed is only ever visible as the difference between the
+// charge and the measured carrier, and at rest that difference is the whole
+// charge — so it may not take a third of a second to leave. The 0.30 s round 15
+// used is part of why "视角一直晃" survived that build.
+constexpr float kDzTrimBleedTauSec = 0.10f;
 
 constexpr float kDerivTauSec = 0.025f;
 
@@ -825,20 +851,20 @@ public:
     //
     // error         : current position error (target - crosshair), px
     // dt            : control step, seconds
-    // frozen        : true when this axis is inside its deadzone. The axis HOLDS
-    //                 for this step: the proportional and derivative terms are
-    //                 discarded, the integrator is neither accumulated NOR ADDED
-    //                 TO THE OUTPUT, and whatever charge it holds is bled off
-    //                 (kDzTrimDrainTauSec). Round 14 held the charge and added
-    //                 it, which left the integral as the only term driving the
-    //                 finger inside the band the band was built to silence — the
-    //                 static shake and, in whichever axis crosses the band on a
-    //                 jump, the creep-snap staircase. See the round-15 section.
-    //                 The FEED-FORWARD is still added, because it is a
-    //                 measurement of the target's velocity rather than an
-    //                 accumulated bias: it holds no charge, and keeping it is
-    //                 what lets a genuinely moving target be followed THROUGH
-    //                 the band instead of the axis stopping dead inside it.
+    // frozen        : true when this axis is inside its deadzone. The band gates
+    //                 the integral's RATE, never its CONTRIBUTION: the
+    //                 proportional and derivative terms stop driving (they are
+    //                 what amplify the detector's jitter — the band's real job),
+    //                 the integrator stops accumulating, and the charge it holds
+    //                 is bled toward what the reconstruction measures the target
+    //                 to need — carry = ffVel/alpha_hat, i.e. toward zero at rest
+    //                 and toward the standing carrier on a strafe
+    //                 (kDzTrimBleedTauSec). It is STILL ADDED to the output at
+    //                 all times, and round 15 is the reason that sentence has to
+    //                 be here: it suppressed the contribution, which turned the
+    //                 band into a bang-bang in a per-step displacement term and
+    //                 read on the device as "乱甩乱晃". The feed-forward is
+    //                 added as always.
     // targetChanged : true when the caller switched to a DIFFERENT track this
     //                 step (it knows, from the track id). The integral, the
     //                 feed-forward velocity and the soft-start ramp are re-seeded
@@ -947,36 +973,21 @@ public:
         // per-sample one; see the class note).
         float p = kp * ramp * gainScale * error;
 
-        // ── Deadzone: the axis HOLDS. Round 15 ────────────────────────────────
+        // ── Deadzone, part 1: P and D stop driving (round 15, kept) ───────────
         //
-        // The round-14 version suppressed the proportional and the derivative
-        // term and merely held the integral — while still adding it. That left
-        // the one term the band exists to silence as the ONLY term still driving
-        // the finger, and it is the whole of round 15:
+        // These two are what amplify the detector's jitter, which is the entire
+        // reason a stop band exists: inside the band P <= kp x band and D is
+        // bounded by the error's own rate, so at any sane gain the step they make
+        // at the boundary is well under a pixel per step. Switching them off is
+        // therefore free, and it is what makes the centre quiet.
         //
-        //   at rest      the trim is a standing charge with no restoring force
-        //                (P, the term that unwinds it, is what the band switched
-        //                off), so it walks the view off the target, the axis
-        //                leaves the band and P snaps it back — creep and snap,
-        //                repeating. That is "静止不动的时候视角也一直晃".
-        //   on a jump    the same cycle in whichever axis is crossing the band
-        //                (Y, when a target jumps) — the same creep and snap, seen
-        //                as the "阶梯状".
-        //
-        // So: the integral is dropped from the output AND bled off. Dropping it
-        // stops the axis moving on the frame the band is entered; bleeding it
-        // means there is no charge left to spend when the axis leaves. Note the
-        // feed-forward is deliberately NOT suppressed — it is a measurement of
-        // the target's screen velocity rather than an accumulated bias, so it
-        // carries no charge and is what keeps a genuinely moving target followed
-        // through the band.
-        float iTerm = integral;
+        // The integral is a different animal — it is a per-step DISPLACEMENT, it
+        // can legitimately hold 50 px/step, and a 50 px/step step in velocity is
+        // what "乱甩乱晃" was. So it is NOT switched off here. It is handled after
+        // the reconstruction below, by being bled toward the measured carrier.
         if (frozen) {
-            p     = 0.0f;
-            d     = 0.0f;
-            iTerm = 0.0f;
-            integral -= integral * std::min(1.0f, dt / kDzTrimDrainTauSec);
-            if (std::fabs(integral) < 0.01f) integral = 0.0f;
+            p = 0.0f;
+            d = 0.0f;
         }
 
         // ── Feed-forward: reconstruct the target's OWN screen velocity ───────
@@ -1006,22 +1017,61 @@ public:
         // lead — it is pure error — and holding it for the 33 ms a symmetric
         // filter would is what makes the crosshair sail past and get dragged
         // back: the user's "目标停下会左右抖几下".
+        // The MEASUREMENT runs whether kf is zero or not (round 16); only the
+        // CONTRIBUTION is scaled by kf. At kf = 0 the feed-forward adds nothing,
+        // but ffVel is still the loop's only knowledge of how fast the target is
+        // actually moving, and both the diagnostic readout and the deadzone's
+        // bleed target (carry = ffVel/alpha_hat) are built from it. Before this
+        // the whole block sat behind `if (kf > 0)`, so at the user's kf = 0 every
+        // number derived from ŵ was identically zero — including the one the band
+        // needed, which is why round 15's band could only bleed to zero.
+        const bool velValid = (alphaHat > 0.0f) && !ffInhibit;
         float ff = 0.0f;
-        if (kf > 0.0f && alphaHat > 0.0f && !ffInhibit) {
-            const float gain = std::min(kf / alphaHat, kFfGainMax);
+        if (velValid) {
             const float meas = std::clamp(de + alphaHat * uHist[uHead],
                                           -kFfVelMaxPx, kFfVelMaxPx);
             const float tau  = (std::fabs(meas) < std::fabs(ffVel))
                                    ? kFfTauFastSec : kFfTauSec;
             const float af   = dt / (dt + tau);
             ffVel += af * (meas - ffVel);
-            ff = std::clamp(gain * ffVel, -kFfLimitPx, kFfLimitPx);
-            // Deadband, pid (1).cpp:55 (`|ki_raw| > 0.5` else 0): without it a
-            // small reconstruction wanders around zero at rest and is integrated
-            // by nothing but the detector.
-            if (std::fabs(ff) < kFfDeadbandPx) ff = 0.0f;
+            if (kf > 0.0f) {
+                const float gain = std::min(kf / alphaHat, kFfGainMax);
+                ff = std::clamp(gain * ffVel, -kFfLimitPx, kFfLimitPx);
+                // Deadband, pid (1).cpp:55 (`|ki_raw| > 0.5` else 0): without it a
+                // small reconstruction wanders around zero at rest and is
+                // integrated by nothing but the detector.
+                if (std::fabs(ff) < kFfDeadbandPx) ff = 0.0f;
+            }
         }
         ffInhibit = false;
+
+        // ── Deadzone, part 2: the trim bleeds toward the MEASURED CARRIER ─────
+        //
+        // The band stops the accumulation (the block below is skipped while
+        // frozen) and pulls the charge toward what the target is measured to need
+        // instead of toward zero. carry = ffVel/alpha_hat is in the trim's own
+        // units — finger px per step — which is what makes it usable as a target
+        // at all; the 0.5 px deadband keeps a jitter-driven ŵ from leaving a
+        // permanent sub-pixel charge at rest.
+        //
+        // Placement matters twice. It must run AFTER the reconstruction, because
+        // ffVel is the filter of the step just observed. And it must not be a
+        // separate term in the sum below — iTerm simply FOLLOWS the state, so the
+        // band changes the integrator's RATE and never its CONTRIBUTION. That
+        // sentence is the whole of round 16: round 15 removed the contribution,
+        // and at kf = 0 that made the band zero the axis outright.
+        float iTerm = integral;
+        if (frozen) {
+            float carry = integral;                        // no measurement: hold
+            if (velValid) {
+                carry = std::clamp(ffVel / alphaHat, -trimLimit, trimLimit);
+                if (std::fabs(carry) < kFfDeadbandPx) carry = 0.0f;
+            }
+            const float bleed = std::min(1.0f, dt / kDzTrimBleedTauSec);
+            integral += (carry - integral) * bleed;
+            if (std::fabs(integral) < 0.01f) integral = 0.0f;
+            iTerm = integral;
+        }
 
         // ── Integral: the DC carrier, unconditioned and quick to let go ──────
         //
@@ -1123,6 +1173,13 @@ public:
     float ffGainValue()    const { return kf; }
     /// The reconstruction constant in force (the estimated plant gain).
     float alphaHatValue()  const { return alphaHat; }
+    /// The carrier the reconstruction says the target needs, in finger px/step —
+    /// in the TRIM's own units, and the value the deadzone bleeds the trim
+    /// toward. Read them together: |trim| far above |carry| on a moving target
+    /// means the trim is holding more than the measurement asks for, and at rest
+    /// carry should read 0 and trim should follow it there. This works at kf = 0
+    /// (round 16): it is a measurement, not a contribution.
+    float carryPx()        const { return alphaHat > 0.0f ? ffVel / alphaHat : 0.0f; }
     /// The proximity weight in force, 0…1 (was the gate's boolean).
     float nearWValue()     const { return nearW; }
     /// Kept for the log: "on target" now means the schedule is mostly open.

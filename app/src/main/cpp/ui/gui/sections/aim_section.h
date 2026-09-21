@@ -168,13 +168,14 @@ struct AimController {
     /// genuinely changes rate (120 Hz while aiming, 60 Hz in the detector tier).
     ///
     /// `freezeX` / `freezeY` are the caller's per-axis deadzone decisions, and
-    /// the caller must NOT zero the returned value afterwards. Round 15 made the
-    /// band mean HOLD: inside it P and D stop driving, the integral is dropped
-    /// from the output and its charge bled off (kDzTrimDrainTauSec), and only the
-    /// feed-forward is still added — so a target genuinely moving through the
-    /// band is still followed, while the standing bias that used to walk a
-    /// resting aim off the target (and, on a jump, saw Y in and out of the band
-    /// as a staircase) has nothing left to spend.
+    /// the caller must NOT zero the returned value afterwards. The band gates the
+    /// integrator's RATE, never its CONTRIBUTION: inside it P and D stop driving
+    /// and the trim stops accumulating, being bled toward the carrier the
+    /// reconstruction measures the target to need (carry = ffVel/alpha_hat, i.e.
+    /// zero at rest and the standing carrier on a strafe) — while still being
+    /// ADDED to the output. Round 15 dropped it from the output as well, and with
+    /// kf = 0 that zeroed the axis outright and read as 乱甩乱晃; see the round-16
+    /// section of tracking/pid_controller.h.
     ///
     /// `targetChanged` says the caller picked a DIFFERENT track this step. The
     /// caller knows (it has the track id); the controller cannot tell a switch
@@ -212,19 +213,29 @@ struct AimController {
     /// True once the plant-gain fit has ever converged. For the log.
     bool  alphaValid() const { return alphaEst.valid(); }
 
-    /// Trim of each axis, for the diagnostic log. See PPID::integralValue() —
-    /// it is the RESIDUAL cleaner while the feed-forward runs, so it should stay
-    /// small; a large trim together with a small `ff` on a moving target means
-    /// kf is off, and roughly by their ratio.
+    /// Trim of each axis, for the diagnostic log. Read it AGAINST carryX/Y, not
+    /// against a fixed idea of "small": the trim is the DC carrier whenever kf is
+    /// small (the user's own tuning runs kf = 0), so |trim| ≈ |carry| is the
+    /// healthy state on a moving target, and trim pinned at its leash means the
+    /// requirement is beyond what the loop may deliver. At rest both should be 0.
     float trimX() const { return pidX.integralValue(); }
     float trimY() const { return pidY.integralValue(); }
 
     /// The feed-forward's contribution to each axis, in px. THE number to watch
-    /// on a moving target: it should settle at ΔT/alpha and hold there. Near
+    /// on a moving target: it should settle at kf·ΔT/alpha and hold there. Near
     /// zero while the error trails the target means the feed-forward is not
-    /// running (kf = 0, or every frame reports targetChanged).
+    /// running (kf = 0, or every frame reports targetChanged) — and at kf = 0 it
+    /// is zero BY DESIGN, which is why `carry` below exists.
     float ffX() const { return pidX.ffValue(); }
     float ffY() const { return pidY.ffValue(); }
+
+    /// The carrier each axis is measured to NEED, in finger px/step — the trim's
+    /// own units, and the value the deadzone bleeds the trim toward. Unlike `ff`
+    /// this is NOT scaled by kf, so it is the number that stays meaningful at
+    /// kf = 0. On a strafe read it against `trim`: the two should converge. At
+    /// rest it should read 0, and trim should follow it there.
+    float carryX() const { return pidX.carryPx(); }
+    float carryY() const { return pidY.carryPx(); }
 
     /// The damping term's contribution to each axis's output, in px, for the
     /// diagnostic log. A D contribution that is always ~0 while the target
@@ -606,19 +617,24 @@ struct PageAim {
     /// the estimator is off by 2× — so every position of the slider is usable and
     /// nothing on it runs away. 0 still switches F off exactly.
     ///
-    /// The DEADZONE and kf are complementary, and this is worth knowing before
-    /// setting either: inside the stop band the integral is suppressed (see
-    /// tracking/pid_controller.h, round 15), so the feed-forward is the only
-    /// term that can still follow motion through the band. kf = 0 + a large
-    /// deadzone therefore moves in bursts by construction.
+    /// The DEADZONE and kf are no longer complementary, and this is the round-16
+    /// correction. Round 15 suppressed the integral inside the band, which made
+    /// the feed-forward the only term that could follow motion through it — and
+    /// at the user's kf = 0 that left NOTHING, so the band zeroed the axis and the
+    /// aim flung. The band now leaves the trim in the output and only bleeds it
+    /// toward the carrier the reconstruction measures the target to need, so a
+    /// strafe is followed through the band at ANY kf including 0. Set the band by
+    /// the target box's jitter alone; it no longer has to be traded against kf.
     widgets::SliderState ffGain{0.05f, 0.0f, 0.50f, 0.01f};
 
 
     /// Aim deadzone (0.0–1.0, step 0.05, two decimals): ports the old project's
     /// `convergeThresh`. Once the TARGET is within `deadzone` of the screen
-    /// centre (crosshair) the axis HOLDS — proportional, derivative and integral
-    /// all stop driving it, and the integral's charge is bled off — instead of
-    /// twitching around trying to land exactly on a jittering box. 0.0 = no
+    /// centre (crosshair) P and D stop driving that axis — they are what amplify
+    /// the box's jitter — and the trim stops accumulating, being bled toward the
+    /// carrier the reconstruction measures (0 at rest, so a standing charge no
+    /// longer walks the view off a still target); the trim is still ADDED to the
+    /// output, which is what round 15 got wrong. 0.0 = no
     /// deadzone (must converge to the pixel), 1.0 = stop as soon as the target
     /// is within ~8% of the shorter screen edge of the crosshair.
     ///
