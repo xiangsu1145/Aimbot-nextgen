@@ -190,15 +190,17 @@ struct AimController {
         outY = pidY.update(errY, dt, freezeY, targetChanged);
 
         // The plant gain is a property of the game, not of an axis, so one fit on
-        // X serves both. It is off the critical path: the whole kf range stays
-        // stable with alpha_hat wrong by 2x in either direction, and `value()`
-        // never returns anything unset.
+        // X serves both. Pushed UNCONDITIONALLY, not only while valid(): the
+        // estimator's value() starts at kAlphaHatSeed (0.10, the SAFE side) and
+        // is never unset, and pushing it only on `valid()` is what left the
+        // controller on its 1.0 default until the first successful fit — an
+        // OVER-estimate of a touch game's ~0.1 plant gain, i.e. +0.9·kf of
+        // positive feedback and the crosshair leaving the screen. `valid()` is
+        // now for the log's `?` marker only.
         alphaEst.push(errX, uDelayed);
-        if (alphaEst.valid()) {
-            const float a = alphaEst.value();
-            pidX.setAlphaHat(a);
-            pidY.setAlphaHat(a);
-        }
+        const float a = alphaEst.value();
+        pidX.setAlphaHat(a);
+        pidY.setAlphaHat(a);
     }
 
     /// The estimated plant gain in force (alpha_hat), for the log. Compare it
@@ -407,6 +409,13 @@ struct PageAim {
     /// standing error a moving target would otherwise need. It is the DC carrier
     /// when the feed-forward is off, and a residual cleaner when it is on — so
     /// 0.5 is the measured optimum with kp = 0.10 and is not a small mop-up value.
+    /// Its row steps in 0.01 and shows two decimals: it stepped in 0.1 before,
+    /// which made the whole useful range 0.0…0.2 three clicks wide.
+    ///
+    /// The scheduled gain multiplier applies to I as well as to P (see the
+    /// round-13 section of tracking/pid_controller.h): a large error accumulates
+    /// at reduced authority, which is what stops the integral from charging up
+    /// during a transient and spending the charge when the target stops.
     ///
     /// Kd (0–2, PER STEP, dimensionless): the filtered weight on the error's
     /// one-step change. Damping, and the only currency a delay-limited loop has
@@ -425,8 +434,8 @@ struct PageAim {
     /// constant tracking::kTrimLimitPx (90). Neither is scaled by anything:
     /// kf is the only place the plant gain enters, and it lives in its own row.
     widgets::SliderState kp{0.10f, 0.0f, 0.6f, 0.01f};
-    widgets::SliderState ki{0.5f, 0.0f, 4.0f, 0.1f};
-    widgets::SliderState kd{0.20f, 0.0f, 2.0f, 0.05f};
+    widgets::SliderState ki{0.5f, 0.0f, 4.0f, 0.01f};
+    widgets::SliderState kd{0.20f, 0.0f, 2.0f, 0.01f};
     widgets::SliderState outSmooth{1.0f, 0.0f, 1.0f, 0.05f};
 
     /// Lead, in detector frames: how far ahead of its tracked centre the aim
@@ -515,8 +524,20 @@ struct PageAim {
     /// 0 turns the feed-forward off exactly and leaves the integral as the sole
     /// DC carrier. Safe everywhere, but it trails a strafe at low sensitivity.
     ///
-    /// Range 0.00–2.00, step 0.05, default 1.00. See tracking/pid_controller.h.
-    widgets::SliderState ffGain{1.00f, 0.0f, 2.00f, 0.05f};
+    /// Range 0.00–2.00, step 0.01, default 1.00. See tracking/pid_controller.h.
+    ///
+    /// ROUND 13 — DO NOT PUSH THIS TO 1.00 BEFORE READING THE SEED CHANGE. The
+    /// crosshair flew off the screen at kf = 1.00 because alpha_hat was still on
+    /// its old 1.0 DEFAULT: with a true alpha near 0.1 the residual self-term
+    /// kf·(1 − alpha/alpha_hat) is then +0.9·kf, i.e. 0.9 of positive feedback.
+    /// The controller now seeds alpha_hat at 0.10 and pushes it from the first
+    /// step rather than only after a successful fit, and the feed-forward is
+    /// bounded four ways, so 1.00 is safe — but if the crosshair ever runs away
+    /// again, the diagnostic order is: read `a=` in the log (it should be near
+    /// 0.1, NOT 1.0), then check `|Δe|` per frame against the 30 px jump
+    /// detector, then lower kf. See the round-13 section of
+    /// tracking/pid_controller.h.
+    widgets::SliderState ffGain{1.00f, 0.0f, 2.00f, 0.01f};
 
 
     /// Aim deadzone (0.0–1.0, one decimal): ports the old project's

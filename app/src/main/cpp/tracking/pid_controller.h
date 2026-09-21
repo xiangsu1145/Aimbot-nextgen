@@ -129,6 +129,75 @@
 //  raise kFfTauSec (0.033 -> 0.05…0.08 trades a few px of lead for it) rather
 //  than lowering kf, which trades the tracking back.
 //
+//  ── ROUND 13: WHY kf = 1.0 FLEW THE CROSSHAIR OFF THE SCREEN ────────────────
+//
+//  User, on the round-12 build: "kf 现在是 1 了，自瞄直接飞出去啊".
+//
+//  alpha_hat reaches the controller only while the estimator reports a valid fit
+//  (AimController::step in aim_section.h), so before the first fit — and
+//  forever, for a user who never excites one — the controller kept its DEFAULT
+//  of 1.0. The true alpha in the touch regime is near 0.1, and the residual
+//  self-term derived above is
+//
+//      kf · (1 − alpha/alpha_hat) = 1.0 · (1 − 0.1/1.0) = +0.9
+//
+//  — a POSITIVE feedback of 0.9 on our own delayed command. An accelerator with
+//  the brake removed: the command grows geometrically, the tanh limiter pins it
+//  at 180 finger px/step, and the crosshair leaves the screen.
+//
+//  The same arithmetic at the kf the user had before (0.08) is +0.072, small
+//  enough to look like a bad gain: "不过冲了，但目标停下会左右抖几下，并且跟枪跟不
+//  上了". ONE root cause, THREE symptoms:
+//
+//      +0.9·kf → runs away            (飞出去)
+//      +0.07·kf → shakes after a stop (停下抖几下: the residual keeps pushing
+//                                       after the target has already stopped)
+//      gain kf/alpha_hat = 0.08 in place of 0.8 → no DC carrier (跟不上)
+//
+//  ── THE REPAIRS, ALL OF THEM PORTED FROM THE TWO REFERENCE FILES ────────────
+//
+//  1. alpha_hat is NEVER 1.0 by default again. The seed, and the fallback while
+//     no fit exists, is kAlphaHatSeed = 0.10 — chosen because it is on the SAFE
+//     side of the asymmetry: an UNDER-estimate makes the residual negative, i.e.
+//     damping. The value is also pushed UNCONDITIONALLY now, not only once a fit
+//     has succeeded, and the estimator's accepted fits are rate-limited so one
+//     bad window cannot slam the constant.
+//
+//  2. A JUMP DETECTOR, pid (1).cpp:40 — `if (|Δe| > 30) reset()`. A re-lock, a
+//     flick or a target switch is 100–300 px of Δe in ONE frame, and the
+//     reconstruction cannot tell that apart from the target really moving that
+//     far; it would read the whole flick as target velocity and fire it through
+//     F. The reference throws the state away. What makes it work there is the
+//     second half of the trick: its reset also zeroes kp_gain, and the ENTIRE
+//     output is multiplied by kp_gain — so the jump frame emits ZERO and the
+//     gains fade back in over the next few frames. That is exactly what ramp
+//     already does here, so the jump branch sets ramp = 0.
+//
+//  3. BOUNDS, so that a wrong alpha_hat can never be violent: the reconstructed
+//     velocity is clamped to ±kFfVelMaxPx, the feed-forward to ±kFfLimitPx, and
+//     the gain kf/alpha_hat to kFfGainMax. The limiter is the LAST line of
+//     defence, not the mechanism — alpha_hat being right is the mechanism.
+//
+//  4. FAST RELEASE on the feed-forward low-pass. When a target stops, a
+//     symmetric 33 ms filter keeps the old velocity alive for ~4 frames — 4 × 50
+//     finger px at alpha = 0.1 — which is the crosshair sailing past and then
+//     being dragged back: the "抖几下". A shorter constant on the way DOWN
+//     (kFfTauFastSec) lets a decay happen at once while a rise stays filtered.
+//
+//  5. A DEADBAND on the feed-forward, pid (1).cpp:55 (`|ki_raw| > 0.5` else 0),
+//     so detector noise cannot keep a small command alive at rest.
+//
+//  6. A RATE-LIMITED PROXIMITY WEIGHT on P and I, ported from pid (1).cpp's
+//     kp_integral()/adjust_integral(): both fade toward half strength while the
+//     aim is far off and are allowed back to full only as it closes
+//     (`比例 = 比例系数*0.5*e`, `积分累计 += e*0.5*dt` on the 未达标 branch).
+//     That is the reference's real anti-overshoot device — not a gain VALUE, a
+//     gain SCHEDULE, and the schedule is what a single slider cannot express.
+//     It REPLACES the hard 已达标 latch, which round 12 measured self-locking:
+//     a latch cannot reopen on a strafing target, and the reference's own rule
+//     parked the error at 475…663 px here. A weight with a floor of 0.5 and a
+//     rate limit cannot latch, and the JUMP branch is what does the hard reset.
+//
 //  ── THE GATE (ported from the reference PID the user pointed at) ────────────
 //
 //  The other half of the overshoot fix is not a gain at all. When the aim is far
@@ -230,9 +299,31 @@ constexpr float kDerivTauSec = 0.025f;
 // CORRECT value is ~1.0 for every game (kf = alpha_hat/alpha, and alpha_hat is
 // estimated on-line), so the range has to straddle 1.0 comfortably on both
 // sides. 2.0 is headroom, not a target.
+//
+// kFfTauFastSec: the release time constant (see round-13 point 4). Asymmetric
+// on purpose — a rising ŵ stays filtered against detector noise, a falling one
+// is followed immediately, because by then the old velocity is not a lead any
+// more, it is pure error.
+//
+// kFfGainMax / kFfVelMaxPx / kFfLimitPx / kFfDeadbandPx: the bounds from
+// round-13 point 3 and the deadband from point 5. All four exist so that a
+// WRONG alpha_hat is survivable rather than violent; none of them is the
+// mechanism.
 constexpr float kFfTauSec      = 0.033f;
+constexpr float kFfTauFastSec  = 0.012f;
 constexpr int   kFfDelaySteps  = 5;
 constexpr float kFfStrengthMax = 2.0f;
+constexpr float kFfGainMax     = 20.0f;
+constexpr float kFfVelMaxPx    = 60.0f;
+constexpr float kFfLimitPx     = 120.0f;
+constexpr float kFfDeadbandPx  = 0.5f;
+
+// ── Jump detector (pid (1).cpp:40) ──────────────────────────────────────────
+//
+// |Δe| above this, in screen px for ONE control step, is a re-lock, a flick or
+// a target switch rather than target motion. 30 px/step is 3600 px/s of screen
+// velocity, well above anything a tracked target produces between detections.
+constexpr float kJumpResetPx = 30.0f;
 
 // ── Soft start ──────────────────────────────────────────────────────────────
 //
@@ -242,16 +333,24 @@ constexpr float kFfStrengthMax = 2.0f;
 // chatter on.
 constexpr float kRampRate = 0.30f;
 
-// ── The gate (see the header) ───────────────────────────────────────────────
+// ── The proximity weight (see round-13 point 6) ─────────────────────────────
 //
-// All three are fractions of, or offsets in, the TARGET'S BOX WIDTH, so they
-// hold their meaning at any range. Order of magnitude: a 64 px box gives a
-// 3.8 px "already on target" radius and a 96 px "give up and restart" radius,
-// which is 1.5 target widths — the reference PID's own figure.
-constexpr float kGateFrac     = 1.5f;   // |e| >= this × box  ⇒ not settled
-constexpr float kGateTinyFrac = 0.06f;  // |e| <  this × box  ⇒ settled
-constexpr float kStabTolPx    = 2.0f;   // |Δe| below this counts as "not moving"
-constexpr int   kStabNeed     = 2;      // ... for this many consecutive frames
+// kGateFrac is the distance, in TARGET WIDTHS, at which the gain schedule has
+// decayed to its floor — the reference's 动态判断阈值 = 动态系数 × 最近目标宽度.
+// Expressing it in target widths rather than pixels is the reference's real
+// trick: the same pixels mean "far off" on a distant 20 px box and "on target"
+// on a 300 px one, so a fixed pixel threshold is either twitchy at range or
+// blind up close, while this one scales with distance for free.
+//
+// kNearRate / kNearDropRate are the reference's own 0.03 and 0.1: opening is
+// slow (a gain that comes back too fast re-excites the transient), closing is
+// three times faster (a big error must not be driven at full authority).
+// kNearFloor is the 0.5 of `比例系数*0.5` — the weight never reaches zero, which
+// is what makes this a schedule and not the latch round 12 had to remove.
+constexpr float kGateFrac     = 1.5f;   // |e| >= this × box  ⇒ weight at floor
+constexpr float kNearRate     = 0.03f;  // per step, opening
+constexpr float kNearDropRate = 0.10f;  // per step, closing
+constexpr float kNearFloor    = 0.5f;   // minimum gain multiplier
 
 // ── On-line plant-gain (alpha) estimation ───────────────────────────────────
 //
@@ -260,9 +359,25 @@ constexpr int   kStabNeed     = 2;      // ... for this many consecutive frames
 // residual self-term is damping). The window fit over-estimates a little at low
 // alpha and under-estimates at high alpha (表5, +30% at 0.5 … −31% at 5.0), so
 // 0.8 lands the used value at 0.55…1.04× the truth across that whole span.
-constexpr float kAlphaBias = 0.8f;
-constexpr float kAlphaMin  = 0.05f;
-constexpr float kAlphaMax  = 4.0f;
+//
+// kAlphaHatSeed: what the controller uses BEFORE any fit has succeeded — and
+// what it keeps using if no fit ever does. It used to be 1.0, and that was the
+// round-13 runaway: in the touch regime the truth is near 0.1, so 1.0 is a huge
+// OVER-estimate and the residual self-term turns into +0.9·kf of positive
+// feedback. 0.10 is picked to be on the SAFE side — an under-estimate makes the
+// residual negative, i.e. damping — and it is simultaneously the right order of
+// magnitude for the phone, so an unconverged controller still carries a target
+// roughly correctly instead of merely not exploding.
+//
+// kAlphaStep: the accepted fit is blended in rather than adopted. The window fit
+// is refitted every kAlphaSolveEvery steps and its error is ±30 %, so adopting
+// each one wholesale would step the loop gain around for no reason.
+constexpr float kAlphaBias       = 0.8f;
+constexpr float kAlphaMin        = 0.05f;
+constexpr float kAlphaMax        = 4.0f;
+constexpr float kAlphaHatSeed    = 0.10f;
+constexpr float kAlphaStep       = 0.35f;
+constexpr int   kAlphaSolveEvery = 15;
 
 namespace {
 // ── Soft limiter ─────────────────────────────────────────────────────────────
@@ -295,15 +410,16 @@ static inline float softLimit(float v, float limit) {
 // swing, a target switch) — in a perfectly steady hold U is collinear with k and
 // the fit is singular, which is also when alpha does not matter.
 //
-// Nothing here is on the critical path: the controller falls back to 1.0 and the
-// whole kf range stays stable with alpha_hat off by 2× in either direction.
+// Nothing here is on the critical path: the controller starts from kAlphaHatSeed
+// (0.10 — the SAFE side, never 1.0 again; see the round-13 header section) and
+// the whole kf range stays stable with alpha_hat off by 2× either way.
 struct AlphaEstimator {
-    static constexpr int kWin = 90;      // 0.75 s at 120 Hz
+    static constexpr int kWin = 60;      // 0.5 s at 120 Hz
 
     void reset() {
         head_ = count_ = tick_ = 0;
         cumU_ = 0.0f;
-        alpha_ = 1.0f;
+        alpha_ = kAlphaHatSeed;
         valid_ = false;
     }
 
@@ -318,10 +434,11 @@ struct AlphaEstimator {
         head_ = (head_ + 1) % kWin;
         if (count_ < kWin) ++count_;
         ++tick_;
-        if (count_ == kWin && (tick_ % 30) == 0) solve();
+        if (count_ == kWin && (tick_ % kAlphaSolveEvery) == 0) solve();
     }
 
-    /// The value to USE (already biased low and clamped), never unset.
+    /// The value to USE (already biased low and clamped), never unset. Before
+    /// the first fit this is kAlphaHatSeed, NOT 1.0.
     float value() const { return alpha_; }
     /// True once a fit has ever succeeded — for the log only.
     bool  valid() const { return valid_; }
@@ -331,8 +448,8 @@ struct AlphaEstimator {
 private:
     void solve() {
         // Normal equations for parameters [c0, c1, c2, alpha] with regressors
-        // [1, k, k², −U]. 4×4 with a partial-pivot Gauss-Jordan; 90 samples once
-        // every 30 steps is nothing.
+        // [1, k, k², −U]. 4×4 with a partial-pivot Gauss-Jordan; 60 samples once
+        // every 15 steps is nothing.
         double M[4][4] = {{0}}, b[4] = {0};
         for (int i = 0; i < kWin; ++i) {
             const double x[4] = {1.0, k_[i], double(k_[i]) * k_[i], -double(U_[i])};
@@ -349,7 +466,7 @@ private:
         uMean /= kWin;
         for (int i = 0; i < kWin; ++i) uVar += (U_[i] - uMean) * (U_[i] - uMean);
         uVar /= kWin;
-        if (uVar < 25.0) return;                       // < 5 px rms of travel: skip
+        if (uVar < 9.0) return;                        // < 3 px rms of travel: skip
 
         for (int i = 0; i < 4; ++i) {
             int pv = i;
@@ -372,7 +489,13 @@ private:
         const double a = x[3];
         if (!(a > kAlphaMin && a < 8.0)) return;       // reject absurd fits
         raw_ = static_cast<float>(a);
-        alpha_ = std::clamp(kAlphaBias * raw_, kAlphaMin, kAlphaMax);
+        // BLEND the fit in rather than adopting it (round-13 point 1). The fit is
+        // refitted every kAlphaSolveEvery steps with a ±30 % error, so adopting
+        // each one wholesale steps the loop gain around for no reason — and the
+        // step happens exactly when the loop has just been excited, which is the
+        // worst moment for it.
+        const float want = std::clamp(kAlphaBias * raw_, kAlphaMin, kAlphaMax);
+        alpha_ += kAlphaStep * (want - alpha_);
         valid_ = true;
     }
 
@@ -381,7 +504,7 @@ private:
     float k_[kWin] = {0.0f};
     int   head_ = 0, count_ = 0, tick_ = 0;
     float cumU_ = 0.0f;   // running sum of the delayed commands == U(k)
-    float alpha_ = 1.0f;
+    float alpha_ = kAlphaHatSeed;
     float raw_ = 0.0f;
     bool  valid_ = false;
 };
@@ -430,8 +553,9 @@ public:
     /// damping rather than the stability near the working point.
     void setAlphaHat(float a) { alphaHat = std::clamp(a, kAlphaMin, kAlphaMax); }
 
-    /// The engaged target's box width in screen px, for the gate. <= 0 disables
-    /// the gate (both the feed-forward and the integrator then run open).
+    /// The engaged target's box width in screen px — the UNITS of the proximity
+    /// weight's threshold (kGateFrac × this). Passing <= 0 disables the schedule
+    /// and leaves P and I at full gain.
     void setTargetBoxPx(float px) { boxPx = (px > 0.0f && std::isfinite(px)) ? px : 0.0f; }
 
     // ── Core update ───────────────────────────────────────────────────────────
@@ -471,14 +595,71 @@ public:
             ramp      = 0.0f;
             ffVel     = 0.0f;
             ffInhibit = true;
-            stabCount = 0;
-            settled   = true;
+            nearW     = 0.0f;
         }
 
         // ── Soft start ────────────────────────────────────────────────────────
         ramp = std::min(1.0f, ramp + kRampRate);
 
         const float de = error - lastError;
+
+        // ── Jump detector (pid (1).cpp:40) ───────────────────────────────────
+        // `if (|Δe| > 30) reset()` in the reference. A re-lock, a flick or a
+        // target switch is 100–300 px of Δe in ONE frame, and the reconstruction
+        // cannot tell that apart from the target really moving that far: it would
+        // read the whole flick as target velocity and fire it through F, which is
+        // the lurch the output limiter then treats as a fact of life.
+        //
+        // What makes it work in the reference is the SECOND half of the trick:
+        // its reset also sets kp_gain = 0, and the ENTIRE output is multiplied by
+        // kp_gain — so the jump frame emits ZERO and the gains fade back in over
+        // the next few frames. ramp is that mechanism here, so the jump branch
+        // zeroes ramp. `lastError` is NOT touched: it is tracking the caller's
+        // error, and zeroing it would make the derivative read kd·error/dt.
+        //
+        // THE THRESHOLD IS NOT A BARE 30 px. Δe is not the target's motion — it
+        // is  Δe = w − alpha·u(k−L), and our own command is inside it. At the
+        // touch regime's alpha ≈ 0.1 that term is at most 18 px, but at alpha = 1
+        // a full-output step legitimately moves the error 180 px, so the
+        // reference's literal `|Δe| > 30` would reset the loop EVERY frame. The
+        // bound on legitimate motion is |ΔT| + alpha·kOutLimitPx, so the threshold
+        // is kJumpResetPx plus that (48 px at alpha 0.1, 210 px at alpha 1) — and
+        // a flick or a re-lock at either sensitivity still clears it by a wide
+        // margin.
+        if (std::fabs(de) > kJumpResetPx + alphaHat * kOutLimitPx) {
+            ffVel     = 0.0f;
+            ffInhibit = true;
+            integral  = 0.0f;
+            deriv     = 0.0f;
+            nearW     = 0.0f;
+            ramp      = 0.0f;
+        }
+
+        // ── Proximity weight: the reference's gain SCHEDULE ──────────────────
+        // pid (1).cpp's kp_integral()/adjust_integral(), both of them a weight in
+        // [0, 1] that chases (1 − |e|/threshold) with a rate limit, plus a
+        // faster decay once |e| is past the threshold:
+        //
+        //     if (|e| <  阈值) w += ((1 − |e|/阈值) − w) · 0.03
+        //     else             w += ((阈值/|e|)·w − w) · 0.1
+        //
+        // The threshold is in TARGET WIDTHS (kGateFrac × box), which is the other
+        // reference file's device. The weight multiplies P and I, so a big error
+        // is approached at half authority and full authority is restored only as
+        // the aim closes — this is the reference's actual anti-overshoot
+        // mechanism, and it is a SCHEDULE, which no single gain value can
+        // express. The floor keeps it a schedule: round 12 removed the hard
+        // 已达标 latch because a weight that reaches zero can never reopen.
+        float want = 1.0f;
+        float rate = kNearRate;
+        if (boxPx > 0.0f) {
+            const float gate = kGateFrac * boxPx;
+            const float ae   = std::fabs(error);
+            if (ae < gate) { want = 1.0f - ae / gate; rate = kNearRate;     }
+            else           { want = gate / ae;        rate = kNearDropRate; }
+        }
+        nearW = std::clamp(nearW + (want - nearW) * rate, 0.0f, 1.0f);
+        const float gainScale = kNearFloor + (1.0f - kNearFloor) * nearW;
 
         // ── Derivative: filtered, PER STEP ───────────────────────────────────
         const float a = dt / (dt + kDerivTauSec);
@@ -487,36 +668,10 @@ public:
 
         // Proportional — per step, NOT scaled by dt (its stability bound is a
         // per-sample one; see the class note).
-        float p = kp * ramp * error;
+        float p = kp * ramp * gainScale * error;
 
         // Deadzone: suppress the proportional and derivative terms only.
         if (frozen) { p = 0.0f; d = 0.0f; }
-
-        // ── The gate: the INTEGRAL's transient guard ─────────────────────────
-        // See the header: an integrator can only do harm in a transient, and that
-        // is all this now governs — round 12 removed the feed-forward from its
-        // jurisdiction (see the FF branch below), because gating a MEASUREMENT
-        // protected nothing and latched the loop out of low-alpha tracking. The
-        // threshold is in TARGET WIDTHS, so it means the same thing at any range,
-        // and the integral is ZEROED (not frozen) on the far branch.
-        bool allow = true;
-        if (boxPx > 0.0f) {
-            const float gate = kGateFrac * boxPx;
-            const float tiny = kGateTinyFrac * boxPx;
-            const float ae   = std::fabs(error);
-            if (ae < tiny) {
-                settled = true;
-                stabCount = 0;
-            } else if (ae >= gate) {
-                settled = false;
-                stabCount = 0;
-                integral = 0.0f;      // ZEROED, not frozen — see the header
-            } else {
-                stabCount = (std::fabs(de) < kStabTolPx) ? stabCount + 1 : 0;
-                if (stabCount >= kStabNeed) { settled = true; stabCount = 0; }
-            }
-            allow = settled;
-        }
 
         // ── Feed-forward: reconstruct the target's OWN screen velocity ───────
         // ŵ = Δe + alpha_hat·u(k−L), then scaled to finger px by 1/alpha_hat and
@@ -526,34 +681,53 @@ public:
         // of the ring: the command that actually produced the Δe we are looking
         // at, NOT the previous step's output.
         //
-        // NOT gated by `allow` — deliberately. The gate's rationale is "a lead is
-        // a bet that the target keeps going", but this F is a MEASUREMENT: ŵ is
-        // reconstructed from the Δe just observed, so there is nothing to protect
-        // by suppressing it. Gating it does positive harm, because the gate is a
-        // LATCH: |Δe| < 2 px cannot hold on a strafing target, and the only other
-        // way back in is |e| < 0.06·box — unreachable at low alpha, where holding
-        // a moving target with P alone needs |e| = w/(alpha·kp) (833 px at
-        // alpha = 0.1, kp = 0.06) while the threshold is only 1.5·box. A gated
-        // feed-forward therefore locks ITSELF out exactly in the regime it exists
-        // for — that is the user's "跟不上" (表1/表2: gate shut 80…93 % of frames,
-        // error parked at 475…663 px).
+        // NOT gated. Round 12 established why: F is a MEASUREMENT (ŵ is
+        // reconstructed from the Δe just observed), not the "bet that the target
+        // keeps going" the old gate's rationale describes, so suppressing it
+        // protected nothing and latched the loop out of the regime it exists for.
+        // What guards it instead is the JUMP branch above — which is the
+        // reference's own answer to the same problem (pid (1).cpp:40), and unlike
+        // a latch it cannot get stuck.
+        //
+        // Bounded four ways (round-13 point 3): the reconstruction velocity, the
+        // gain, the resulting command, and a deadband. The bounds are there so
+        // that a wrong alpha_hat is survivable; alpha_hat being right is what
+        // makes F a feed-forward rather than a slow oscillator.
+        //
+        // ASYMMETRIC low-pass (round-13 point 4): a RISING ŵ stays filtered at
+        // kFfTauSec against detector noise, but a FALLING one is followed at
+        // kFfTauFastSec. When a target stops, the old velocity is no longer a
+        // lead — it is pure error — and holding it for the 33 ms a symmetric
+        // filter would is what makes the crosshair sail past and get dragged
+        // back: the user's "目标停下会左右抖几下".
         float ff = 0.0f;
         if (kf > 0.0f && alphaHat > 0.0f && !ffInhibit) {
-            const float af = dt / (dt + kFfTauSec);
-            ffVel += af * ((de + alphaHat * uHist[uHead]) - ffVel);
-            ff = std::clamp(kf * ffVel / alphaHat, -outLimit, outLimit);
+            const float gain = std::min(kf / alphaHat, kFfGainMax);
+            const float meas = std::clamp(de + alphaHat * uHist[uHead],
+                                          -kFfVelMaxPx, kFfVelMaxPx);
+            const float tau  = (std::fabs(meas) < std::fabs(ffVel))
+                                   ? kFfTauFastSec : kFfTauSec;
+            const float af   = dt / (dt + tau);
+            ffVel += af * (meas - ffVel);
+            ff = std::clamp(gain * ffVel, -kFfLimitPx, kFfLimitPx);
+            // Deadband, pid (1).cpp:55 (`|ki_raw| > 0.5` else 0): without it a
+            // small reconstruction wanders around zero at rest and is integrated
+            // by nothing but the detector.
+            if (std::fabs(ff) < kFfDeadbandPx) ff = 0.0f;
         }
         ffInhibit = false;
 
-        // ── Integral: gated, and conditional on saturation ───────────────────
-        // Stop accumulating while the output is already saturated the way the
-        // error wants to push it. Without this the integral builds a reserve
-        // behind a clipped output and spends it later.
+        // ── Integral: scheduled, and conditional on saturation ───────────────
+        // The accumulation is multiplied by gainScale — the reference's
+        // `积分累计 += e*0.5*dt` on its 未达标 branch, made continuous. Stop
+        // accumulating while the output is already saturated the way the error
+        // wants to push it; without this the integral builds a reserve behind a
+        // clipped output and spends it later.
         const float raw = p + integral + d + ff;
         const bool pushHi = raw >=  outLimit && error > 0.0f;
         const bool pushLo = raw <= -outLimit && error < 0.0f;
-        if (allow && !frozen && !pushHi && !pushLo) {
-            integral += ki * error * dt;
+        if (!frozen && !pushHi && !pushLo) {
+            integral += ki * gainScale * error * dt;
             integral  = std::clamp(integral, -trimLimit, trimLimit);
         }
 
@@ -591,8 +765,7 @@ public:
         ffVel     = 0.0f;
         ffInhibit = false;
         uHead     = 0;
-        stabCount = 0;
-        settled   = true;
+        nearW     = 0.0f;
         for (int i = 0; i < kFfDelaySteps; ++i) uHist[i] = 0.0f;
     }
 
@@ -604,10 +777,15 @@ public:
     /// or every frame reports targetChanged). Before round 12 it also settled low
     /// whenever the gate was shut, which at low alpha was most of the time.
     ///
-    /// `integralValue()` is the DC carrier: with kf = 0.20 it supplies most of
-    /// u_ss, so it should be a SIZABLE number on a moving target and near zero on
-    /// a still one. It going to zero and STAYING there while the target strafes
-    /// means the gate never opens — check the box width the caller passes in.
+    /// `integralValue()` is the DC carrier's reserve. It should be modest on a
+    /// moving target and near zero on a still one; pinned at ±trimLimit means the
+    /// carrier is bigger than the leash allows and kf should be carrying more of
+    /// it.
+    ///
+    /// `nearWValue()` is the proximity weight: near 1 while the aim is on target,
+    /// near 0 while it is far off. If it sits at 0 while the crosshair is clearly
+    /// on target, the BOX WIDTH the caller passes in is wrong — the threshold is
+    /// measured in target widths, not pixels.
     float ffValue()        const { return alphaHat > 0.0f ? kf * ffVel / alphaHat : 0.0f; }
     float integralValue()  const { return integral; }
     float lastErrorValue() const { return lastError; }
@@ -619,8 +797,10 @@ public:
     float ffGainValue()    const { return kf; }
     /// The reconstruction constant in force (the estimated plant gain).
     float alphaHatValue()  const { return alphaHat; }
-    /// Whether the current step was judged "settled" (gate open).
-    bool  settledNow()     const { return settled; }
+    /// The proximity weight in force, 0…1 (was the gate's boolean).
+    float nearWValue()     const { return nearW; }
+    /// Kept for the log: "on target" now means the schedule is mostly open.
+    bool  settledNow()     const { return nearW > kNearFloor; }
 
 private:
     float kp        = 0.10f;
@@ -628,7 +808,7 @@ private:
     float kd        = 0.20f;
     float outSmooth = 1.0f;
     float kf        = 1.0f;
-    float alphaHat  = 1.0f;
+    float alphaHat  = kAlphaHatSeed;   // NEVER 1.0 by default — see round 13
 
     // ── State ─────────────────────────────────────────────────────────────────
     float integral  = 0.0f;
@@ -637,14 +817,13 @@ private:
     float deriv     = 0.0f;   // filtered one-step change of the error
     float ramp      = 0.0f;   // soft-start ramp, 0..1
     float ffVel     = 0.0f;   // filtered ŵ, the target's own screen velocity
-    bool  ffInhibit = false;  // one step of silence after a target switch
+    bool  ffInhibit = false;  // one step of silence after a jump or a switch
     float outLimit  = kOutLimitPx;
     float trimLimit = kTrimLimitPx;
 
-    // Gate
-    float boxPx     = 0.0f;   // engaged target's box width; 0 = gate disabled
-    int   stabCount = 0;
-    bool  settled   = true;
+    // Proximity weight (the reference's gain schedule)
+    float boxPx     = 0.0f;   // engaged target's box width; 0 = schedule off
+    float nearW     = 0.0f;   // 0…1, rate-limited; P and I follow it
 
     float uHist[kFfDelaySteps] = {0.0f};  // our own commands, for u(k−L)
     int   uHead    = 0;                   // index of the OLDEST entry
