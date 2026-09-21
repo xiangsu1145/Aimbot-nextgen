@@ -48,6 +48,22 @@ struct Snapshot {
     double   fps = 0.0;           // completed inferences per second
     uint64_t ran = 0, dropped = 0, failed = 0;
 
+    /// Bumped under the SAME lock that replaces `detections`, so a consumer can
+    /// tell a genuinely new detection set from the identical one it already
+    /// processed. `ran` is a worker-thread counter read through a separate
+    /// lock, so it can run one inference ahead of `detections` — a consumer
+    /// that keyed off `ran` would occasionally treat a stale list as fresh and
+    /// then skip the fresh one. This counter and the data it describes move
+    /// together, which is the whole point.
+    ///
+    /// The consumer that needs it is the Kalman tracker: the render loop polls
+    /// at 120 Hz while the detector finishes at ~60 Hz, so half the polls carry
+    /// a repeated list. Re-associating a repeat corrects the predicted centre
+    /// back toward a measurement that is already a frame old, which both drags
+    /// the published position backwards and makes the velocity estimate ring
+    /// instead of converge — measured numbers on MultiTracker::update().
+    uint64_t detSeq = 0;
+
     /// The crop the boxes are valid for, in screen pixels. A box is only
     /// meaningful against the frame it was found in.
     Roi boxesIn;

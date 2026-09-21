@@ -17,6 +17,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include "uinput_inject.h"
 #include "inject_backend.h"
+#include "panel_filter.h"
 
 #include <fcntl.h>
 #include <linux/input.h>
@@ -25,11 +26,14 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <time.h>
 
 #include <android/log.h>
@@ -467,6 +471,20 @@ void upload() {
 /// Finds the real touchscreen by parsing `getevent -p`. Doing it through
 /// getevent avoids needing a direct /dev/input fd just to enumerate devices.
 /// Fills out the path and the panel's coordinate range.
+///
+/// Accepts Protocol B (ABS_MT_SLOT + MT X/Y) unconditionally; Protocol A (no
+/// slot) only with the full direct-touch signature — MT X/Y + BTN_TOUCH +
+/// INPUT_PROP_DIRECT — same gate as touch_reader's live probe. The protocol-A
+/// path exists for Huawei/Honor, whose only touch node ("input_mt_wrapper")
+/// has no ABS_MT_SLOT; the BTN_TOUCH+DIRECT requirements are what keep vivo's
+/// fingerprint-helper nodes (vivo_ts_fp / vivo_fp, MT axes at panel
+/// resolution but no BTN_TOUCH, no DIRECT) out.
+///
+/// Ranks candidates the same way touch_reader's live enumeration does
+/// (INPUT_PROP_DIRECT + extra MT axes, blacklist by name), because the first
+/// passing device in getevent's output order is not necessarily the real
+/// panel — a Bluetooth band mimicking a touchscreen sorts earlier. getevent
+/// prints no bus type, so DIRECT + axis count is all the text fallback has.
 bool detectTouchDeviceViaGetevent(char* outPath, size_t pathSize, int& outMaxX, int& outMaxY) {
     FILE* fp = popen("/system/bin/getevent -p 2>&1", "r");
     if (!fp) {
@@ -474,49 +492,88 @@ bool detectTouchDeviceViaGetevent(char* outPath, size_t pathSize, int& outMaxX, 
         return false;
     }
 
-    char line[512];
-    char currentPath[256] = "";
-    bool hasSlot = false, hasX = false, hasY = false;
-    int maxX = 0, maxY = 0;
-    int deviceCount = 0;
-    bool found = false;
+    struct Candidate {
+        std::string path;
+        int maxX = 0, maxY = 0;
+        int score = 0;
+    };
+    std::vector<Candidate> candidates;
 
-    auto tryCommit = [&]() -> bool {
-        if (deviceCount > 0 && hasSlot && hasX && hasY) {
-            strncpy(outPath, currentPath, pathSize - 1);
-            outPath[pathSize - 1] = '\0';
-            outMaxX = maxX > 0 ? maxX : 0;
-            outMaxY = maxY > 0 ? maxY : 0;
-            LOGD("detected touch device: %s abs=%dx%d", outPath, outMaxX, outMaxY);
-            return true;
+    char line[512];
+    std::string currentPath;
+    bool inDevice = false, skipDevice = false, inKeyBlock = false;
+    bool hasSlot = false, hasX = false, hasY = false, hasDirect = false;
+    bool hasBtnTouch = false;
+    bool hasTracking = false, hasTouchMajor = false, hasPressure = false;
+    int maxX = 0, maxY = 0;
+
+    auto commitCurrent = [&]() {
+        if (inDevice && !skipDevice && hasX && hasY &&
+            (hasSlot || (hasBtnTouch && hasDirect))) {
+            int score = hasDirect ? 1 : 0;
+            if (hasTracking)   ++score;
+            if (hasTouchMajor) ++score;
+            if (hasPressure)   ++score;
+            candidates.push_back({currentPath, maxX, maxY, score});
+            LOGI("getevent candidate %s max=%d,%d slot=%d direct=%d btnTouch=%d score=%d",
+                 currentPath.c_str(), maxX, maxY, hasSlot ? 1 : 0,
+                 hasDirect ? 1 : 0, hasBtnTouch ? 1 : 0, score);
         }
-        return false;
     };
 
     while (fgets(line, sizeof(line), fp)) {
         // New device section: "add device N: /dev/input/eventX"
         if (strstr(line, "add device") && strstr(line, "/dev/input/event")) {
-            if (tryCommit()) { found = true; break; }
+            commitCurrent();
 
             char* p = strstr(line, "/dev/input/event");
             if (p) {
                 char* end = p;
                 while (*end && *end != '\n' && *end != '\r' && *end != ' ') end++;
-                size_t len = static_cast<size_t>(end - p);
-                if (len >= sizeof(currentPath)) len = sizeof(currentPath) - 1;
-                memcpy(currentPath, p, len);
-                currentPath[len] = '\0';
+                currentPath.assign(p, static_cast<size_t>(end - p));
             }
-            deviceCount++;
-            hasSlot = hasX = hasY = false;
+            inDevice = true;
+            skipDevice = false;
+            inKeyBlock = false;
+            hasSlot = hasX = hasY = hasDirect = false;
+            hasBtnTouch = false;
+            hasTracking = hasTouchMajor = hasPressure = false;
             maxX = maxY = 0;
+            continue;
         }
-        // Skip a virtual device we may have created earlier.
-        if (strstr(line, "name:") && strstr(line, "Aimbot")) {
-            hasSlot = hasX = hasY = false;
-            maxX = maxY = 0;
+        if (!inDevice) continue;
+
+        // "name:" comes before the events/props sections, so a device we must
+        // skip (our own earlier uinput device, or a blacklisted accessory) is
+        // flagged here and its later axis lines are ignored entirely.
+        if (strstr(line, "name:")) {
+            skipDevice = strstr(line, "Aimbot") != nullptr ||
+                         isBlacklistedPanelName(line);
+            if (skipDevice) LOGI("getevent: %s blacklisted — skipped", currentPath.c_str());
+            continue;
         }
-        // 002f=ABS_MT_SLOT(47), 0035=ABS_MT_POSITION_X(53), 0036=ABS_MT_POSITION_Y(54).
+        if (skipDevice) continue;
+
+        if (strstr(line, "INPUT_PROP_DIRECT")) hasDirect = true;
+
+        // KEY 块内找 BTN_TOUCH (014a)。getevent 的续行是纯十六进制码，不带
+        // 所属类型头，所以靠"最近一次出现的事件类型头"判断当前行属于哪个块；
+        // 只在 KEY 块里匹配 014a，避免把它误当成其他字段里的数字。
+        if (strstr(line, "KEY (")) {
+            inKeyBlock = true;
+        } else if (strstr(line, "ABS (") || strstr(line, "SW (") ||
+                   strstr(line, "FF (") || strstr(line, "MSC (") ||
+                   strstr(line, "LED (") || strstr(line, "SND (") ||
+                   strstr(line, "REP (") || strstr(line, "EV (")) {
+            inKeyBlock = false;
+        }
+        if (inKeyBlock &&
+            (strstr(line, "014a") || strstr(line, "BTN_TOUCH"))) {
+            hasBtnTouch = true;
+        }
+
+        // 002f=ABS_MT_SLOT(47), 0035=ABS_MT_POSITION_X(53), 0036=ABS_MT_POSITION_Y(54),
+        // 0039=ABS_MT_TRACKING_ID, 0030=ABS_MT_TOUCH_MAJOR, 003a=ABS_MT_PRESSURE.
         // Some Android builds print symbolic names instead — accept both.
         if (strstr(line, "002f") || strstr(line, "ABS_MT_SLOT")) hasSlot = true;
         if (strstr(line, "0035") || strstr(line, "ABS_MT_POSITION_X")) {
@@ -529,11 +586,26 @@ bool detectTouchDeviceViaGetevent(char* outPath, size_t pathSize, int& outMaxX, 
             int val;
             if (sscanf(line, "%*x%*[^m]min %*d, max %d", &val) == 1 && val > 0) maxY = val;
         }
+        if (strstr(line, "0039") || strstr(line, "ABS_MT_TRACKING_ID")) hasTracking = true;
+        if (strstr(line, "0030") || strstr(line, "ABS_MT_TOUCH_MAJOR")) hasTouchMajor = true;
+        if (strstr(line, "003a") || strstr(line, "ABS_MT_PRESSURE")) hasPressure = true;
     }
-    if (!found) found = tryCommit();
+    commitCurrent();
 
     pclose(fp);
-    return found;
+    if (candidates.empty()) return false;
+
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Candidate& a, const Candidate& b) {
+                         return a.score > b.score;
+                     });
+    const Candidate& best = candidates.front();
+    strncpy(outPath, best.path.c_str(), pathSize - 1);
+    outPath[pathSize - 1] = '\0';
+    outMaxX = best.maxX > 0 ? best.maxX : 0;
+    outMaxY = best.maxY > 0 ? best.maxY : 0;
+    LOGD("detected touch device: %s abs=%dx%d", outPath, outMaxX, outMaxY);
+    return true;
 }
 
 // ── Virtual device creation ──────────────────────────────────────────────────

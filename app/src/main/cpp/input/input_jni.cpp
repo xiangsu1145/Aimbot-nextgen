@@ -34,6 +34,7 @@
 #include "touch_reader.h"
 #include "uinput_inject.h"
 #include "ui/gui/aimbot_ui.h"
+#include "ui/gui/hud.h"
 #include "ui/gui/sections/model_section.h"
 #include "ui/gui/sections/touch_section.h"
 
@@ -288,6 +289,15 @@ PREFIX(uiStart)(JNIEnv* env, jobject, jobject surface) {
     return aimbotng::ui::start() ? JNI_TRUE : JNI_FALSE;
 }
 
+/// Panel density from the Kotlin side (densityDpi, see SysDisplay.density()).
+/// Read by the renderer when it sizes text and the ImGui style — see
+/// aimbotng::ui::setUiDensity. ShellLayerHost calls this before every
+/// uiStart, so a rebuilt layer always re-reports.
+JNIEXPORT void JNICALL
+PREFIX(uiSetDensity)(JNIEnv*, jobject, jint dpi) {
+    aimbotng::ui::setUiDensity(dpi);
+}
+
 JNIEXPORT void JNICALL
 PREFIX(uiStop)(JNIEnv*, jobject) {
     aimbotng::ui::stop();
@@ -513,6 +523,33 @@ PREFIX(modelSetClasses)(JNIEnv* env, jobject, jint id, jobjectArray jClasses) {
 JNIEXPORT void JNICALL
 PREFIX(modelLoadFromDisk)(JNIEnv*, jobject) {
     aimbotng::model::loadFromDisk();
+}
+
+// Points the persisted list at the App's shared models directory. Has to run
+// before modelLoadFromDisk — after the first read the store is already in
+// memory and the call is ignored.
+JNIEXPORT void JNICALL
+PREFIX(modelSetStoreDir)(JNIEnv* env, jobject, jstring jDir) {
+    if (jDir == nullptr) return;
+    const char* dir = env->GetStringUTFChars(jDir, nullptr);
+    if (dir == nullptr) return;
+    aimbotng::model::setStoreDir(dir);
+    env->ReleaseStringUTFChars(jDir, dir);
+}
+
+// One-call import for the App's 模型工厂 page: everything about the entry —
+// engine, thresholds, probed input size and class count — is decided here on
+// the C++ side, so the App cannot drift from what the in-menu Add dialog
+// would have produced. Returns the entry id (existing one when the path is
+// already registered) or -1.
+JNIEXPORT jint JNICALL
+PREFIX(modelAddDefault)(JNIEnv* env, jobject, jstring jPath) {
+    if (jPath == nullptr) return static_cast<jint>(-1);
+    const char* path = env->GetStringUTFChars(jPath, nullptr);
+    if (path == nullptr) return static_cast<jint>(-1);
+    const jint id = static_cast<jint>(aimbotng::model::addDefault(path));
+    env->ReleaseStringUTFChars(jPath, path);
+    return id;
 }
 
 // ── Inference, for scripts ─────────────────────────────────────────────────

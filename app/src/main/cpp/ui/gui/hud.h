@@ -11,8 +11,13 @@
 //
 //  Geometry: the board holds a strict 4:3 aspect ratio and is derived from the
 //  surface resolution every frame, so it lands the same way on a 1080p panel
-//  and on the 2K panel of this device — no hardcoded pixel sizes, no density
-//  lookups. Content sizes itself through hudScale(), the same way.
+//  and on the 2K panel of this device — no hardcoded pixel sizes. Content
+//  sizes itself through hudScale(), a screen fraction. On a phone that
+//  fraction leaves text physically tiny, so two density-derived factors from
+//  the panel (setUiDensity → uiScale/textBoost, see below) come in on top:
+//  uiScale() anchors physical-size elements (ImGui style, toasts, float
+//  button) in dp, and tsize()/textBoost() enlarge text inside the board
+//  without moving the layout boxes.
 //
 //  Colour: two greys — a darker content pane on the right, a lighter rail down
 //  the left — behind a blue accent for the active rail entry. The swapchain is
@@ -128,6 +133,48 @@ HudRect hudRect();
 /// future content metric (padding, font size, row height) by this so the board
 /// keeps its proportions on every resolution.
 float hudScale();
+
+// ── Density-derived scaling ─────────────────────────────────────────────────
+//
+// hudScale() is a screen *fraction*: the board already spans the panel, so it
+// cannot grow with density — and on a phone that leaves its design-px text
+// physically tiny. These three give the UI a physical anchor instead:
+//
+//   * uiScale()   — the classic dp ratio (densityDpi/160), for anything that
+//                   must keep its physical size across panels: the ImGui
+//                   style, floating elements (toasts, float button).
+//   * textBoost() — a text-only readability multiplier, applied on top of
+//                   hudScale() through tsize(). Clamped tightly so boosted
+//                   text can never overflow the unboosted layout boxes.
+
+/// Records the panel density (`densityDpi`, reported by ShellLayerHost when
+/// the layer is built). Call before the renderer starts; 0 or negative is
+/// ignored, and until something is set a 420dpi phone is assumed.
+void setUiDensity(int dpi);
+
+/// Physical scale: densityDpi/160, clamped to [1.0, 4.0]. Defaults to the
+/// 420dpi-phone value until setUiDensity() reports the real panel.
+float uiScale();
+
+/// Readability/touch-size multiplier on top of hudScale(), shared by text
+/// (tsize) and control geometry (csize) so rows keep their proportions. Every
+/// panel gets at least +20 %; the cap at 1.7 sets how chunky the biggest
+/// panels render — raise it for fewer, larger controls per screen.
+float textBoost();
+
+/// Applies textBoost() to a design-px text size. Wrap every *text* size where
+/// it meets the layout scale — `tsize(kNavTextSize) * s`, and the same
+/// expression for its matching CalcTextSizeA — while boxes, paddings and hit
+/// rects stay unboosted.
+inline float tsize(float designPx) { return designPx * textBoost(); }
+
+/// Control-geometry boost — the same factor as tsize(), applied to the *touch
+/// targets* instead: row heights, switch grooves, slider tracks, dialog
+/// padding, the gaps between rows. Controls grow with their text so the
+/// proportions inside a row are preserved, and a page simply fits fewer rows —
+/// which is the point; the scrollable pages take up the slack. Hit rects need
+/// no separate work: they are built from the same constants.
+inline float csize(float designPx) { return designPx * textBoost(); }
 
 /// Live alpha (0..1) the HUD is currently fading at — 0 when fully hidden, 1
 /// when fully shown. Set by drawHud() every frame; widgets without a Xf

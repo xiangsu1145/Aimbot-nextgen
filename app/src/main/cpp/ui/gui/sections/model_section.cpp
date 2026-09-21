@@ -337,7 +337,7 @@ void drawFileBrowser(ImDrawList* dl, const HudRect& board, float s, float es, co
     // Header: title + X close.
     const float titleH = widgets::dialogHeaderHeight(es);
     const float padX = widgets::dialogInnerPad(es);
-    dl->AddText(font, 36.0f * s,
+    dl->AddText(font, tsize(36.0f) * s,
                 ImVec2(card.x + padX, card.y + (titleH - 36.0f * s) * 0.5f),
                 xf.col(TextPrimary), "Select Model");
     const float xBtn = 50.0f * s;
@@ -352,7 +352,7 @@ void drawFileBrowser(ImDrawList* dl, const HudRect& board, float s, float es, co
     float yc = card.y + titleH + 18.0f * s;
 
     // Current path.
-    dl->AddText(font, 20.0f * s, ImVec2(card.x + padX, yc),
+    dl->AddText(font, tsize(20.0f) * s, ImVec2(card.x + padX, yc),
                 xf.col(TextMuted), fb.dir.c_str());
     yc += 32.0f * s;
 
@@ -361,13 +361,13 @@ void drawFileBrowser(ImDrawList* dl, const HudRect& board, float s, float es, co
     const float chipGap = 10.0f * s;
     float cx = card.x + padX;
     for (const QuickFolder& q : kQuickFolders) {
-        const ImVec2 ts = font->CalcTextSizeA(22.0f * s, FLT_MAX, 0.0f, q.label);
+        const ImVec2 ts = font->CalcTextSizeA(tsize(22.0f) * s, FLT_MAX, 0.0f, q.label);
         const float chipW = ts.x + 40.0f * s;
         widgets::Rect chip{cx, yc, chipW, chipH};
         const bool held = ImGui::IsMouseDown(ImGuiMouseButton_Left) && hitRect(io.MousePos, chip);
         dl->AddRectFilled(ImVec2(chip.x, chip.y), ImVec2(chip.x + chip.w, chip.y + chip.h),
                           xf.col(held ? ControlBgHi : ControlBg), xf.s(10.0f * s));
-        dl->AddText(font, 22.0f * s,
+        dl->AddText(font, tsize(22.0f) * s,
                     ImVec2(chip.x + (chip.w - ts.x) * 0.5f,
                            chip.y + (chip.h - ts.y) * 0.5f),
                     xf.col(TextPrimary), q.label);
@@ -432,7 +432,7 @@ void drawFileBrowser(ImDrawList* dl, const HudRect& board, float s, float es, co
     dl->PushClipRect(ImVec2(listRect.x, listRect.y),
                      ImVec2(listRect.x + listRect.w, listRect.y + listRect.h), true);
 
-    const float rowSz = 24.0f * s;
+    const float rowSz = tsize(24.0f) * s;
     auto paintRow = [&](const char* label, ImU32 col, int index) {
         const float rowY = listRect.y - fb.scroll + index * rowH;
         const widgets::Rect row{listRect.x, rowY, listRect.w, rowH};
@@ -485,7 +485,7 @@ void drawFileBrowser(ImDrawList* dl, const HudRect& board, float s, float es, co
     }
 
     if (!fb.error.empty()) {
-        dl->AddText(font, 20.0f * s, ImVec2(listRect.x, listRect.y + 8.0f * s),
+        dl->AddText(font, tsize(20.0f) * s, ImVec2(listRect.x, listRect.y + 8.0f * s),
                     xf.col(IM_COL32(255, 96, 96, 255)), fb.error.c_str());
     }
 
@@ -541,7 +541,7 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     const float titleH = widgets::dialogHeaderHeight(es);
     const float titlePadX = widgets::dialogInnerPad(es);
     ImFont* font = ImGui::GetFont();
-    dl->AddText(font, 36.0f * s,
+    dl->AddText(font, tsize(36.0f) * s,
                 ImVec2(card.x + titlePadX, card.y + (titleH - 36.0f * s) * 0.5f),
                 xf.col(TextPrimary), "添加模型");
     const float xBtn = 50.0f * s;
@@ -571,7 +571,7 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     }
     yc += 78.0f * s + padY;
     if (pg.pathFailed && pg.pathErr[0] != '\0') {
-        dl->AddText(font, 18.0f * s, ImVec2(card.x + padX, yc),
+        dl->AddText(font, tsize(18.0f) * s, ImVec2(card.x + padX, yc),
                     xf.col(IM_COL32(255, 96, 96, 255)), pg.pathErr);
         yc += 28.0f * s;
     }
@@ -726,7 +726,7 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
     const float titleH = widgets::dialogHeaderHeight(es);
     const float padX = widgets::dialogInnerPad(es);
     ImFont* font = ImGui::GetFont();
-    dl->AddText(font, 36.0f * s,
+    dl->AddText(font, tsize(36.0f) * s,
                 ImVec2(card.x + padX, card.y + (titleH - 36.0f * s) * 0.5f),
                 xf.col(TextPrimary), "模型设置");
     const float xBtn = 50.0f * s;
@@ -746,7 +746,7 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
         if (e.id == pg.settingsId) { current = e; found = true; break; }
     }
     if (!found) {
-        dl->AddText(font, 22.0f * s,
+        dl->AddText(font, tsize(22.0f) * s,
                     ImVec2(card.x + padX, card.y + titleH + 30.0f * s),
                     xf.col(TextMuted), "该模型已不存在");
         if (widgets::button(dl, {card.x + padX, card.y + titleH + 80.0f * s,
@@ -768,7 +768,7 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
 
     // The file, for orientation: two dialogs deep, "which model is this?"
     // is a fair question, and the path is the only thing that answers it.
-    dl->AddText(font, 18.0f * s, ImVec2(card.x + padX, yc),
+    dl->AddText(font, tsize(18.0f) * s, ImVec2(card.x + padX, yc),
                 xf.col(TextMuted), current.path.c_str());
     yc += 32.0f * s + padY;
 
@@ -952,7 +952,7 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
     const float rowH = kModelRowH * s;
     auto entries = model::all();
     if (entries.empty()) {
-        dl->AddText(font, 22.0f * s, xf.pt(ImVec2(x, y + 24.0f * s)),
+        dl->AddText(font, tsize(22.0f) * s, xf.pt(ImVec2(x, y + 24.0f * s)),
                     xf.col(TextMuted), "No models yet — tap Add Model above.");
     }
     for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
@@ -1011,12 +1011,12 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
                  detail[0] ? "  •  " : "",
                  detail,
                  e.loaded ? "  •  LOADED" : "");
-        const std::string cut1 = ellipsize(font, 24.0f * s, line1, textMaxW);
-        const std::string cut2 = ellipsize(font, 18.0f * s, line2, textMaxW);
-        dl->AddText(font, 24.0f * s,
+        const std::string cut1 = ellipsize(font, tsize(24.0f) * s, line1, textMaxW);
+        const std::string cut2 = ellipsize(font, tsize(18.0f) * s, line2, textMaxW);
+        dl->AddText(font, tsize(24.0f) * s,
                     xf.pt(ImVec2(row.x + 18.0f * s, row.y + 12.0f * s)),
                     xf.col(TextPrimary), cut1.c_str());
-        dl->AddText(font, 18.0f * s,
+        dl->AddText(font, tsize(18.0f) * s,
                     xf.pt(ImVec2(row.x + 18.0f * s, row.y + row.h - 30.0f * s)),
                     xf.col(TextMuted), cut2.c_str());
 
@@ -1315,7 +1315,7 @@ void drawCompilingDialog(ImDrawList* dl, const HudRect& board, float s, float es
     char line1[192];
     snprintf(line1, sizeof(line1), "%s%s", title, dots);
 
-    dl->AddText(font, 28.0f * s,
+    dl->AddText(font, tsize(28.0f) * s,
                 ImVec2(cmin.x + padX, cmin.y + 36.0f * s),
                 xf.col(TextPrimary), line1);
 
@@ -1326,7 +1326,7 @@ void drawCompilingDialog(ImDrawList* dl, const HudRect& board, float s, float es
         snprintf(sub, sizeof(sub), "%s  •  %s",
                  model::kindLabel(e.kind),
                  model::engineLabel(e.engine));
-        dl->AddText(font, 18.0f * s,
+        dl->AddText(font, tsize(18.0f) * s,
                     ImVec2(cmin.x + padX, cmin.y + 86.0f * s),
                     xf.col(TextMuted), sub);
     }
@@ -1347,8 +1347,8 @@ void drawCompilingDialog(ImDrawList* dl, const HudRect& board, float s, float es
         snprintf(msg, sizeof(msg), "加载失败: %s",
                  pg.compileError.empty() ? "(无详细信息)" : pg.compileError.c_str());
         const std::string cut = ellipsize(
-            font, 18.0f * s, msg, w - 2.0f * padX - 16.0f * s);
-        dl->AddText(font, 18.0f * s,
+            font, tsize(18.0f) * s, msg, w - 2.0f * padX - 16.0f * s);
+        dl->AddText(font, tsize(18.0f) * s,
                     ImVec2(cmin.x + padX, cmax.y - btnH - 24.0f * s - 36.0f * s),
                     xf.col(IM_COL32(255, 96, 96, 255)), cut.c_str());
     }
@@ -1386,13 +1386,13 @@ void drawNoModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
 
     ImFont* font = ImGui::GetFont();
     const float padX = 40.0f * s;
-    dl->AddText(font, 30.0f * s,
+    dl->AddText(font, tsize(30.0f) * s,
                 ImVec2(cmin.x + padX, cmin.y + 36.0f * s),
                 xf.col(TextPrimary), "未选择模型");
-    dl->AddText(font, 20.0f * s,
+    dl->AddText(font, tsize(20.0f) * s,
                 ImVec2(cmin.x + padX, cmin.y + 92.0f * s),
                 xf.col(TextMuted), "请先在模型列表中点击 Load");
-    dl->AddText(font, 20.0f * s,
+    dl->AddText(font, tsize(20.0f) * s,
                 ImVec2(cmin.x + padX, cmin.y + 122.0f * s),
                 xf.col(TextMuted), "选择一个模型，再打开推理开关。");
 

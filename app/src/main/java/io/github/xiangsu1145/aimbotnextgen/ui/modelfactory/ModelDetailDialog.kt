@@ -21,6 +21,8 @@ import io.github.xiangsu1145.aimbotnextgen.model.ModelInfo
 import io.github.xiangsu1145.aimbotnextgen.model.ModelFormat
 import io.github.xiangsu1145.aimbotnextgen.model.ModelRepository
 import io.github.xiangsu1145.aimbotnextgen.ui.theme.AimbotColors
+import io.github.xiangsu1145.aimbotnextgen.shell.ShellController
+import java.io.File
 
 /**
  * Model detail dialog.
@@ -85,8 +87,15 @@ class ModelDetailDialog(
             .start()
 
         ModelDownloadManager.addListener(this)
-        // A task for this model may already be running from a previous dialog.
-        ModelDownloadManager.taskFor(model.modelId)?.let { renderTask(it) }
+        // A task for this model may already exist from a previous dialog. Only
+        // a live or just-failed task re-opens in PROGRESS mode. A COMPLETED task
+        // never leaves the manager's map, so rendering it here would pin every
+        // later visit to the full-bar-and-"完成" card until process death, even
+        // though the file has long been on disk — renderInfo() (already run by
+        // buildContent) is the truthful state then.
+        ModelDownloadManager.taskFor(model.modelId)?.let { task ->
+            if (task.state != ModelDownloadManager.State.COMPLETED) renderTask(task)
+        }
     }
 
     fun dismiss() {
@@ -145,6 +154,10 @@ class ModelDetailDialog(
             trackThickness = ctx.dp(6)
             setIndicatorColor(AimbotColors.PRIMARY)
             setTrackColor(AimbotColors.SURFACE_VARIANT)
+            // Material 3 paints a small "stop indicator" dot in the indicator
+            // colour at the far right end of the track by default; this design
+            // has no place for it, so shrink it away entirely.
+            setTrackStopIndicatorSize(0)
             layoutParams = matchParentWrapContent().apply { topMargin = ctx.dp(6) }
         }
         val text = TextView(ctx).apply {
@@ -187,13 +200,11 @@ class ModelDetailDialog(
         }
         val cancel = button("取消", filled = false)
         val action = button("下载", filled = true)
-        // 导入：已下载模型的占位入口（真实导入逻辑后续对接）。
+        // 导入：把已下载的模型文件登记进 daemon 的模型列表（按 C++ 默认参数）。
         val import = button("导入", filled = false).apply {
             setTextColor(AimbotColors.ON_PRIMARY_CONTAINER)
             setBackgroundColor(AimbotColors.PRIMARY_CONTAINER)
-            setOnClickListener {
-                Toast.makeText(activity, "导入功能对接中", Toast.LENGTH_SHORT).show()
-            }
+            setOnClickListener { importModel() }
         }
         importButton = import
         btnRow.addView(cancel)
@@ -248,6 +259,43 @@ class ModelDetailDialog(
         }
         progressHost?.visibility = View.VISIBLE
         renderTask(task)
+    }
+
+    /**
+     * 导入：把已下载的模型文件登记进 shell daemon 的模型列表。
+     *
+     * The file already sits in the shared models dir
+     * (/sdcard/Android/data/<pkg>/models/…), which the shell-uid daemon reads
+     * directly, and the model store itself lives in the same dir now — so the
+     * whole import is one `IMPORT <path>` protocol command. The daemon's
+     * native store decides every parameter (default engine for the kind,
+     * confidence 0.5, threads 1, HTP perf 1, probed input size / class count /
+     * tensor type) and answers `OK:<id>` / `ERR:<why>`; the App never writes
+     * the store itself, because the daemon keeps the list in memory and
+     * rewrites the file on every menu mutation.
+     */
+    private fun importModel() {
+        val controller = ShellController.get(activity)
+        if (!controller.isRunning) {
+            Toast.makeText(activity, "Shell 未运行，无法导入", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val file = File(ModelRepository.targetDir(activity, model.format), model.fileName)
+        if (!file.isFile) {
+            Toast.makeText(activity, "模型文件不存在", Toast.LENGTH_SHORT).show()
+            return
+        }
+        importButton?.isEnabled = false
+        Toast.makeText(activity, "正在导入…", Toast.LENGTH_SHORT).show()
+        controller.request("IMPORT ${file.absolutePath}") { reply ->
+            importButton?.isEnabled = true
+            val msg = when {
+                reply == null -> "导入失败：Shell 无响应"
+                reply.startsWith("OK:") -> "导入成功，可在悬浮窗的模型列表查看"
+                else -> "导入失败：${reply.removePrefix("ERR:").removePrefix("IMPORT: ")}"
+            }
+            Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
+        }
     }
 
     /** Renders whatever the given task currently looks like. */
@@ -310,7 +358,20 @@ class ModelDetailDialog(
 
     override fun onTasksChanged() {
         val task = ModelDownloadManager.taskFor(model.modelId) ?: return
-        activity.runOnUiThread { if (dialog?.isShowing == true) renderTask(task) }
+        activity.runOnUiThread {
+            if (dialog?.isShowing != true) return@runOnUiThread
+            // A COMPLETED task is only worth showing while the progress section
+            // is already up — i.e. the download finished inside this very
+            // dialog. Anything else (a re-opened dialog, a change triggered by
+            // some other model's task) must not drag the dialog back into the
+            // progress card; the info state (导入/删除) is the truthful one.
+            if (task.state == ModelDownloadManager.State.COMPLETED &&
+                progressHost?.visibility != View.VISIBLE
+            ) {
+                return@runOnUiThread
+            }
+            renderTask(task)
+        }
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

@@ -116,3 +116,6 @@ tools/ida_mcp_probe.py
 app/src.zip
 app/src (2).zip
 app/src/main/jniLibs/
+
+# 工具计划缓存（AI 编码助手生成，不入库）
+.zcode/

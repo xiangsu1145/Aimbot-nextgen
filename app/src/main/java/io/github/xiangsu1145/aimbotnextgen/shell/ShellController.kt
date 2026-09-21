@@ -113,6 +113,17 @@ class ShellController private constructor(context: Context) {
     /** Sends a raw protocol line to the daemon (e.g. "SINK 0"). */
     fun sendCommand(command: String) = manager?.sendCommand(command)
 
+    /**
+     * Sends a protocol line and delivers the daemon's valued reply
+     * (`OK:<value>` / `ERR:<message>`, distinguished by prefix) to [onReply],
+     * or null on timeout / when no daemon is bound. The callback runs on the
+     * main thread, so it may show a Toast directly.
+     */
+    fun request(command: String, timeoutMs: Long = 10_000, onReply: (String?) -> Unit) {
+        val m = manager ?: run { onReply(null); return }
+        m.requestAsync(command, timeoutMs, onReply)
+    }
+
     /** Stops the shell service and tears down the connection. */
     fun stop() {
         manager?.stop()

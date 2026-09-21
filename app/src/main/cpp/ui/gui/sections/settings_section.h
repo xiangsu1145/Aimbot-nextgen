@@ -41,9 +41,18 @@ struct PageSettings {
 
     /// Multi-target Kalman tracker tuning (see tracking/kalman_tracker.h).
     /// Written into tracking::trackerConfig() by syncSettingsPage().
-    widgets::SliderState trackIou{0.5f, 0.1f, 0.9f, 0.05f};        // min IoU to associate
-    widgets::SliderState trackConfirm{1.0f, 1.0f, 10.0f, 1.0f};    // frames to confirm a track
-    widgets::SliderState trackTerminate{5.0f, 1.0f, 30.0f, 1.0f};  // missed frames before drop
+    ///
+    /// trackIou is the minimum association score. It used to be a bare IoU
+    /// threshold at 0.5, which a fast target can never clear: a box 100 px wide
+    /// crossing at 60 px per detector frame overlaps its previous position with
+    /// IoU ≈ 0.2, so the track was dropped and recreated every frame — id churn,
+    /// a jittering box, and a velocity pinned at 0 because a new track starts
+    /// from rest. The score now also carries a centre-distance term (see
+    /// matchAndUpdate), so 0.15 keeps fast targets attached to their own track.
+    /// Raise it only if two different enemies get merged into one track.
+    widgets::SliderState trackIou{0.15f, 0.05f, 0.6f, 0.05f};         // min association score
+    widgets::SliderState trackConfirm{1.0f, 1.0f, 10.0f, 1.0f};      // frames to confirm a track
+    widgets::SliderState trackTerminate{5.0f, 1.0f, 10.0f, 1.0f};    // missed frames before drop
 
     // ── Inference trigger ─────────────────────────────────────────────────
     //

@@ -92,8 +92,8 @@ void drawCapturePreview(ImDrawList* dl, float x, float y, float w, float h,
 void drawCaptureSection(ImDrawList* dl, float x, float& y, float w,
                         float bottomY, float s, float es, const Xf& xf,
                         Scroll& sc) {
-    const float gap   = 12.0f * s;
-    const float rowSl = widgets::kSliderRowH * s;
+    const float gap   = csize(12.0f) * s;
+    const float rowSl = csize(widgets::kSliderRowH) * s;
 
     auto wRect = [&](float wx, float wy, float ww, float wh) {
         // Capture page does not scroll (see sectionIsScrollable), so the offset

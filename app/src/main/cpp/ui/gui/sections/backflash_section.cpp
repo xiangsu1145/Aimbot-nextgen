@@ -142,6 +142,7 @@ inline void drawCornerHandles(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx
 inline void drawCentredLabel(ImDrawList* dl, const ImVec2& center, float size,
                              ImU32 col, const char* text) {
     ImFont* font = ImGui::GetFont();
+    size = tsize(size);  // readability boost — measure and draw on the same size
     const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
     dl->AddText(font, size,
                 ImVec2(center.x - ts.x * 0.5f, center.y - ts.y * 0.5f),
@@ -415,10 +416,10 @@ void BackFlashCategoryState::syncFromModel(
 void drawBackFlashSection(ImDrawList* dl, float x, float& y, float w,
                           float /*bottomY*/, float s, float es, const Xf& xf,
                           Scroll& sc) {
-    const float gap   = 12.0f * s;
-    const float rowSw = widgets::kSwitchRowH   * s;
-    const float rowSl = widgets::kSliderRowH   * s;
-    const float rowDd = widgets::kDropdownRowH * s;
+    const float gap   = csize(12.0f) * s;
+    const float rowSw = csize(widgets::kSwitchRowH)   * s;
+    const float rowSl = csize(widgets::kSliderRowH)   * s;
+    const float rowDd = csize(widgets::kDropdownRowH) * s;
 
     auto wRect = [&](float wx, float wy, float ww, float wh) {
         // Apply the page's scroll offset so paint and hit-test agree. `y`

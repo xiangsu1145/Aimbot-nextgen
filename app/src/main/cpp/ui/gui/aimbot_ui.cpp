@@ -32,6 +32,9 @@
 #include "ui/gui/float_button.h"
 #include "ui/gui/notify.h"
 #include "ui/gui/sections/settings_section.h"
+// For sections::aimIsDriving(), which the frame-rate tier below consults so the
+// aim loop runs at the display's rate while a target is engaged.
+#include "ui/gui/sections/aim_section.h"
 
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
@@ -1403,6 +1406,13 @@ bool initImGui() {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     ImGui::StyleColorsDark();
+    // The defaults are desktop-sized; on a phone panel every padding and the
+    // base font size have to come up to physical (dp) dimensions. TouchExtra-
+    // Padding is applied after the scaling so it adds a fixed touch slack on
+    // top rather than being scaled from zero.
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(uiScale());
+    style.TouchExtraPadding = ImVec2(2.0f, 2.0f);
     ImGui_ImplAndroid_Init(g_window);
 
     // Register the embedded fonts on the atlas *before* the Vulkan backend is
@@ -1601,8 +1611,25 @@ void* renderThread(void*) {
         // aiming, which is exactly the case the dormant tier must not catch.
         const bool inferring = infer::runtime::wantsFrames() ||
                                sections::holdToInferHeld();
+        // Aiming outranks the detector tier, and the reason is arithmetic rather
+        // than preference. The finger is advanced once per render frame, so a
+        // 720 px/s target moves it 12 px per step at 60 fps and 6 px at 120 fps:
+        // the 12 px staircase is what "不丝滑" looks like. Worse, the control
+        // loop's delay is counted in FRAMES, so halving the frame period halves
+        // the delay in milliseconds and doubles the phase margin — which is what
+        // makes a tighter lock (higher Kp) affordable instead of oscillatory.
+        // The tracker is fed from this same pass, so at 60 fps it was being shown
+        // every other detection and half a 120 fps detector's output was dropped
+        // on the floor. This overlap with `inferring` is deliberate: the detector
+        // wants 60, the aim wants the native rate, and the native rate is the
+        // safe superset. Paid only while a target is engaged — the moment the aim
+        // lets go, the tier falls back on its own.
+        const bool aiming = sections::aimIsDriving();
         int64_t periodUs;
         if (idleFor < kActiveHoldUs) {
+            periodUs = kFramePeriodUs;
+            pacedFps = kTargetFps;
+        } else if (aiming) {
             periodUs = kFramePeriodUs;
             pacedFps = kTargetFps;
         } else if (inferring) {
@@ -1625,14 +1652,24 @@ void* renderThread(void*) {
         }
 
         // ── Follow with the panel vote ──────────────────────────────────────
-        // Only the fully-hidden case hands the refresh rate back. While the
-        // board is up there is usually a game on screen behind it, and this
-        // layer does not get to throttle someone else's frame rate — a panel
+        // The fully-hidden case hands the refresh rate back — but NOT while the
+        // aim is driving a finger, and that exception is load-bearing. The loop's
+        // delay, in SECONDS, is what sets the largest stable kp: halving the
+        // panel rate doubles that delay and halves the phase margin, so a kp the
+        // user tuned while the menu was open starts ringing the moment they
+        // dismiss it and actually play. Measured in scripts/aim_loop_sim.py: at
+        // alpha = 1.0 the first gain that rings goes from 0.25 at L = 6 steps to
+        // 0.10 at L = 9, and L is measured in frames. So aiming keeps the vote.
+        //
+        // While the board is up there is usually a game on screen behind it, and
+        // this layer does not get to throttle someone else's frame rate — a panel
         // vote is a device-wide decision, not a per-layer one. Raising is
-        // immediate; lowering waits out kVoteHoldUs so closing and reopening
-        // the menu quickly does not strobe the display.
+        // immediate; lowering waits out kVoteHoldUs so closing and reopening the
+        // menu quickly does not strobe the display.
         {
-            const float wantVote = hidden ? 0.0f : static_cast<float>(kTargetFps);
+            const float wantVote = (hidden && !aiming)
+                                       ? 0.0f
+                                       : static_cast<float>(kTargetFps);
             if (wantVote > g_votedFps) {
                 voteFrameRate(wantVote);
                 heldVoteSinceUs = frameStartUs;

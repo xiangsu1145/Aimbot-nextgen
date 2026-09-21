@@ -94,6 +94,42 @@ constexpr float kChevronH       = 8.0f;    // y extent — than it is tall, so t
 constexpr float kChevronThick   = 3.4f;
 constexpr float kPi             = 3.14159265358979323846f;
 
+// ── Dropdown / multi-select shared placement ─────────────────────────────────
+//
+// The open list expands downward from the selector by default. When the full
+// list would run past the bottom of the screen it is cut off there (the list
+// paints on the foreground draw list, so the panel edge is the only clip) —
+// the bottom entries would be unreachable. In that case, and when there is
+// actually room above, the list opens upward from above the field instead.
+// Both the paint paths and the hit-test paths take their `listTop` from here,
+// so they can never disagree about where the items are.
+struct DropdownGeom {
+    Rect  field;    // the selector pill inside the row
+    float listTop;  // top edge of the open list
+    bool  upward;   // true = opened upward (reveal grows from the bottom edge)
+};
+
+DropdownGeom dropdownGeom(const Rect& r, int count, float s) {
+    const float insetY = csize(kDropdownInsetY) * s;
+    DropdownGeom g;
+    g.field = Rect{r.x + r.w * 0.5f, r.y + insetY, r.w * 0.5f, r.h - insetY * 2.0f};
+    g.upward = false;
+
+    const float listH  = count * csize(kDropdownItemH) * s;
+    const float gap    = csize(kDropdownGap) * s;
+    const float downTop = g.field.y + g.field.h + gap;
+    const float screenH = ImGui::GetIO().DisplaySize.y;
+
+    if (downTop + listH > screenH - gap &&
+        g.field.y - gap - listH >= 0.0f) {
+        g.upward  = true;
+        g.listTop = g.field.y - gap - listH;   // bottom edge sits just above the field
+    } else {
+        g.listTop = downTop;
+    }
+    return g;
+}
+
 // ── Small helpers ────────────────────────────────────────────────────────────
 
 bool inside(const ImVec2& p, const Rect& r) {
@@ -122,12 +158,14 @@ float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
 void textLeft(ImDrawList* dl, float x, float centreY, float size, ImU32 col, const char* text) {
     ImFont* f = ImGui::GetFont();
+    size = tsize(size);  // readability boost — measure and draw on the same size
     const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
     dl->AddText(f, size, ImVec2(x, centreY - ts.y * 0.5f), fadeCol(col), text);
 }
 
 void textRight(ImDrawList* dl, float xRight, float centreY, float size, ImU32 col, const char* text) {
     ImFont* f = ImGui::GetFont();
+    size = tsize(size);  // readability boost — measure and draw on the same size
     const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
     dl->AddText(f, size, ImVec2(xRight - ts.x, centreY - ts.y * 0.5f), fadeCol(col), text);
 }
@@ -177,8 +215,8 @@ void roundSegment(ImDrawList* dl, const ImVec2& a, const ImVec2& b, float r, ImU
 void drawSwitchTrack(ImDrawList* dl, const Rect& r, float anim, float s,
                      Rect* trackRect, float dim = 1.0f) {
     const float cy     = r.y + r.h * 0.5f;
-    const float trackW = kSwitchTrackW * s;
-    const float trackH = kSwitchTrackH * s;
+    const float trackW = csize(kSwitchTrackW) * s;
+    const float trackH = csize(kSwitchTrackH) * s;
     const ImVec2 min(r.x + r.w - trackW, cy - trackH * 0.5f);
 
     // `dim` lerps the accent contribution toward zero so an "off because the
@@ -197,7 +235,7 @@ void drawSwitchTrack(ImDrawList* dl, const Rect& r, float anim, float s,
     const uint32_t knobA = static_cast<uint32_t>(
         (static_cast<float>((Knob >> IM_COL32_A_SHIFT) & 0xFFu)) * dim);
     const ImU32 knob = (Knob & 0x00FFFFFFu) | (knobA << IM_COL32_A_SHIFT);
-    dl->AddCircleFilled(ImVec2(knobX, cy), kSwitchKnobR * s, fadeCol(knob));
+    dl->AddCircleFilled(ImVec2(knobX, cy), csize(kSwitchKnobR) * s, fadeCol(knob));
 
     if (trackRect != nullptr) {
         trackRect->x = min.x;
@@ -302,12 +340,12 @@ bool sliderFloat(ImDrawList* dl, const Rect& r, SliderState& st,
     // can land near the groove without having to be precise. The label and
     // the value readout are inert — tapping them does nothing. Skip when a
     // sibling has already claimed the gesture (touch-through fix).
-    const float titleCy = r.y + kSliderTitleCy * s;
-    const float trackCy = r.y + kSliderTrackCy * s;
-    const float trackH  = kSliderTrackH * s;
-    const float thumbR  = kSliderThumbR * s * (1.0f + kSliderThumbGrow * st.press);
-    const float trackX0 = r.x + kSliderThumbR * s;
-    const float trackX1 = r.x + r.w - kSliderThumbR * s;
+    const float titleCy = r.y + csize(kSliderTitleCy) * s;
+    const float trackCy = r.y + csize(kSliderTrackCy) * s;
+    const float trackH  = csize(kSliderTrackH) * s;
+    const float thumbR  = csize(kSliderThumbR) * s * (1.0f + kSliderThumbGrow * st.press);
+    const float trackX0 = r.x + csize(kSliderThumbR) * s;
+    const float trackX1 = r.x + r.w - csize(kSliderThumbR) * s;
     const float trackW  = trackX1 - trackX0;
     // Vertical pad = thumb radius + a bit, so the rounded ends of the thumb
     // are as easy to land on as the line. Horizontal = the thumb at rest.
@@ -384,7 +422,7 @@ bool sliderFloat(ImDrawList* dl, const Rect& r, SliderState& st,
 // ── Dropdown ─────────────────────────────────────────────────────────────────
 
 float dropdownListHeight(int count, float s) {
-    return count * kDropdownItemH * s;
+    return count * csize(kDropdownItemH) * s;
 }
 
 bool dropdown(ImDrawList* dl, const Rect& r, DropdownState& st,
@@ -396,18 +434,14 @@ bool dropdown(ImDrawList* dl, const Rect& r, DropdownState& st,
     st.anim = approach(st.anim, st.open ? 1.0f : 0.0f, kDropdownAnimRate, io.DeltaTime);
 
     const float cy    = r.y + r.h * 0.5f;
-    const float padX  = kDropdownPadX * s;
-    const float itemH = kDropdownItemH * s;
+    const float padX  = csize(kDropdownPadX) * s;
+    const float itemH = csize(kDropdownItemH) * s;
 
-    // The row is split down the middle: the title keeps the left half, the
-    // selector takes the right. Inside the selector the value is flush left and
-    // the chevron flush right, so the pair reads as one control even though the
-    // title sits outside it.
-    const float insetY = kDropdownInsetY * s;
-    const Rect  field{r.x + r.w * 0.5f, r.y + insetY, r.w * 0.5f, r.h - insetY * 2.0f};
+    const DropdownGeom geom = dropdownGeom(r, count, s);
+    const Rect  field = geom.field;
     const float fieldCy = field.y + field.h * 0.5f;
 
-    const float listTop = field.y + field.h + kDropdownGap * s;
+    const float listTop = geom.listTop;
     const float listH   = count * itemH;
     const float shownH  = listH * st.anim;
 
@@ -464,11 +498,11 @@ bool dropdown(ImDrawList* dl, const Rect& r, DropdownState& st,
     const bool rowHeld = ImGui::IsMouseDown(ImGuiMouseButton_Left) && inside(mouse, r);
     dl->AddRectFilled(ImVec2(field.x, field.y),
                       ImVec2(field.x + field.w, field.y + field.h),
-                      fadeCol(rowHeld ? ControlBgHi : ControlBg), kDropdownRound * s);
+                      fadeCol(rowHeld ? ControlBgHi : ControlBg), csize(kDropdownRound) * s);
 
-    const float chevHalfW = kChevronW * s * 0.5f;
-    const float chevHalfH = kChevronH * s * 0.5f;
-    const float chevStroke = kChevronThick * s * 0.5f;
+    const float chevHalfW = csize(kChevronW) * s * 0.5f;
+    const float chevHalfH = csize(kChevronH) * s * 0.5f;
+    const float chevStroke = csize(kChevronThick) * s * 0.5f;
     // Pull the centre left by the stroke's own radius so the *drawn* right edge,
     // cap included, lands on the padding and not half a stroke past it.
     const float chevCx = field.x + field.w - padX - chevHalfW - chevStroke;
@@ -505,9 +539,14 @@ bool dropdown(ImDrawList* dl, const Rect& r, DropdownState& st,
         ImDrawList* fg = ImGui::GetForegroundDrawList();
         const ImVec2 listMin(field.x, listTop);
         const ImVec2 listMax(field.x + field.w, listTop + listH);
-        fg->PushClipRect(listMin, ImVec2(listMax.x, listMin.y + shownH), true);
+        // Reveal grows out of the field's edge: downward lists grow from the
+        // top, upward lists from the bottom — either way the anchored edge is
+        // the one touching the field.
+        const float clipY0 = geom.upward ? (listMax.y - shownH) : listMin.y;
+        fg->PushClipRect(ImVec2(listMin.x, clipY0),
+                         ImVec2(listMax.x, clipY0 + shownH), true);
 
-        fg->AddRectFilled(listMin, listMax, fadeCol(ListBg), kDropdownRound * s);
+        fg->AddRectFilled(listMin, listMax, fadeCol(ListBg), csize(kDropdownRound) * s);
 
         for (int i = 0; i < count; ++i) {
             const Rect item{field.x, listTop + i * itemH, field.w, itemH};
@@ -518,11 +557,11 @@ bool dropdown(ImDrawList* dl, const Rect& r, DropdownState& st,
             if (selected && !isDisabled) {
                 fg->AddRectFilled(ImVec2(item.x + padX * 0.5f, item.y + 4.0f * s),
                                   ImVec2(item.x + item.w - padX * 0.5f, item.y + item.h - 4.0f * s),
-                                  fadeCol(Accent), kDropdownRound * s);
+                                  fadeCol(Accent), csize(kDropdownRound) * s);
             } else if (held && !isDisabled) {
                 fg->AddRectFilled(ImVec2(item.x + padX * 0.5f, item.y + 4.0f * s),
                                   ImVec2(item.x + item.w - padX * 0.5f, item.y + item.h - 4.0f * s),
-                                  fadeCol(ControlBgHi), kDropdownRound * s);
+                                  fadeCol(ControlBgHi), csize(kDropdownRound) * s);
             }
 
             // Disabled entries draw dimmer than muted — the user should see
@@ -548,19 +587,23 @@ void dropdownList(ImDrawList* dl, const Rect& r, const DropdownState& st,
     const ImGuiIO& io = ImGui::GetIO();
     const ImVec2 mouse = io.MousePos;
 
-    const float padX  = kDropdownPadX * s;
-    const float itemH = kDropdownItemH * s;
-    const float insetY = kDropdownInsetY * s;
-    const Rect  field{r.x + r.w * 0.5f, r.y + insetY, r.w * 0.5f, r.h - insetY * 2.0f};
-    const float listTop = field.y + field.h + kDropdownGap * s;
+    const float padX  = csize(kDropdownPadX) * s;
+    const float itemH = csize(kDropdownItemH) * s;
+
+    const DropdownGeom geom = dropdownGeom(r, count, s);
+    const Rect field = geom.field;
+    const float listTop = geom.listTop;
     const float listH   = count * itemH;
     const float shownH  = listH * st.anim;
 
     const ImVec2 listMin(field.x, listTop);
     const ImVec2 listMax(field.x + field.w, listTop + listH);
-    dl->PushClipRect(listMin, ImVec2(listMax.x, listMin.y + shownH), true);
+    // Same directional reveal as the inline path in dropdown().
+    const float clipY0 = geom.upward ? (listMax.y - shownH) : listMin.y;
+    dl->PushClipRect(ImVec2(listMin.x, clipY0),
+                     ImVec2(listMax.x, clipY0 + shownH), true);
 
-    dl->AddRectFilled(listMin, listMax, fadeCol(ListBg), kDropdownRound * s);
+    dl->AddRectFilled(listMin, listMax, fadeCol(ListBg), csize(kDropdownRound) * s);
 
     for (int i = 0; i < count; ++i) {
         const Rect item{field.x, listTop + i * itemH, field.w, itemH};
@@ -571,11 +614,11 @@ void dropdownList(ImDrawList* dl, const Rect& r, const DropdownState& st,
         if (selected && !isDisabled) {
             dl->AddRectFilled(ImVec2(item.x + padX * 0.5f, item.y + 4.0f * s),
                               ImVec2(item.x + item.w - padX * 0.5f, item.y + item.h - 4.0f * s),
-                              fadeCol(Accent), kDropdownRound * s);
+                              fadeCol(Accent), csize(kDropdownRound) * s);
         } else if (held && !isDisabled) {
             dl->AddRectFilled(ImVec2(item.x + padX * 0.5f, item.y + 4.0f * s),
                               ImVec2(item.x + item.w - padX * 0.5f, item.y + item.h - 4.0f * s),
-                              fadeCol(ControlBgHi), kDropdownRound * s);
+                              fadeCol(ControlBgHi), csize(kDropdownRound) * s);
         }
 
         const ImU32 itemCol = isDisabled
@@ -635,23 +678,27 @@ static void paintMultiSelectList(ImDrawList* fg, const Rect& r, MultiSelectState
     const ImGuiIO& io = ImGui::GetIO();
     const ImVec2 mouse = io.MousePos;
 
-    const float padX  = kDropdownPadX * s;
-    const float insetY = kDropdownInsetY * s;
-    const Rect  field{r.x + r.w * 0.5f, r.y + insetY, r.w * 0.5f, r.h - insetY * 2.0f};
-    const float itemH = kDropdownItemH * s;
-    const float listTop = field.y + field.h + kDropdownGap * s;
+    const float padX  = csize(kDropdownPadX) * s;
+    const float itemH = csize(kDropdownItemH) * s;
+    const DropdownGeom geom = dropdownGeom(r, count, s);
+    const Rect  field = geom.field;
+    const float listTop = geom.listTop;
     const float listH = count * itemH;
 
-    // Reveal like dropdown(): a clip rect that grows downward with `anim`,
-    // no whole-list scale. The panel background is a steady `ListBg` slab;
-    // rows appear to drop down from the row rather than the block squashing.
+    // Reveal like dropdown(): a clip rect that grows out of the field's edge
+    // with `anim` (downward lists grow from the top, upward ones from the
+    // bottom), no whole-list scale. The panel background is a steady `ListBg`
+    // slab; rows appear to drop down from the row rather than the block
+    // squashing.
     const float shownH = listH * st.anim;
     const ImVec2 listMin(field.x, listTop);
     const ImVec2 listMax(field.x + field.w, listTop + listH);
-    fg->PushClipRect(listMin, ImVec2(listMax.x, listMin.y + shownH), true);
+    const float clipY0 = geom.upward ? (listMax.y - shownH) : listMin.y;
+    fg->PushClipRect(ImVec2(listMin.x, clipY0),
+                     ImVec2(listMax.x, clipY0 + shownH), true);
 
     // Panel background — dropdown-style, no per-item blue.
-    fg->AddRectFilled(listMin, listMax, fadeCol(ListBg), kDropdownRound * s);
+    fg->AddRectFilled(listMin, listMax, fadeCol(ListBg), csize(kDropdownRound) * s);
 
     // Re-trigger the per-item pop the moment the list opens, so the ticks
     // grow in rather than sitting pre-drawn. Closing leaves them at 1, so
@@ -682,7 +729,7 @@ static void paintMultiSelectList(ImDrawList* fg, const Rect& r, MultiSelectState
         if (held) {
             fg->AddRectFilled(ImVec2(item.x + padX * 0.5f, item.y + 4.0f * s),
                               ImVec2(item.x + item.w - padX * 0.5f, item.y + item.h - 4.0f * s),
-                              fadeColAnim(ControlBgHi, st.anim), kDropdownRound * s);
+                              fadeColAnim(ControlBgHi, st.anim), csize(kDropdownRound) * s);
         }
 
         // Check mark — ONE rounded polyline (rounded joins AND caps), so it
@@ -690,10 +737,10 @@ static void paintMultiSelectList(ImDrawList* fg, const Rect& r, MultiSelectState
         // (kChkScaleStart → 1.0) and fades (0 → 1) with this item's own
         // `checkAnim`, so it pops in on select/open and fades on deselect.
         if (chkA > 0.01f) {
-            const float checkX = item.x + padX * 1.4f + kMSCheckW * s * 0.5f;
+            const float checkX = item.x + padX * 1.4f + csize(kMSCheckW) * s * 0.5f;
             const float checkY = item.y + item.h * 0.5f;
-            const float w = kMSCheckW * s;
-            const float h = kMSCheckH * s;
+            const float w = csize(kMSCheckW) * s;
+            const float h = csize(kMSCheckH) * s;
             const float cScale = kChkScaleStart + (1.0f - kChkScaleStart) * chkA;
             const auto cscale = [&](float lx, float ly) {
                 return ImVec2(checkX + (lx - checkX) * cScale,
@@ -706,13 +753,13 @@ static void paintMultiSelectList(ImDrawList* fg, const Rect& r, MultiSelectState
             };
             const uint32_t ca = (uint32_t)(255.0f * g_hudAlpha * chkA);
             const ImU32 col = (TextOnAccent & 0x00FFFFFFu) | (ca << IM_COL32_A_SHIFT);
-            fg->AddPolyline(pts, 3, col, kMSCheckStroke * s,
+            fg->AddPolyline(pts, 3, col, csize(kMSCheckStroke) * s,
                             ImDrawFlags_RoundCornersAll);
         }
 
         // Label — white on selected rows (reads on ListBg), muted otherwise.
         const ImU32 labelCol = isSel ? TextOnAccent : TextMuted;
-        textLeft(fg, item.x + padX * 2.0f + kMSCheckW * s, item.y + item.h * 0.5f,
+        textLeft(fg, item.x + padX * 2.0f + csize(kMSCheckW) * s, item.y + item.h * 0.5f,
                  kLabelSize * s, fadeColAnim(labelCol, st.anim), items[i]);
     }
 
@@ -734,12 +781,12 @@ bool multiSelect(ImDrawList* dl, const Rect& r, MultiSelectState& st,
     st.anim = approach(st.anim, st.open ? 1.0f : 0.0f, kMSAnimRate, io.DeltaTime);
 
     const float cy    = r.y + r.h * 0.5f;
-    const float padX  = kDropdownPadX * s;
-    const float insetY = kDropdownInsetY * s;
-    const Rect  field{r.x + r.w * 0.5f, r.y + insetY, r.w * 0.5f, r.h - insetY * 2.0f};
+    const float padX  = csize(kDropdownPadX) * s;
+    const DropdownGeom geom = dropdownGeom(r, count, s);
+    const Rect  field = geom.field;
     const float fieldCy = field.y + field.h * 0.5f;
-    const float itemH = kDropdownItemH * s;
-    const float listTop = field.y + field.h + kDropdownGap * s;
+    const float itemH = csize(kDropdownItemH) * s;
+    const float listTop = geom.listTop;
     const float listH = count * itemH;
 
     // ── Build the collapsed-state label from selected items ────────────────
@@ -822,15 +869,15 @@ bool multiSelect(ImDrawList* dl, const Rect& r, MultiSelectState& st,
     const bool rowHeld = ImGui::IsMouseDown(ImGuiMouseButton_Left) && inside(mouse, r);
     dl->AddRectFilled(ImVec2(field.x, field.y),
                       ImVec2(field.x + field.w, field.y + field.h),
-                      fadeCol(rowHeld ? ControlBgHi : ControlBg), kDropdownRound * s);
+                      fadeCol(rowHeld ? ControlBgHi : ControlBg), csize(kDropdownRound) * s);
 
     textLeft(dl, field.x + padX, fieldCy, kValueSize * s,
              selectedCount > 0 ? TextPrimary : TextMuted, collapsed.c_str());
 
     // Chevron — same counter-clockwise opening as the dropdown.
-    const float chevHalfW = kChevronW * s * 0.5f;
-    const float chevHalfH = kChevronH * s * 0.5f;
-    const float chevStroke = kChevronThick * s * 0.5f;
+    const float chevHalfW = csize(kChevronW) * s * 0.5f;
+    const float chevHalfH = csize(kChevronH) * s * 0.5f;
+    const float chevStroke = csize(kChevronThick) * s * 0.5f;
     const float chevCx = field.x + field.w - padX - chevHalfW - chevStroke;
     const float ca = st.anim * -kPi;
     const float cc = cosf(ca);
@@ -1037,7 +1084,7 @@ bool button(ImDrawList* dl, const Rect& r, const char* label,
 void paintButton(ImDrawList* dl, const Rect& r, const char* label,
                  ButtonVariant variant, float s, bool held) {
     ImFont* font = ImGui::GetFont();
-    const float rounding = kButtonRoundDesign * s;
+    const float rounding = csize(kButtonRoundDesign) * s;
     const ImVec2 mn(r.x, r.y);
     const ImVec2 mx(r.x + r.w, r.y + r.h);
 
@@ -1069,7 +1116,7 @@ void paintButton(ImDrawList* dl, const Rect& r, const char* label,
     dl->AddRectFilled(mn, mx, fadeCol(fill), rounding);
     dl->AddRect(mn, mx, fadeCol(edge), rounding, 0, 1.0f * s);
 
-    const float sz = 28.0f * s;
+    const float sz = tsize(28.0f) * s;
     const ImVec2 ts = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, label);
     dl->AddText(font, sz,
                 ImVec2(mn.x + (r.w - ts.x) * 0.5f,
@@ -1087,10 +1134,10 @@ bool closeButton(ImDrawList* dl, const Rect& r, float s) {
     // sits badly inside a square, while two lines can be centred exactly.
     dl->AddRectFilled(ImVec2(r.x, r.y), ImVec2(r.x + r.w, r.y + r.h),
                       fadeCol(held ? kGhostFillHi : kGhostFill),
-                      kButtonRoundDesign * s);
+                      csize(kButtonRoundDesign) * s);
     dl->AddRect(ImVec2(r.x, r.y), ImVec2(r.x + r.w, r.y + r.h),
                 fadeCol(IM_COL32(255, 255, 255, kGhostOutlineAlpha)),
-                kButtonRoundDesign * s, 0, 1.0f * s);
+                csize(kButtonRoundDesign) * s, 0, 1.0f * s);
 
     const float inset = r.w * 0.30f;
     const float w = 3.2f * s;
@@ -1150,9 +1197,9 @@ bool closeButton(ImDrawList* dl, const Rect& r, float s) {
 void paintField(ImDrawList* dl, const Rect& r, const DialogField& f,
                 const char* placeholder, float s, bool multiline) {
     ImFont* font = ImGui::GetFont();
-    const float sz     = 24.0f * s;
-    const float pad    = kFieldPadDesign * s;
-    const float rounding = kFieldRoundDesign * s;
+    const float sz     = tsize(24.0f) * s;
+    const float pad    = csize(kFieldPadDesign) * s;
+    const float rounding = csize(kFieldRoundDesign) * s;
     const ImVec2 mn(r.x, r.y);
     const ImVec2 mx(r.x + r.w, r.y + r.h);
     const bool   empty = f.len == 0;
@@ -1233,11 +1280,11 @@ bool pathPill(ImDrawList* dl, const Rect& r, const char* path, int pathLen,
               bool picking, float s) {
     if (r.w <= 1.0f || r.h <= 1.0f) return false;
     ImFont* font = ImGui::GetFont();
-    const float sz       = 22.0f * s;
-    const float pad      = kFieldPadDesign * s;
-    const float rounding = kFieldRoundDesign * s;
-    const float btnSize  = kPathPillBtnSizeDesign * s;
-    const float btnGap   = kPathPillBtnGapDesign * s;
+    const float sz       = tsize(22.0f) * s;
+    const float pad      = csize(kFieldPadDesign) * s;
+    const float rounding = csize(kFieldRoundDesign) * s;
+    const float btnSize  = csize(kPathPillBtnSizeDesign) * s;
+    const float btnGap   = csize(kPathPillBtnGapDesign) * s;
     const ImVec2 mn(r.x, r.y);
     const ImVec2 mx(r.x + r.w, r.y + r.h);
 
@@ -1311,9 +1358,9 @@ bool pathPill(ImDrawList* dl, const Rect& r, const char* path, int pathLen,
 Rect dialogRect(const HudRect& board, float s) {
     Rect r;
     if (!board.valid()) return r;
-    const float sidePad  = kDialogSidePadDesign * s;
-    const float topPad   = kDialogTopPadDesign  * s;
-    const float botPad   = kDialogTopPadDesign  * s;
+    const float sidePad  = csize(kDialogSidePadDesign) * s;
+    const float topPad   = csize(kDialogTopPadDesign)  * s;
+    const float botPad   = csize(kDialogTopPadDesign)  * s;
     const float maxW     = 1300.0f * s;
     r.w = board.w - 2.0f * sidePad;
     if (r.w > maxW) r.w = maxW;
@@ -1324,8 +1371,8 @@ Rect dialogRect(const HudRect& board, float s) {
     return r;
 }
 
-float dialogHeaderHeight(float s) { return kDialogHeaderHeightDesign * s; }
-float dialogInnerPad(float s)     { return kDialogInnerPadDesign * s; }
+float dialogHeaderHeight(float s) { return csize(kDialogHeaderHeightDesign) * s; }
+float dialogInnerPad(float s)     { return csize(kDialogInnerPadDesign) * s; }
 
 }  // namespace widgets
 }  // namespace ui

@@ -50,6 +50,34 @@ namespace ui {
 bool  g_hudVisibleTarget = true;
 float g_hudAlpha         = 1.0f;
 
+// ── Density-derived scaling ──────────────────────────────────────────────────
+//
+// Deliberately above the HAS_IMGUI guard: these are pure arithmetic, and the
+// JNI shim (input_jni.cpp) forwards the Kotlin-reported density into
+// setUiDensity() whether or not this build renders.
+
+int g_densityDpi = 0;  // 0 = the Kotlin side has not reported a panel yet.
+
+void setUiDensity(int dpi) {
+    if (dpi > 0) g_densityDpi = dpi;
+}
+
+float uiScale() {
+    const int dpi = g_densityDpi > 0 ? g_densityDpi : 420;
+    float s = static_cast<float>(dpi) / 160.0f;
+    return s < 1.0f ? 1.0f : (s > 4.0f ? 4.0f : s);
+}
+
+float textBoost() {
+    // 440dpi ≈ the 1080p phone this reads smallest on; everything gets at
+    // least the floor, 2K panels ride up towards the cap. The cap is
+    // deliberately generous: controls share the factor (csize()), so a higher
+    // ceiling means fewer, chunkier rows per screen — the scrolling pages
+    // absorb the difference.
+    float b = uiScale() / 2.75f;
+    return b < 1.2f ? 1.2f : (b > 1.7f ? 1.7f : b);
+}
+
 }  // namespace ui
 }  // namespace aimbotng
 
@@ -84,6 +112,9 @@ ImU32 lerpColor(ImU32 a, ImU32 b, float t) {
 void textCentred(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
                  float size, ImU32 col, const char* text) {
     ImFont* font = ImGui::GetFont();
+    // One readability boost for every textCentred caller — measuring and
+    // drawing stay on the same boosted size, so centring cannot drift.
+    size = tsize(size);
     const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
     dl->AddText(font, size,
                 ImVec2(mn.x + (mx.x - mn.x - ts.x) * 0.5f,
@@ -222,14 +253,14 @@ void drawRail(ImDrawList* dl, const HudRect& r, float s, float railW, const Xf& 
     const float padX = kRailPad * s;
 
     const float titleY = r.y + kTitleTop * s;
-    dl->AddText(font, kTitleSize * s,
+    dl->AddText(font, tsize(kTitleSize) * s,
                 xf.pt(ImVec2(railMin.x + padX, titleY)),
                 xf.col(TextPrimary), "Aimbot");
 
     // "Nextgen" sits under the title, flush with the rail's right padding.
-    const float subY = titleY + kTitleSize * s + kSubGap * s;
-    const ImVec2 subSize = font->CalcTextSizeA(kSubSize * s, FLT_MAX, 0.0f, "Nextgen");
-    dl->AddText(font, kSubSize * s,
+    const float subY = titleY + tsize(kTitleSize) * s + kSubGap * s;
+    const ImVec2 subSize = font->CalcTextSizeA(tsize(kSubSize) * s, FLT_MAX, 0.0f, "Nextgen");
+    dl->AddText(font, tsize(kSubSize) * s,
                 xf.pt(ImVec2(railMax.x - padX - subSize.x, subY)),
                 xf.col(TextMuted), "Nextgen");
 
@@ -317,7 +348,7 @@ void drawRail(ImDrawList* dl, const HudRect& r, float s, float railW, const Xf& 
     if (sections::g_pageSettings.fpsOverlay.value) {
         char fps[32];
         snprintf(fps, sizeof(fps), "%.0f FPS", io.Framerate);
-        const float fpsSize = kFpsSize * s;
+        const float fpsSize = tsize(kFpsSize) * s;
         const ImVec2 fpsExtent = font->CalcTextSizeA(fpsSize, FLT_MAX, 0.0f, fps);
         dl->AddText(font, fpsSize,
                     xf.pt(ImVec2(railMin.x + padX, railMax.y - kRailPad * s - fpsExtent.y)),
@@ -371,13 +402,13 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
     // ── Header ───────────────────────────────────────────────────────────────
     ImFont* font = ImGui::GetFont();
     const float titleY    = r.y + kContentTop * s;
-    const float titleSize = kPageTitleSize * s;
+    const float titleSize = tsize(kPageTitleSize) * s;
 
     // The switch geometry is worked out before the title is painted because the
     // title line's readout is laid out against the switch, and computing it
     // twice is how the two end up disagreeing by a padding constant.
-    const float trackW    = widgets::kSwitchTrackW * s;
-    const float trackH    = widgets::kSwitchTrackH * s;
+    const float trackW    = csize(widgets::kSwitchTrackW) * s;
+    const float trackH    = csize(widgets::kSwitchTrackH) * s;
     const float padTouch  = 14.0f * s;
     widgets::SwitchState* master    = masterSwitch(g_section);
     const float switchLeft = x + w - trackW - padTouch;
@@ -429,7 +460,7 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
     // in the page body: it is only meaningful while the switch is on, it changes
     // every frame, and a row that changes every frame is a row nobody reads.
     if (g_section == MenuSection::Model) {
-        const float roSize = kPageTitleSize * 0.55f * s;
+        const float roSize = tsize(kPageTitleSize * 0.55f) * s;
         const float gap    = 22.0f * s;
         // Available width between the title and the switch, less a gutter so the
         // two never touch even at the largest menu scale.
@@ -569,6 +600,16 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
             break;
     }
 
+    // A control (the slider thumb is the one that grabs on press-down) claimed
+    // the finger on this same press. The scroll arm above runs before the
+    // section and cannot know yet, so both drags start armed; the widget's
+    // latch is the authoritative claim. Drop the scroll drag here, before the
+    // commit below — otherwise dragging a thumb past the scroll slop scrolls
+    // the page under the control while it is being moved.
+    if (g_scrollDrag && widgets::widgetDraggingActive()) {
+        g_scrollDrag = false;
+    }
+
     // ── Scroll clamp + commit the drag offset ────────────────────────────────
     // `y` is now the page's natural bottom (header offset + every row's
     // height + every gap). The scrollable range is the excess over the
@@ -656,7 +697,7 @@ void drawDetectionOverlay() {
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     ImFont* font = ImGui::GetFont();
-    constexpr float kLabelSize = 21.0f;
+    constexpr float kLabelSize = 21.0f;  // screen-space px; tsize() boosts it at use
     constexpr float kRound     = 3.0f;
     constexpr float kPadX      = 6.0f;
     constexpr float kPadY      = 3.0f;
@@ -677,7 +718,7 @@ void drawDetectionOverlay() {
             snprintf(label, sizeof(label), "#%d %.2f", b.cls, b.score);
         }
 
-        const ImVec2 ts = font->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, label);
+        const ImVec2 ts = font->CalcTextSizeA(tsize(kLabelSize), FLT_MAX, 0.0f, label);
         // Above the box by preference, flipped inside it when the box is at the
         // top of the screen and there is nothing above to sit on.
         ImVec2 lmn(mn.x, mn.y - ts.y - kPadY * 2.0f);
@@ -685,7 +726,7 @@ void drawDetectionOverlay() {
         const ImVec2 lmx(lmn.x + ts.x + kPadX * 2.0f, lmn.y + ts.y + kPadY * 2.0f);
 
         dl->AddRectFilled(lmn, lmx, DetectPlate, kRound);
-        dl->AddText(font, kLabelSize, ImVec2(lmn.x + kPadX, lmn.y + kPadY),
+        dl->AddText(font, tsize(kLabelSize), ImVec2(lmn.x + kPadX, lmn.y + kPadY),
                     DetectText, label);
     }
 }
@@ -711,7 +752,7 @@ void drawTrackingOverlay() {
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     ImFont* font = ImGui::GetFont();
-    constexpr float kLabelSize = 21.0f;
+    constexpr float kLabelSize = 21.0f;  // screen-space px; tsize() boosts it at use
     constexpr float kRound     = 3.0f;
     constexpr float kPadX      = 6.0f;
     constexpr float kPadY      = 3.0f;
@@ -729,13 +770,13 @@ void drawTrackingOverlay() {
         char label[32];
         snprintf(label, sizeof(label), "#%d", t.id);
 
-        const ImVec2 ts = font->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, label);
+        const ImVec2 ts = font->CalcTextSizeA(tsize(kLabelSize), FLT_MAX, 0.0f, label);
         ImVec2 lmn(mn.x, mn.y - ts.y - kPadY * 2.0f);
         if (lmn.y < 0.0f) lmn.y = mn.y + 1.0f;
         const ImVec2 lmx(lmn.x + ts.x + kPadX * 2.0f, lmn.y + ts.y + kPadY * 2.0f);
 
         dl->AddRectFilled(lmn, lmx, TrackPlate, kRound);
-        dl->AddText(font, kLabelSize, ImVec2(lmn.x + kPadX, lmn.y + kPadY),
+        dl->AddText(font, tsize(kLabelSize), ImVec2(lmn.x + kPadX, lmn.y + kPadY),
                     TrackText, label);
     }
 }

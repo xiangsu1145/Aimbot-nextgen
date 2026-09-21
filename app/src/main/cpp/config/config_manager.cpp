@@ -39,6 +39,82 @@ using nlohmann::json;
 constexpr const char* kDir  = "/data/local/tmp/aimbotng";
 constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 
+// ── Controller-gain schema version ──────────────────────────────────────────
+//
+// Bumped whenever the MEANING of kp/ki/kd changes, which forces the stored
+// values to be discarded in favour of the new defaults. It has now happened
+// twice, and both times a stale file would have been actively harmful:
+//
+//   v1 → the original predictive PPID, gains on a 0–50 scale.
+//   v2 → the DsAi-unit rewrite. A stored kp = 25 would have clamped to the new
+//        ceiling of 1.0, i.e. 2.5x past the stability limit.
+//   v3 → the per-frame-reset fix (see tracking/pid_controller.h). This one is
+//        the important one: while the bug was live the controller had NO
+//        integral and the derivative was a hidden proportional gain of kd/dt,
+//        so EVERY number the user arrived at was a setting that worked around
+//        a broken plant. kd = 0 in particular is the value the shake forced
+//        them onto; carrying it forward would silently throw away the damping
+//        that the working derivative now provides. There is no way to tell
+//        "chose 0 deliberately" from "chose 0 because it was the only quiet
+//        option", so the gains are re-seeded and the user starts from a
+//        controller that actually means what its labels say.
+//   v4 → the units-and-bounds repair. kd is PER STEP now instead of per-second
+//        (its old real weight was kd*120, so every stored value is off by that
+//        factor and its old ceiling of 0.008 was a sliver of the new one), the
+//        derivative gained a low-pass so it stops being a noise amplifier, the
+//        integral got its own tighter ceiling and conditional integration, the
+//        output ceiling stopped being a slider, and 速度前馈's range widened to
+//        cover 1/alpha because that is what it actually is. A stored
+//        kd = 0.002 read under the new units is a kd of 0.002 — i.e. off — so
+//        the damping that repairs the loop would silently vanish. Same argument
+//        as v3, one layer deeper.
+//   v5 → the feed-forward repair. 速度前馈 stopped being a 1/alpha calibration
+//        and became a scale on a self-calibrating estimator inside the
+//        controller.
+//   v6 → the feed-forward DELETED. The estimator was a bare integrator in a
+//        delay loop and it oscillated (1453 px peak-to-peak at alpha = 2.5); its
+//        gate could not work either, because the tracker reports the box's
+//        SCREEN velocity, which the aim itself nulls. The integral is the term
+//        that holds a moving target now (leash 24 -> 56, ki is no longer a small
+//        mop-up gain), and 速度前馈's row is 灵敏度补偿 — a master multiplier on
+//        all three gains that absorbs the game's sensitivity. Every stored kp/ki/
+//        kd was tuned against a controller with an oscillator inside it, and the
+//        stored 速度前馈 is a scale on a term that no longer exists, so all four
+//        are re-seeded. See notes 1-4 in tracking/pid_controller.h.
+//   v7 → the feed-forward REPAIRED, and the ceilings made per-sensitivity. v6
+//        was right that the old estimator was a bare integrator, and wrong that
+//        the answer was deletion: the remaining loop had no DC carrier, so it
+//        either lagged (P alone: e_ss = ΔT/(alpha·kp)) or wound up (the integral
+//        alone: 137 px of overshoot and 842 frames to settle at alpha = 0.1).
+//        The repair was that the reconstruction constant must be 1/kf — the SAME
+//        number as the gain — and that 1/alpha is not measurable, so the number
+//        had to come from the user. v7 supplied it TWICE: once as 灵敏度补偿
+//        (≈ 1/alpha, scaling the gains AND the ceilings) and once as 前馈增益.
+//        That scaling layer is gone; see v8.
+//   v8 → the scaling layer REMOVED, and the feed-forward's sample DELAY-ALIGNED.
+//        There is no 灵敏度补偿 any more and no 输出限幅 scaling: kp, ki, kd and
+//        kf go into the controller as written, and the ceilings are the constants
+//        kOutLimitPx (180) / kTrimLimitPx (90). Two reasons, both measured:
+//
+//        (a) The reconstruction was using u(k−1). But Δe(k) = w(k) − alpha·u(k−L),
+//            so the sample to subtract is the one L steps back; with u(k−1) the
+//            leftover is proportional to our own rate of change and is read back
+//            as target velocity. At alpha = 1 NO value of kf repaired it
+//            (pp 656…871 px for kf 0.5…8). With u(k−L) the sway is 5–16 px at
+//            every alpha from 0.08 to 1.0 when kf = 1/alpha — and it does not
+//            care if L is wrong, so L is a constant (5), not a setting.
+//        (b) With one number instead of two, kf alone carries the plant gain and
+//            the rule becomes exactly kf = 1/alpha, usable band kf·alpha ≈
+//            0.75…1.5. Note a SMALL non-zero kf is WORSE than 0: it makes
+//            alpha_hat = 1/kf huge and F degenerates into "repeat your own
+//            delayed command". Stored values are therefore re-seeded, not kept.
+//
+//        kp/ki/kd keep their per-step meanings, but the ceilings they work
+//        against changed, so the whole set is re-seeded. Default kf = 3, correct
+//        for a low-sensitivity game and safe down to alpha ≈ 0.05.
+//        See scripts/aim_pidf_bench.py 表14 and tracking/pid_controller.h.
+constexpr int kCtlSchema = 8;
+
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
 void putSlider(json& o, const char* k, const ui::widgets::SliderState& s) {
@@ -118,11 +194,21 @@ json serialize() {
         json o;
         putSwitch(o, "on", a.enabled);
         putSlider(o, "kp", a.kp);
+        putSlider(o, "ki", a.ki);
         putSlider(o, "kd", a.kd);
-        putSlider(o, "predictX", a.predictX);
-        putSlider(o, "predictY", a.predictY);
-        putSlider(o, "rate", a.rate);
-        putSlider(o, "smooth", a.smooth);
+        putSlider(o, "outSmooth", a.outSmooth);
+        // The gains above are only meaningful under the schema that produced
+        // them — see kCtlSchema. Written every save so a file from an older
+        // build is recognised on the next load and re-seeded rather than
+        // reinterpreted. "predictX"/"predictY"/"rate" are gone entirely: old
+        // files simply carry them as dead keys.
+        o["ctl"] = kCtlSchema;
+        putSlider(o, "delay", a.aimDelayFrames);
+        // "kf" is the feed-forward gain AND the reciprocal of the reconstruction
+        // constant — one value, two uses, and the second is why it cannot be
+        // split into two sliders. "ff" (v7's 灵敏度补偿) is gone.
+        putSlider(o, "kf", a.ffGain);
+        putSlider(o, "trackPred", a.trackPredictHoldFrames);
         putSlider(o, "dz", a.deadzone);
         putBox(o, "touch", a.touchArea.toggle.value,
                a.touchArea.x, a.touchArea.y, a.touchArea.w, a.touchArea.h,
@@ -187,8 +273,13 @@ json serialize() {
         putSwitch(o, "fps", s.fpsOverlay);
         putSwitch(o, "antiShot", s.antiScreenshot);
         putSwitch(o, "boxes", s.showDetections);
+        putSwitch(o, "tracking", s.showTracking);
         putSwitch(o, "touchPass", s.touchPassthrough);
         putSwitch(o, "contInf", s.continuousInference);
+        putSlider(o, "trackIou",  s.trackIou);
+        putSlider(o, "trackConf", s.trackConfirm);
+        putSlider(o, "trackTerm", s.trackTerminate);
+        // trackPred lives on the Aim page now → persisted under aim.trackPred
         putCircle(o, "infArea", s.inferenceArea.toggle.value,
                   s.inferenceArea.cx, s.inferenceArea.cy, s.inferenceArea.r,
                   s.inferenceArea.placed);
@@ -214,12 +305,46 @@ void apply(const json& j) {
         auto& a = ui::sections::g_pageAim;
         const json& o = *it;
         getSwitch(o, "on", a.enabled);
-        getSlider(o, "kp", a.kp);
-        getSlider(o, "kd", a.kd);
-        getSlider(o, "predictX", a.predictX);
-        getSlider(o, "predictY", a.predictY);
-        getSlider(o, "rate", a.rate);
-        getSlider(o, "smooth", a.smooth);
+        // The controller gains are only restored when the file was written by a
+        // build whose gains MEAN the same thing — see kCtlSchema. Reading them
+        // across a schema change is worse than discarding them: a stored 25
+        // (0–50 scale) clamps to the top of a 0–1 range, which is 2.5x past the
+        // stability limit, and a stored kd = 0 (the value the old shake forced
+        // the user onto) silently disables the damping the fixed derivative
+        // provides.
+        const auto ctlIt = o.find("ctl");
+        const int  storedCtl = (ctlIt != o.end() && ctlIt->is_number())
+                                   ? static_cast<int>(ctlIt->get<double>())
+                                   : 0;
+        if (storedCtl == kCtlSchema) {
+            getSlider(o, "kp", a.kp);
+            getSlider(o, "ki", a.ki);
+            getSlider(o, "kd", a.kd);
+        } else {
+            a.kp.value = 0.10f;
+            a.ki.value = 0.5f;
+            a.kd.value = 0.20f;
+            // 3 is the default for a low-sensitivity game (alpha around 0.1
+            // wants about 10) and safe down to alpha around 0.05. A stored v7
+            // value meant "kf = 灵敏度补偿 × this", i.e. up to 48, so it cannot be
+            // carried across — and a small non-zero kf is worse than 0 anyway.
+            a.ffGain.value = 3.0f;
+            LOGI("config: aim gains re-seeded for controller schema %d "
+                 "(file had %d): kp=%.2f ki=%.1f kd=%.2f kf=%.2f",
+                 kCtlSchema, storedCtl, a.kp.value, a.ki.value, a.kd.value,
+                 a.ffGain.value);
+        }
+        getSlider(o, "outSmooth", a.outSmooth);
+        getSlider(o, "delay", a.aimDelayFrames);
+        // kf changes MEANING with the schema (v7 scaled it by 灵敏度补偿), so it
+        // is read only from a same-schema file. Reading it unconditionally would
+        // silently overwrite the re-seeded value above — the "re-seeded ... kf="
+        // log line would be a lie, and a number that meant something else under
+        // the old controller would come back.
+        if (storedCtl == kCtlSchema) {
+            getSlider(o, "kf", a.ffGain);
+        }
+        getSlider(o, "trackPred", a.trackPredictHoldFrames);
         getSlider(o, "dz", a.deadzone);
         bool on = false, placed = false;
         float x = -1, y = -1, w = 0, h = 0;
@@ -321,8 +446,13 @@ void apply(const json& j) {
         getSwitch(o, "fps", s.fpsOverlay);
         getSwitch(o, "antiShot", s.antiScreenshot);
         getSwitch(o, "boxes", s.showDetections);
+        getSwitch(o, "tracking", s.showTracking);
         getSwitch(o, "touchPass", s.touchPassthrough);
         getSwitch(o, "contInf", s.continuousInference);
+        getSlider(o, "trackIou",  s.trackIou);
+        getSlider(o, "trackConf", s.trackConfirm);
+        getSlider(o, "trackTerm", s.trackTerminate);
+        // trackPred lives on the Aim page now → persisted under aim.trackPred
         bool on = false, placed = false;
         float cx = -1, cy = -1, r = 0;
         if (getCircle(o, "infArea", on, cx, cy, r, placed)) {

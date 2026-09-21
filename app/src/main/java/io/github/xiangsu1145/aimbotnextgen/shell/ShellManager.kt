@@ -16,6 +16,7 @@ import io.github.xiangsu1145.aimbotnextgen.adb.AdbKey
 import io.github.xiangsu1145.aimbotnextgen.adb.AdbMdns
 import io.github.xiangsu1145.aimbotnextgen.adb.AdbPairingClient
 import io.github.xiangsu1145.aimbotnextgen.adb.AdbPairingState
+import io.github.xiangsu1145.aimbotnextgen.model.ModelRepository
 import kotlinx.coroutines.*
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -23,6 +24,7 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.Socket
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 
 private const val TAG = "ShellManager"
@@ -196,6 +198,9 @@ class ShellManager(private val context: Context) {
 
     private val geometryHandler = Handler(Looper.getMainLooper())
 
+    /** Replies for [requestAsync] are delivered on this, so callers may touch UI. */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     /**
      * True only while the daemon has CONFIRMED that it really holds the touch
      * panel exclusively (EVIOCGRAB) — i.e. the last `OK:grabbed=` said 1.
@@ -340,6 +345,10 @@ class ShellManager(private val context: Context) {
                 val info = context.applicationInfo
                 val apkPath = info.sourceDir
                 val libDir = info.nativeLibraryDir
+                // Shared models directory (downloads live here, and the model
+                // store itself from this build on). Arg 2 of ShellServerEntry —
+                // the daemon has no Context of its own to derive it from.
+                val modelsDir = ModelRepository.modelsRootDir(context).absolutePath
 
                 // Rebindable: a desynced ADB stream is unrecoverable (see
                 // adbCommandFailed), so the loop below may replace this with a
@@ -391,7 +400,7 @@ class ShellManager(private val context: Context) {
                 // launch that fails leaves evidence behind instead of nothing.
                 val cmd = "(setsid /system/bin/app_process -Djava.class.path='$apkPath' -Djava.library.path='$kSystemLibraryPath' /system/bin " +
                         "--nice-name=aimbot_shell " +
-                        "io.github.xiangsu1145.aimbotnextgen.shell.ShellServerEntry '$libDir' " +
+                        "io.github.xiangsu1145.aimbotnextgen.shell.ShellServerEntry '$libDir' '$modelsDir' " +
                         ">$DAEMON_LOG_FILE 2>&1) & " + kLaunchLinger
 
                 // Same launch, as a script on the device. Written once here;
@@ -405,7 +414,7 @@ class ShellManager(private val context: Context) {
                 val scriptLine = "setsid /system/bin/app_process " +
                         "-Djava.class.path='$apkPath' -Djava.library.path='$kSystemLibraryPath' /system/bin " +
                         "--nice-name=aimbot_shell " +
-                        "io.github.xiangsu1145.aimbotnextgen.shell.ShellServerEntry '$libDir' " +
+                        "io.github.xiangsu1145.aimbotnextgen.shell.ShellServerEntry '$libDir' '$modelsDir' " +
                         ">$DAEMON_LOG_FILE 2>&1 &\n" + kLaunchLinger
                 adbShellText(adb, "printf '%s\\n' \"$scriptLine\" > $DAEMON_LAUNCH_SCRIPT")
                 val scriptReady =
@@ -762,12 +771,72 @@ class ShellManager(private val context: Context) {
             // Where the daemon stands after a reconnect: its menu and grab
             // outlived the gap, so adopt them instead of assuming a fresh start.
             line.startsWith("STATE ") -> handleStateLine(line.substring(6))
-            line.startsWith("OK:") -> handleOkPayload(line.substring(3))
+            // Valued replies (`OK:<value>` / `ERR:<message>`) resolve a pending
+            // [request] first; only when nobody is waiting do they fall back to
+            // the log panel. Plain `OK` never resolves anything — it is the
+            // heartbeat's reply and carries no value to route.
+            line.startsWith("OK:") || line.startsWith("ERR:") -> {
+                if (!resolvePendingReply(line)) {
+                    if (line.startsWith("OK:")) handleOkPayload(line.substring(3))
+                    else appendOutput("守护进程错误: ${line.substring(4)}")
+                }
+            }
             line == "OK" -> Unit
-            line.startsWith("ERR:") -> appendOutput("守护进程错误: ${line.substring(4)}")
             line.startsWith("TOUCH ") -> handleTouchLine(line)
             line == "BYE" -> handleDaemonBye()
             else -> appendOutput(line)
+        }
+    }
+
+    // ── Request / reply ───────────────────────────────────────────────────
+    //
+    // sendCommand is fire-and-forget, which is right for SET_RESOLUTION / OPEN
+    // but wrong for the few commands whose answer drives a UI decision (IMPORT
+    // is the only one today). This adds a one-at-a-time request channel on top
+    // of the same TCP session: the next valued reply resolves the oldest
+    // in-flight request. Nothing in the daemon emits a valued reply on its own
+    // — LAYER progress lines and TOUCH events don't start with OK:/ERR: — so
+    // the ordering assumption holds even with the 25s heartbeat in flight.
+
+    private class PendingRequest(val command: String) {
+        val reply = CompletableDeferred<String>()
+    }
+
+    private val pendingReplies = ConcurrentLinkedQueue<PendingRequest>()
+
+    /** Resolves the oldest in-flight request with this reply; false when nobody waits. */
+    private fun resolvePendingReply(line: String): Boolean {
+        while (true) {
+            val head = pendingReplies.peek() ?: return false
+            // An entry can have been reaped by its own timeout between peek
+            // and complete; keep polling in that case.
+            if (head.reply.complete(line)) return true
+            pendingReplies.poll()
+        }
+    }
+
+    /**
+     * Sends [command] and waits at most [timeoutMs] for the daemon's valued
+     * reply: `OK:<value>` resolves with the full line, `ERR:<message>` too —
+     * the caller tells them apart by prefix. Returns null on timeout or when
+     * the wait was cancelled (app frozen, session torn down).
+     */
+    suspend fun request(command: String, timeoutMs: Long = 10_000): String? {
+        val pending = PendingRequest(command)
+        pendingReplies.add(pending)
+        try {
+            sendCommand(command)
+            return withTimeoutOrNull(timeoutMs) { pending.reply.await() }
+        } finally {
+            pendingReplies.remove(pending)
+        }
+    }
+
+    /** Callback flavour of [request]; [onReply] runs on the main thread. */
+    fun requestAsync(command: String, timeoutMs: Long = 10_000, onReply: (String?) -> Unit) {
+        scope.launch {
+            val reply = request(command, timeoutMs)
+            mainHandler.post { onReply(reply) }
         }
     }
 

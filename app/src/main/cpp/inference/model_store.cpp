@@ -7,11 +7,15 @@
 
 #include <android/log.h>
 
+#include "inference/model_runtime.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #define TAG "AimbotModel"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -21,10 +25,16 @@ namespace aimbotng {
 namespace model {
 namespace {
 
-// Not in the app's private storage on purpose: the daemon is `app_process`
-// under the shell UID and has no Context to ask for a directory. This is the
-// one place on the device a shell process can write to and still find again.
-constexpr const char* kStorePath = "/data/local/tmp/aimbot_models.tsv";
+// Legacy location, kept as the migration fallback. It was chosen because the
+// daemon (app_process, shell UID) could write it and the App could not — but
+// that split is exactly what made importing a downloaded model impossible from
+// the App side. The store now lives in the App's shared models directory
+// (/sdcard/Android/data/<pkg>/models/, handed over via setStoreDir()), which
+// BOTH sides can read and write, so a download and an import touch the same
+// tree. A store that predates the move is adopted on first load and migrated
+// by the first save.
+constexpr const char* kLegacyStorePath = "/data/local/tmp/aimbot_models.tsv";
+std::string g_storePath = kLegacyStorePath;
 
 // Field separators. Tab between fields, 0x1f between class names — neither can
 // appear in a file name the picker will hand back, so no escaping is needed and
@@ -110,7 +120,18 @@ void ensureLoadedLocked() {
 
     bool changed = false;   // a re-probe corrected a stored value -> persist it
 
-    FILE* f = fopen(kStorePath, "rb");
+    FILE* f = fopen(g_storePath.c_str(), "rb");
+    if (f == nullptr && g_storePath != kLegacyStorePath) {
+        // First run against the shared location. Adopt the legacy
+        // /data/local/tmp list so an upgrade does not silently empty the
+        // user's model list; `changed` makes the first save write the new
+        // path, which is the migration itself.
+        f = fopen(kLegacyStorePath, "rb");
+        if (f != nullptr) {
+            changed = true;
+            LOGI("migrating model list from %s", kLegacyStorePath);
+        }
+    }
     if (f == nullptr) return;  // first run — an empty list is a correct answer
 
     std::string line;
@@ -199,14 +220,26 @@ void ensureLoadedLocked() {
     }
     fclose(f);
     if (changed) saveLocked();   // persist any values the re-probe corrected
-    LOGI("loaded %zu model(s) from %s", g_entries.size(), kStorePath);
+    LOGI("loaded %zu model(s) from %s", g_entries.size(), g_storePath.c_str());
 }
 
 /** Writes the whole list. Called with the lock held. */
 void saveLocked() {
-    FILE* f = fopen(kStorePath, "wb");
+    // The shared location sits one level deep under a directory that always
+    // exists by the time anything imports a model, but a first-run save can
+    // race the App's own directory setup — one mkdir is cheaper than losing
+    // the list to a missing parent.
+    {
+        std::string parent = g_storePath;
+        const size_t slash = parent.find_last_of('/');
+        if (slash != std::string::npos && slash > 0) {
+            parent.resize(slash);
+            mkdir(parent.c_str(), 0755);   // EEXIST is fine
+        }
+    }
+    FILE* f = fopen(g_storePath.c_str(), "wb");
     if (f == nullptr) {
-        LOGE("cannot write %s", kStorePath);
+        LOGE("cannot write %s", g_storePath.c_str());
         return;
     }
     for (const Entry& e : g_entries) {
@@ -517,6 +550,83 @@ bool setType(int id, const std::string& typeText) {
     return false;
 }
 
+/// The engine a freshly imported model gets: the first row of the kind's
+/// engine table that this build can actually run. The table order IS the
+/// default order (the same one the Add dialog's dropdown shows); the only
+/// deviation is skipping NeuroPilot / Neuron when their vendor .so is absent
+/// — the same check that greys those rows in the dropdown — because an
+/// import that defaults onto an engine the device cannot run would fail at
+/// Load every single time.
+Engine defaultEngineFor(Kind kind) {
+    const Engine* ids = nullptr;
+    int count = 0;
+    if (kind == Kind::Onnx) {
+        ids = kOnnxEngineIds;  count = arrayLen(kOnnxEngineIds);
+    } else if (kind == Kind::Tflite) {
+        ids = kTfliteEngineIds;  count = arrayLen(kTfliteEngineIds);
+    }
+    for (int i = 0; ids != nullptr && i < count; ++i) {
+        const Engine e = ids[i];
+        if ((e == Engine::NeuroPilot || e == Engine::Neuron) &&
+            !infer::runtime::engineAvailable(e)) {
+            continue;
+        }
+        return e;
+    }
+    return (ids != nullptr && count > 0) ? ids[0] : Engine::None;
+}
+
+void setStoreDir(const char* dir) {
+    if (dir == nullptr || dir[0] == '\0') return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_loadedFromDisk) {
+        LOGE("setStoreDir after load — ignored (%s)", dir);
+        return;
+    }
+    std::string d = dir;
+    while (d.size() > 1 && d.back() == '/') d.pop_back();
+    g_storePath = d + "/aimbot_models.tsv";
+    LOGI("model store: %s", g_storePath.c_str());
+}
+
+int addDefault(const char* path) {
+    if (path == nullptr || path[0] == '\0') return -1;
+    const Kind k = kindOfPath(path);
+    if (k == Kind::Unknown) return -1;
+
+    Entry e;
+    e.path  = path;
+    e.name  = baseName(path);
+    e.kind  = k;
+    e.engine = defaultEngineFor(k);
+    // The rest are the struct defaults — confidence 0.5, cpuThreads 1,
+    // htpPerfMode 1 (Sustained High Performance) — the same values the Add
+    // dialog seeds its controls with. The two probed fields are the only
+    // ones that need the file itself.
+    {
+        int w = 0, h = 0, c = 0;
+        if (aimbotng::infer::detectModelShape(path, w, h, c)) {
+            if (w > 0) e.inputSize = w;   // square: W == H
+            e.classCount = c;
+        }
+        e.typeText = aimbotng::infer::detectModelType(path);
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ensureLoadedLocked();
+    // Idempotent: the same file imported twice is one entry, not two.
+    for (const Entry& old : g_entries) {
+        if (old.path == e.path) return old.id;
+    }
+    e.id = g_nextId++;
+    g_entries.push_back(e);
+    sortLocked();
+    saveLocked();
+    LOGI("added default model #%d %s (%s, engine %s)", e.id, e.name.c_str(),
+         e.path.c_str(), engineLabel(e.engine));
+    return e.id;
+}
+
 void loadFromDisk() {
     std::lock_guard<std::mutex> lock(g_mutex);
     ensureLoadedLocked();
@@ -527,7 +637,7 @@ void saveToDisk() {
     saveLocked();
 }
 
-const char* storePath() { return kStorePath; }
+const char* storePath() { return g_storePath.c_str(); }
 
 }  // namespace model
 }  // namespace aimbotng

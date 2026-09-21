@@ -175,6 +175,16 @@ object ShellNative {
     //
     // Touch actions match AimbotNg.TOUCH_*: 0 down / 1 move / 2 up / 3 cancel.
 
+    /**
+     * Reports the panel density (`densityDpi`, as [SysDisplay.density] reads it)
+     * so the renderer can size itself in physical units instead of raw pixels.
+     *
+     * Must reach the renderer before [uiStart] — ImGui reads it while it
+     * initialises. [ShellLayerHost] calls it on every build, so a rotation
+     * (which rebuilds the layer) always re-reports the current value.
+     */
+    external fun uiSetDensity(dpi: Int)
+
     /** Binds the renderer to a layer's Surface and starts its render thread. */
     external fun uiStart(surface: Surface): Boolean
     external fun uiStop()
@@ -291,6 +301,23 @@ object ShellNative {
 
     /** Loads the persisted list into the daemon's in-memory model list. */
     external fun modelLoadFromDisk()
+
+    /**
+     * Points the persisted list at `<dir>/aimbot_models.tsv` — the App's shared
+     * models directory, which both this shell-uid process and the App can read
+     * and write. Must be called before [modelLoadFromDisk]; a call after the
+     * first load is ignored. A list that predates the move (still in
+     * /data/local/tmp) is adopted on first load and migrated by the first save.
+     */
+    external fun modelSetStoreDir(dir: String)
+
+    /**
+     * Registers the model file at [path] with the C++ defaults (default engine
+     * for its kind, confidence 0.5, threads 1, HTP perf 1, probed input size /
+     * class count / tensor type). Idempotent per path. Returns the entry id,
+     * or -1 when the path is not a .onnx/.tflite file.
+     */
+    external fun modelAddDefault(path: String): Int
 
     // ── Inference, driven from a script ────────────────────────────────────
     // The Model page's switch is a control the daemon paints onto its own

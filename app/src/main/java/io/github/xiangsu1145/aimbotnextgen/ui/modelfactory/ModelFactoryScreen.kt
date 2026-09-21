@@ -218,6 +218,20 @@ class ModelFactoryScreen(
 
     // ── ModelDownloadManager.Listener ─────────────────────────────────────
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        // Registration is what makes 已下载 badges react to a download that
+        // finishes while this page is showing. The screen used to implement the
+        // interface without ever registering, so the badge only appeared after
+        // an app restart rebuilt the screen from scratch.
+        ModelDownloadManager.addListener(this)
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        ModelDownloadManager.removeListener(this)
+    }
+
     override fun onTasksChanged() {
         // Download complete / deleted: refresh list + 已下载 badges.
         activity.runOnUiThread { applyFilters() }

@@ -107,8 +107,8 @@ void ensureLoadedLocked() {
 void drawTouchSection(ImDrawList* dl, float x, float& y, float w,
                       float /*bottomY*/, float s, float es, const Xf& xf,
                       Scroll& sc) {
-    const float gap   = 12.0f * s;
-    const float rowDd = widgets::kDropdownRowH * s;
+    const float gap   = csize(12.0f) * s;
+    const float rowDd = csize(widgets::kDropdownRowH) * s;
 
     auto wRect = [&](float wx, float wy, float ww, float wh) {
         const ImVec2 p = xf.pt(wx, wy);

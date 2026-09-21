@@ -218,6 +218,7 @@ void onResult(const std::vector<Box>& boxes, const Roi& roi, const Timing& timin
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_snapshot.detections = std::move(screen);
+    g_snapshot.detSeq++;   // same lock as the list it describes — see the note in the header
     g_snapshot.timing = timing;
     g_snapshot.boxesIn = roi;
 }
@@ -304,6 +305,7 @@ Status prepare() {
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_snapshot.detections.clear();
+    g_snapshot.detSeq++;   // the list changed, so consumers must re-read it
     g_snapshot.timing = Timing{};
     g_snapshot.boxesIn = Roi{};
     g_snapshot.classes = entry.classes;
@@ -375,6 +377,12 @@ void arm() {
     // about to be overwritten anyway.
     g_snapshot.active = true;
     g_snapshot.detections.clear();
+    // Bump the sequence: the list just changed (emptied). Without this a
+    // consumer keyed on freshness sees the same sequence as the previous
+    // session and keeps its stale state — which is the "boxes in the wrong
+    // place, easing out as if they were fresh" failure this clear exists to
+    // prevent.
+    g_snapshot.detSeq++;
     g_snapshot.status.clear();
     LOGI("inference armed");
 }

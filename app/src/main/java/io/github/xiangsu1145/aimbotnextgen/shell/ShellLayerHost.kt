@@ -229,6 +229,12 @@ object ShellLayerHost {
             .getDeclaredConstructor(scCls).newInstance(sc) as Surface
         surface = sf
 
+        // The renderer sizes itself in physical units, so it needs the panel's
+        // density before its first frame. Read here rather than passed down the
+        // UI_ON command: density is a property of this display, and resize()
+        // rebuilds through this same path so a rotation always re-reports it.
+        ShellNative.uiSetDensity(SysDisplay.density())
+
         if (!ShellNative.uiStart(sf)) {
             error("uiStart returned false (Vulkan init failed — see logcat 'AimbotNg')")
         }

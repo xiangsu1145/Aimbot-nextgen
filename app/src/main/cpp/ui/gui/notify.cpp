@@ -26,10 +26,11 @@ namespace {
 
 // ── Look ────────────────────────────────────────────────────────────────────
 
-/// Plate geometry, in screen pixels at 1x. The HUD draws itself at a scale that
-/// follows the panel, and so does this: the toasts are read at the same
-/// distance as the board, so they have to grow with it or they read as a
-/// system overlay pasted on top.
+/// Plate geometry, in dp. Scaled by uiScale() — the density-derived ratio, so
+/// a toast keeps the same physical size on every panel. The toasts are read at
+/// the same distance as the board, and unlike the board they are not bound to
+/// the panel's size, so they take the physical anchor directly rather than a
+/// screen fraction.
 constexpr float kMinWidthPx   = 260.0f;   // a short message still gets a real card
 constexpr float kMaxWidthFrac = 0.42f;    // never more than this much of the screen
 constexpr float kPadXPx       = 16.0f;
@@ -188,19 +189,10 @@ std::string ellipsize(ImFont* font, float size, const std::string& text, float m
     return out + ell;
 }
 
-/// The HUD's scale factor for this frame, clamped to something readable.
-///
-/// `hudScale()` is recomputed only while the board is being laid out, and the
-/// hidden early-return in drawHud() deliberately leaves it at its last value —
-/// which is exactly what the toasts want, since they have to stay legible when
-/// the board is out of the way (a person aiming at a game). The clamp is for the
-/// degenerate end: a panel small enough to drive the ratio to nearly zero would
-/// otherwise draw the cards at a couple of pixels tall.
-float uiScale() {
-    const float s = hudScale();
-    if (!(s > 0.0f)) return 1.0f;   // never laid out yet
-    return std::clamp(s, 0.6f, 2.0f);
-}
+// Scale for this frame: the density-derived ratio from hud.h. Unlike the old
+// hudScale-derived clamp this does not depend on the board ever having been
+// laid out — a toast posted while the menu is still closed sizes itself
+// correctly on the very first frame.
 
 }  // namespace
 

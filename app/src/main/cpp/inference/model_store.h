@@ -174,6 +174,33 @@ bool setType(int id, const std::string& typeText);
 
 // ── Persistence ─────────────────────────────────────────────────────────────
 
+/**
+ * Points the persisted list at `<dir>/aimbot_models.tsv` instead of the legacy
+ * /data/local/tmp location.
+ *
+ * `dir` is the App's shared models directory (/sdcard/Android/data/<pkg>/models),
+ * which this shell-uid process can read and write and which the App process can
+ * too — the store stops being a file only the daemon can reach. Must be called
+ * before the first loadFromDisk()/all()/add() of the process lifetime; a call
+ * after the list is already read is ignored. When the new file does not exist
+ * yet but the legacy one does, the first load adopts the legacy list and the
+ * first save migrates it over.
+ */
+void setStoreDir(const char* dir);
+
+/**
+ * Appends the model file at `path` with the defaults a fresh Add-dialog entry
+ * would get: the first engine of the kind's engine table that this build can
+ * actually run, confidence 0.5, cpuThreads 1, HTP perf mode 1, input size and
+ * class count probed from the graph, tensor type peeked from the file. The
+ * display name is the file's base name.
+ *
+ * Returns the entry id — the existing one when the path is already registered,
+ * so importing the same file twice does not duplicate the row — or -1 when the
+ * path is not a .onnx/.tflite file.
+ */
+int addDefault(const char* path);
+
 /// Reads the list back from disk. Safe to call once at start-up; a missing or
 /// unreadable file leaves the list empty rather than failing.
 void loadFromDisk();

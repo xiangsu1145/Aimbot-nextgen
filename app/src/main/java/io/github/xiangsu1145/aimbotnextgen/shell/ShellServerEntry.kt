@@ -43,9 +43,12 @@ import kotlin.system.exitProcess
  *                                          run the ImGui renderer against it
  *     DOWN <x> <y> | MOVE <x> <y> | UP    inject through the virtual device
  *     TAP <x> <y> [durationMs]
- *     GRABBED                              is the panel held exclusively right now?
- *     PING
- *     DESTROY                             close + exit
+     *     GRABBED                              is the panel held exclusively right now?
+     *     PING
+     *     IMPORT <path>                        register an already-downloaded model
+     *                                          file into the model list with C++
+     *                                          defaults; replies OK:<id> / ERR:<why>
+     *     DESTROY                             close + exit
  *
  *   daemon → client, one line each:
  *     READY
@@ -353,6 +356,19 @@ object ShellServerEntry {
             Log.w(TAG, "neuronDiagnosis failed: ${t.javaClass.simpleName}: ${t.message}")
         }
         bootStep("APU diagnosis")
+
+        // The App's shared models directory (arg 2, from ShellManager). It is
+        // where downloaded .onnx/.tflite files live AND — from this build on —
+        // where the model store itself lives, so both processes see the same
+        // tree. Must reach the store before the first load.
+        val modelsDir = args.getOrNull(1)
+        if (!modelsDir.isNullOrBlank()) {
+            try {
+                ShellNative.modelSetStoreDir(modelsDir)
+            } catch (t: Throwable) {
+                Log.w(TAG, "modelSetStoreDir failed", t)
+            }
+        }
 
         ShellNative.modelLoadFromDisk()
         bootStep("modelLoadFromDisk")
@@ -670,6 +686,40 @@ object ShellServerEntry {
             }
 
             "PING" -> replyOk()
+
+            // ── Model import (模型工厂 → daemon) ─────────────────────────────
+            //
+            // The App downloads a model into its shared models dir
+            // (/sdcard/Android/data/<pkg>/models/…), which this shell-uid
+            // process reads directly. What the App cannot safely do is edit
+            // the model store itself: the daemon keeps the list in memory and
+            // rewrites the whole file on every menu mutation, so an
+            // app-side append would race the next save and lose the row.
+            // Single-writer instead: the App sends the path, the daemon's
+            // native store decides everything (default engine, thresholds,
+            // probed shape and class count) and persists atomically with the
+            // rest of its writes.
+            //
+            // The path is the rest of the line, so file names with spaces
+            // travel intact.
+            "IMPORT" -> {
+                val path = cmd.removePrefix("IMPORT").trim()
+                when {
+                    path.isEmpty() ->
+                        replyErr("usage: IMPORT <model file path>")
+                    path.contains('\t') || path.contains('\r') || path.contains('\n') ->
+                        replyErr("IMPORT: bad path")
+                    !java.io.File(path).isFile ->
+                        replyErr("IMPORT: no such file: $path")
+                    !java.io.File(path).canRead() ->
+                        replyErr("IMPORT: not readable: $path")
+                    else -> {
+                        val id = ShellNative.modelAddDefault(path)
+                        if (id > 0) replyOkValue(id.toString())
+                        else replyErr("IMPORT: not a .onnx/.tflite file, or the store refused it")
+                    }
+                }
+            }
 
             // Scripted control of the Model page's inference switch.
             //

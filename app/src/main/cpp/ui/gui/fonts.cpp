@@ -28,8 +28,10 @@ namespace ui {
 
 namespace {
 
-// Single size for both fonts: ImGui renders from the one baked size (no
-// per-size rasterisation), and 20px reads well on a 2K panel.
+// Reference size for both fonts. With ImGui 1.92+'s dynamic font atlas this
+// is no longer "the one baked size": glyphs are rasterised on demand at
+// whatever pixel size each AddText request carries, so text stays sharp at
+// any scale (hud scale × density boost) without re-baking.
 constexpr float kFontSize = 20.0f;
 
 /// Registers one embedded font on the atlas. `len` is derived from the objcopy

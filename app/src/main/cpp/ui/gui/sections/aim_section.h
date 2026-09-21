@@ -19,6 +19,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -110,16 +111,16 @@ struct AimCategoryState {
     bool hasAnySelected() const { return sel.mask != 0; }
 };
 
-// ── Aim controller (velocity-type PPID, ported from pid.cpp reference) ─────────
+// ── Aim controller — two per-step position controllers, one per axis ────────
 //
-// Two PPID instances, one per axis.  PPID outputs velocity in px/frame @ 60 Hz;
-// the caller divides by 60 to get displacement.  The reference kp=25/kd=25 is
-// used for both axes by default; only `predict` differs (X uses 3.0 for lead,
-// Y uses 0.0).
+// The output of PPID::update() is the FINGER DISPLACEMENT for one control step,
+// in px — not a velocity, and nothing divides by a nominal frame rate. The step
+// time is real and is passed in as `dt`; the loop genuinely runs at 120 Hz
+// while aiming and drops to 60 Hz in the detector tier.
 //
-// Deadzone and per-class Y band are applied AFTER the PID step, so the
-// controller always sees the raw error and does its own adaptive gain
-// management to handle the full range.
+// Deadzone and per-class Y band are applied AFTER the control step, so the
+// controller always sees the raw error. The output ceiling and the derivative
+// filter are constants inside PPID (see tracking/pid_controller.h), not sliders.
 struct AimController {
     tracking::PPID pidX;
     tracking::PPID pidY;
@@ -127,27 +128,85 @@ struct AimController {
     // Drag safety: lift+repress if finger travels further than this from press point.
     float maxDragDist = 400.0f;  // px
 
-    /// Initialise both axes from sliders.  Call once on press.
-    void init(float kp, float kd, float predictX, float predictY,
-              float rate, float smooth) {
-        pidX.init(kp, kd, predictX, rate, smooth);
-        pidY.init(kp, kd, predictY, rate, smooth);
+    /// Push slider values into both axes. PURE ASSIGNMENT — it must never reset
+    /// anything. It is called once per render frame, so a version that cleared
+    /// state (this used to be `init()`, which ended in reset()) would wipe the
+    /// integrator and the derivative history 120 times a second. A genuinely
+    /// new engagement calls reset() instead.
+    ///
+    /// There is NO sensitivity compensation here any more and no scaling of the
+    /// gains or of the ceilings: kp, ki, kd and kf go in as they are. `kf` is the
+    /// feed-forward gain and carries the plant gain inside itself — the
+    /// reconstruction uses its RECIPROCAL as the assumed 1/alpha, so the correct
+    /// setting is kf = 1/alpha and the residual self-term is (1 − kf·alpha)·u,
+    /// exactly zero when it is right. See the header of tracking/pid_controller.h
+    /// for why the number must be used twice, and for the measured band
+    /// (kf·alpha ≈ 0.75…1.5) that this implies.
+    void setGains(float kp, float ki, float kd, float outSmooth, float kf) {
+        this->ffGain = std::max(0.0f, kf);
+        pidX.setGains(kp, ki, kd, outSmooth, kf);
+        pidY.setGains(kp, ki, kd, outSmooth, kf);
     }
 
-    /// Drive both axes, return raw displacement in px/frame @ 60Hz.  Deadzone is
-    /// applied by the caller after this returns.
-    void step(float errX, float errY, float dt,
-              float& outX, float& outY) {
-        (void)dt;  // PPID is frame-rate-independent; dt kept for API compat only
-        // PPID.update() returns velocity in px/frame @ 60 Hz — direct displacement.
-        outX = pidX.update(errX);
-        outY = pidY.update(errY);
+    /// Drive both axes, return the total displacement in px for THIS control
+    /// step. The caller only has to add the player's own fusion assist on top.
+    ///
+    /// `dt` is the real step time in seconds and it is used, not decorative: the
+    /// integral and derivative terms are both scaled by it, and the control loop
+    /// genuinely changes rate (120 Hz while aiming, 60 Hz in the detector tier).
+    ///
+    /// `freezeX` / `freezeY` are the caller's per-axis deadzone decisions, and
+    /// the caller must NOT zero the returned value afterwards. Inside the band
+    /// the controller itself suppresses the proportional and derivative terms
+    /// and holds the integrator while still adding what it has already learned,
+    /// so a slowly drifting target is still followed rather than being left
+    /// behind and then snapped after — the limit cycle the per-axis freeze was
+    /// added for.
+    ///
+    /// `targetChanged` says the caller picked a DIFFERENT track this step. The
+    /// caller knows (it has the track id); the controller cannot tell a switch
+    /// from fast motion by looking at the error alone, and guessing wrong cost
+    /// the integral that damps a large swing. Both axes are resynced together —
+    /// a switch changes both.
+    void step(float errX, float errY, float dt, bool freezeX, bool freezeY,
+              bool targetChanged, float& outX, float& outY) {
+        outX = pidX.update(errX, dt, freezeX, targetChanged);
+        outY = pidY.update(errY, dt, freezeY, targetChanged);
     }
+
+    /// Trim of each axis, for the diagnostic log. See PPID::integralValue() —
+    /// it is the RESIDUAL cleaner while the feed-forward runs, so it should stay
+    /// small; a large trim together with a small `ff` on a moving target means
+    /// kf is off, and roughly by their ratio.
+    float trimX() const { return pidX.integralValue(); }
+    float trimY() const { return pidY.integralValue(); }
+
+    /// The feed-forward's contribution to each axis, in px. THE number to watch
+    /// on a moving target: it should settle at ΔT/alpha and hold there. Near
+    /// zero while the error trails the target means the feed-forward is not
+    /// running (kf = 0, or every frame reports targetChanged).
+    float ffX() const { return pidX.ffValue(); }
+    float ffY() const { return pidY.ffValue(); }
+
+    /// The damping term's contribution to each axis's output, in px, for the
+    /// diagnostic log. A D contribution that is always ~0 while the target
+    /// strafes means kd is not doing anything; one that is comparable to the
+    /// trim means it is carrying the loop and kp can be raised.
+    float derivX() const { return pidX.derivPx(); }
+    float derivY() const { return pidY.derivPx(); }
 
     void reset() {
         pidX.reset();
         pidY.reset();
     }
+
+    /// The feed-forward gain in force (== kf == 1/alpha_hat), for the log.
+    float ffGainValue() const { return ffGain; }
+    /// The output ceiling in force (finger px/step). A constant.
+    float outLimitPx() const { return pidX.outLimitPx(); }
+
+private:
+    float ffGain = 3.0f;
 };
 
 // ── Aim-touch state machine ───────────────────────────────────────────────
@@ -196,16 +255,64 @@ struct TouchAimState {
     bool drivingReal = false;
     int  realId = -1;
 
+    /// Last physical finger position seen, in screen px. Drives the one-way
+    /// fusion assist: (current - lastPhysical) is the player's movement this
+    /// frame, of which only the component along the aim direction is kept.
+    /// -1 means "no physical finger was tracked last frame" — the delta is
+    /// meaningless across that boundary and must not be computed.
+    float lastPhysX = -1.0f, lastPhysY = -1.0f;
+
     /// Set for ONE frame after a fusion takeover is released (real finger lifted /
     /// swapped). Lets the Idle branch skip spawning a synthetic finger that frame,
     /// so we don't get a phantom "extra touch point" the instant a real finger
     /// leaves the touch area. Cleared when read, and on press()/release().
     bool justReleasedTakeover = false;
 
-    /// Physical touch delta for fusion: last known screen position of the physical
-    /// finger inside the touch area.  Reset to -1,-1 when no physical finger is tracked.
-    float physX = -1.0f, physY = -1.0f;
-    float lastPhysX = -1.0f, lastPhysY = -1.0f;
+    /// Set by the drag-safety lift so the re-press that follows does NOT reset
+    /// the controller.
+    ///
+    /// Drag safety lifts the synthetic finger once it strays more than
+    /// `maxDragDist` (400 px) from its press point, and the next frame presses a
+    /// new one at the touch-area centre. That is a re-anchor of WHERE THE FINGER
+    /// SITS, not a new engagement: the target, its velocity and the game's
+    /// sensitivity are all unchanged, so the controller's trim is still valid and
+    /// must survive. It did not — press() called reset() unconditionally, which
+    /// on a 400 px budget at 720 px/s means the integrator was wiped roughly
+    /// twice a second, so it could never hold the trim that removes the trailing
+    /// error. Cleared by press() when consumed, and by release() so that a
+    /// drag-safety lift immediately followed by a target loss cannot leave the
+    /// flag set for the NEXT engagement.
+    bool carryTrim = false;
+
+    /// Track id the aim was engaging last control step, or -1 for "none".
+    ///
+    /// This is how the controller is told a switch happened. It replaces a
+    /// magnitude heuristic that lived inside the controller ("the error jumped
+    /// more than 220 px"), and that heuristic was wrong in both directions: it
+    /// fired on any large legitimate swing — which is precisely what a limit
+    /// cycle looks like, so it wiped the integral that would have damped the
+    /// swing, twice per period — and it missed the common case of a switch
+    /// between two adjacent enemies, whose centres are only ~100 px apart.
+    /// The caller has the track id; the controller never did. Cleared by
+    /// release() so a new engagement never inherits a stale id.
+    int lastTargetId = -1;
+
+    /// Where the last engaged target WAS, and how big it was, in screen px.
+    ///
+    /// Needed because the track id alone is no longer a trustworthy test for
+    /// "did the aim switch enemies". Identity is genuinely unstable in two
+    /// situations that are NOT switches — a head box and a body box of the same
+    /// enemy are two tracks (NMS is per class, so one enemy legitimately yields
+    /// two boxes), and a track that has to be re-acquired can come back under a
+    /// new id. Treating either as a switch clears the integrator, and doing that
+    /// several times a second is the "永远滞后" half of the reported symptom:
+    /// the trim can never build the steady-state velocity that removes a
+    /// trailing error. So the id change is confirmed against POSITION — a real
+    /// enemy switch moves the aim point by a whole box or more, an id flicker
+    /// does not.
+    float lastTargetCx  = -1.0f;
+    float lastTargetCy  = -1.0f;
+    float lastTargetBox = 0.0f;   // 0.5*(w+h), the yardstick for "that far away"
 
     /// Drops a finger at the TOUCH-AREA centre ± jitter (the finger's home,
     /// where the virtual thumb rests — matching the old project's
@@ -215,12 +322,22 @@ struct TouchAimState {
     /// bug). Records `start` so drag safety can later lift if the finger
     /// travels too far. Caller is responsible for the uinput_down() that
     /// immediately follows.
+    ///
+    /// Resets the controller UNLESS `carryTrim` is set — see that flag above.
     void press(const TouchAreaOverlay& area);
 
     /// Releases the synthetic finger. Caller is responsible for the matching
     /// uinput_up() — same separation as press().
     void release();
 };
+
+/// True while the aim is actually driving a finger. The render loop uses it to
+/// decide whether the overlay needs the full 120 Hz rate: syncing at 60 Hz while
+/// a 120 fps game is being tracked makes the finger advance in 12 px steps at
+/// 720 px/s (visible as stepping) and doubles the loop's delay in seconds. The
+/// smoothness the user is asking for is bought exactly here, and it costs
+/// nothing when nobody is aiming because the tier falls back on its own.
+bool aimIsDriving();
 
 // ── The Aim page itself ──────────────────────────────────────────────────
 //
@@ -229,17 +346,128 @@ struct TouchAimState {
 struct PageAim {
     widgets::SwitchState enabled{true};
 
-    /// PPID controller parameters.  Defaults match the reference pid.cpp: kp=25, kd=25.
-    /// predictX is the integral amplification for the X axis (reference: 3.0 — lead).
-    /// predictY is the same for Y.  Both default to 3.0 so both axes get equal force.
-    /// 自适应: 0=禁用(P项始终满载, 推荐), >0=启用自适应机制
-    /// 平滑: 控制大误差时的软饱和区间宽度，默认9900
-    widgets::SliderState kp{25.0f, 0.0f, 50.0f, 0.5f};
-    widgets::SliderState kd{25.0f, 0.0f, 50.0f, 0.5f};
-    widgets::SliderState predictX{3.0f, 0.0f, 10.0f, 0.1f};
-    widgets::SliderState predictY{3.0f, 0.0f, 10.0f, 0.1f};
-    widgets::SliderState rate{0.0f, 0.0f, 1.0f, 0.01f};
-    widgets::SliderState smooth{9900.0f, 9500.0f, 9999.0f, 1.0f};
+    /// ── Controller parameters ─────────────────────────────────────────────
+    ///
+    /// All three gains are in ONE consistent unit system — per control step —
+    /// and the defaults below were chosen by sweeping the loop over the two
+    /// quantities nobody knows: alpha (the game's sensitivity, view px per
+    /// finger px) and L (the loop's delay, in control steps). See
+    /// scripts/aim_screenvel_check.py and the header of
+    /// tracking/pid_controller.h.
+    ///
+    /// Kp (0–0.6, per STEP — "the fraction of the gap to cover this step"):
+    /// a discrete proportional loop with L steps of delay is stable while
+    /// kp*alpha < 2·sin(π/(2(2L+1))) — 0.45 at L=4, 0.30 at L=6, where alpha is
+    /// the game's own sensitivity in view px per finger px. Nothing compensates
+    /// for that any more, so a HIGH-sensitivity game is expected to lower kp —
+    /// and at alpha above ~1.5 it must, or the loop rings no matter what kf is.
+    /// The shipped 0.10 is 4x inside the bound at alpha = 1.
+    ///
+    /// Ki (0–4, px of output per px-of-error-second): the term that erases the
+    /// standing error a moving target would otherwise need. It is the DC carrier
+    /// when the feed-forward is off, and a residual cleaner when it is on — so
+    /// 0.5 is the measured optimum with kp = 0.10 and is not a small mop-up value.
+    ///
+    /// Kd (0–2, PER STEP, dimensionless): the filtered weight on the error's
+    /// one-step change. Damping, and the only currency a delay-limited loop has
+    /// for buying phase margin. Measured optimum is kd ≈ 2·kp; going past that
+    /// is how a high-alpha game starts to ring, for the same reason kp is.
+    ///
+    /// 输出平滑 (outSmooth): a REAL output EMA, 1.0 = off. Off by default: it
+    /// adds phase lag, and phase lag is the one thing a delay-limited loop
+    /// cannot afford. Lower it for a gentler-looking motion and accept the
+    /// extra latency. Measured, 0.8 against 1.0 differs in the decimal places.
+    ///
+    /// 输出限幅 used to live here as a slider. It was never a tuning parameter —
+    /// it is the ceiling that stops a re-lock from flinging the finger across
+    /// the panel — so it is the constant tracking::kOutLimitPx (180 px/step,
+    /// tanh) and the page draws no row for it. The integral's leash is the
+    /// constant tracking::kTrimLimitPx (90). Neither is scaled by anything:
+    /// kf is the only place the plant gain enters, and it lives in its own row.
+    widgets::SliderState kp{0.10f, 0.0f, 0.6f, 0.01f};
+    widgets::SliderState ki{0.5f, 0.0f, 4.0f, 0.1f};
+    widgets::SliderState kd{0.20f, 0.0f, 2.0f, 0.05f};
+    widgets::SliderState outSmooth{1.0f, 0.0f, 1.0f, 0.05f};
+
+    /// Lead, in detector frames: how far ahead of its tracked centre the aim
+    /// places the target, to pay for the delay between the screenshot the
+    /// detector saw and the touch the game will receive. Applied as
+    /// (target.x, target.y) += (vx, vy) * this, using the tracker's filtered
+    /// velocity.
+    ///
+    /// ⚠ DEFAULT IS NOW 0.0, and the reason matters: this term enters the output
+    /// through the proportional gain, so in steady state it adds Kp*v*this to
+    /// the finger's motion — which is the SAME channel as 速度前馈. With both at
+    /// their old defaults (1.0 here, 1.0 there) the loop was adding ≈1.5x the
+    /// target's velocity when 1.0x is what makes the crosshair travel with it,
+    /// and the surplus showed up as overshoot on every moving target. Two knobs
+    /// pushing on one term is exactly the "I tuned one and the other fought it"
+    /// trap; 速度前馈 is now the single velocity knob and this one is the
+    /// optional extra. See the Kp/Ki note above — with a working integrator the
+    /// lag is already handled, so starting at 0 loses nothing.
+    ///
+    /// Range 0–5, step 0.05. Raise it if the crosshair trails a target that is
+    /// steadily moving; lower it (or zero it) if the crosshair overshoots one
+    /// that changes direction — a lead is a bet that the target keeps going.
+    widgets::SliderState aimDelayFrames{0.0f, 0.0f, 5.0f, 0.05f};
+
+    /// Kalman forward-prediction window: how many consecutive missed frames
+    /// the tracker continues to push the predicted position along (vx, vy)
+    /// before freezing at last_valid. 0 freezes instantly (the pre-2026
+    /// behaviour), 3 ≈ 50 ms covers a brief occlusion, 5 ≈ 83 ms covers
+    /// ducking behind cover. The track's lifetime is automatically extended to
+    /// cover this window (see TrackerConfig::predictHoldFrames), so the value
+    /// you set here is the value you get — it is no longer silently capped by
+    /// 丢失帧. Range 0–30, step 1 (30 ≈ 0.5 s of dead reckoning).
+    widgets::SliderState trackPredictHoldFrames{3.0f, 0.0f, 30.0f, 1.0f};
+
+    /// 前馈增益 (kf) — the velocity feed-forward gain, and the ONE number the
+    /// loop cannot work out for itself: **kf = 1 / alpha**, alpha being the
+    /// game's sensitivity in view px per finger px.
+    ///
+    /// WHY IT IS THE PLANT INVERSE, NOT A TASTE. F reconstructs the target's own
+    /// screen velocity from our own output and the error —
+    ///
+    ///     w = Δe + u(k−L)/kf          F = kf · LPF(w)
+    ///
+    /// — because the crosshair is the screen centre, so the error IS the box's
+    /// screen coordinate and the camera rotation our own finger caused is sitting
+    /// inside it. The reconstruction subtracts that; the factor it subtracts with
+    /// is 1/kf. If 1/kf is not the real plant gain, the leftover is read back as
+    /// target velocity and the loop feeds itself. The same number therefore
+    /// appears twice — as the gain, and as the reciprocal of the reconstruction
+    /// constant — and the residual self-term is exactly (1 − kf·alpha)·u.
+    /// kf = 1/alpha makes it zero. That is the whole calibration.
+    ///
+    /// WHY IT CANNOT BE MEASURED INSTEAD. The tracker's velocity is the box's
+    /// SCREEN velocity and the aim's own output is in it
+    /// (tracker_velocity = ΔT_world − alpha·u), and since the error IS that same
+    /// screen coordinate the two signals are the same up to filtering — their
+    /// difference carries no information about alpha. A ring-detector was tried
+    /// as a fallback and rejected: it false-triggered to a 0.61 gain multiplier
+    /// on a STATIONARY target (scripts/aim_ring_guard.py).
+    ///
+    /// HOW TO SET IT, on a moving target rather than a still one. The criterion
+    /// is the SIGN of the error while the target strafes steadily:
+    ///   * crosshair trails the target            → kf too small → RAISE it
+    ///   * crosshair leads / buzzes on a still target → kf too large → LOWER it
+    /// The usable band is kf·alpha ≈ 0.75…1.5, so a LOW-sensitivity game wants a
+    /// LARGE kf (alpha = 0.1 wants about 10). Do NOT creep up from 0.05: values
+    /// between 0 and about 1/alpha are WORSE than 0, because a small kf makes
+    /// alpha_hat = 1/kf huge and F degenerates into "repeat your own delayed
+    /// command" — the round-8 oscillator. If 1.0 rings, jump to 3 or 4; do not
+    /// fine-tune through the bad band. Measured map: scripts/aim_pidf_bench.py
+    /// 表14; the derivation is in tracking/pid_controller.h.
+    ///
+    /// 0 turns the feed-forward off exactly, and leaves the integral to carry a
+    /// moving target — safe everywhere, but it trails on a fast strafe at low
+    /// sensitivity, which is what this row is for.
+    ///
+    /// Range 0–16, step 0.05. Default 3: right for a low-sensitivity game and
+    /// safe down to alpha ≈ 0.05. A normal-sensitivity game may prefer 1–2, and
+    /// must lower kp and kd as well — see the Kp note above.
+    widgets::SliderState ffGain{3.0f, 0.0f, 16.0f, 0.05f};
+
 
     /// Aim deadzone (0.0–1.0, one decimal): ports the old project's
     /// `convergeThresh`. Once the TARGET is within `deadzone` of the screen
@@ -252,12 +480,16 @@ struct PageAim {
     /// Touch-area overlay (the dashed box on screen).
     TouchAreaOverlay touchArea;
 
-    /// Touch fusion — when on, aim always uses its own synthetic finger. If a
-    /// physical finger is held inside the touch area, its per-frame delta is
-    /// blended with the aim output when both directions align (dot > 0);
-    /// when directions conflict, pure aim output is used. The physical finger
-    /// mirrors normally to the game alongside the synthetic one.  When off, aim
-    /// takes over the physical finger exclusively (no synthetic press).
+    /// Touch fusion — ON: aim drives a REAL finger, and no new touch point is
+    /// created. If a physical finger is held inside the touch area, aim takes
+    /// over that finger's mirror slot and moves it directly: the aim increment
+    /// is added straight onto the finger's own coordinates. The player keeps
+    /// control of the FORWARD direction only — finger movement pointing the
+    /// same way as the aim is added to it (the finger helps), movement pointing
+    /// the other way is discarded (it can never fight the aim).
+    ///
+    /// OFF: aim presses a separate synthetic finger at the touch-area centre;
+    /// the player's own finger is mirrored to the game untouched. No takeover.
     widgets::SwitchState fusion{false};
 
     /// Continuous trigger — when on, the trigger-area switch is hidden on the

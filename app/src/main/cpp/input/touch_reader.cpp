@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "inject_backend.h"
+#include "panel_filter.h"
 #include "uinput_inject.h"
 #include <fcntl.h>
 #include <linux/input.h>
@@ -365,9 +366,21 @@ bool rebuildPointersLocked(int* ids, int* xs, int* ys, int* rawXs, int* rawYs,
 
 // ── Device discovery ─────────────────────────────────────────────────────────
 
+/// What [probeTouchDevice] learned about one event node.
+struct TouchProbeInfo {
+    bool ok = false;         // accepted panel: B = slot+MT X/Y, A = MT X/Y+BTN_TOUCH+DIRECT
+    bool hasSlot = false;
+    bool hasDirect = false;  // INPUT_PROP_DIRECT (direct touch, not a pointer pad)
+    bool hasBtnTouch = false;// BTN_TOUCH in the KEY bitmap
+    bool hasMtPos = false;   // ABS_MT_POSITION_X and _Y both advertised
+    int  mtAxisCount = 0;    // extra MT axes: TRACKING_ID / TOUCH_MAJOR / PRESSURE
+    int  maxX = 0, maxY = 0;
+};
+
 /// True when the device advertises the multitouch axes we need.
-bool probeTouchDevice(int fd, bool* hasSlotOut, int* maxXOut, int* maxYOut) {
-    bool hasX = false, hasY = false, hasSlot = false;
+TouchProbeInfo probeTouchDevice(int fd) {
+    TouchProbeInfo info;
+    bool hasX = false, hasY = false;
 
     uint8_t* bits = nullptr;
     ssize_t size = 0;
@@ -382,26 +395,52 @@ bool probeTouchDevice(int fd, bool* hasSlotOut, int* maxXOut, int* maxYOut) {
         for (int k = 0; k < 8; ++k) {
             if (!(bits[j] & (1 << k))) continue;
             int code = j * 8 + k;
-            if (code == ABS_MT_SLOT)           hasSlot = true;
+            if (code == ABS_MT_SLOT)           info.hasSlot = true;
             else if (code == ABS_MT_POSITION_X) hasX = true;
             else if (code == ABS_MT_POSITION_Y) hasY = true;
+            else if (code == ABS_MT_TRACKING_ID ||
+                     code == ABS_MT_TOUCH_MAJOR ||
+                     code == ABS_MT_PRESSURE) {
+                ++info.mtAxisCount;
+            }
         }
     }
     free(bits);
 
-    // 必须 Protocol B（带 ABS_MT_SLOT）。vivo 等厂商把"屏下指纹辅助触摸"
-    // 也做成 ABS_MT_* Protocol A，没有 SLOT，仅靠 X/Y 校验会被一起误识别成主屏。
-    // 后果是 reader 把多设备全 grab，真触摸屏也被独占，系统触摸整体死亡。
-    if (!hasX || !hasY || !hasSlot) return false;
+    info.hasMtPos = hasX && hasY;
+    if (!hasX || !hasY) return info;
+
+    // BTN_TOUCH 是真触摸面板的标志。vivo 把"屏下指纹辅助触摸"做成带
+    // ABS_MT_POSITION_X/Y 的节点（vivo_ts_fp 的轴范围甚至和真屏一致），但那类
+    // 节点既没有 BTN_TOUCH 也没有 INPUT_PROP_DIRECT —— 仅凭 X/Y 校验会把它们
+    // 误识别成主屏，reader 一 grab，真触摸屏就被独占，系统触摸整体死亡。
+    uint8_t keyBits[(KEY_MAX + 7) / 8] = {};
+    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keyBits)), keyBits) > 0) {
+        info.hasBtnTouch = (keyBits[BTN_TOUCH / 8] >> (BTN_TOUCH % 8)) & 1;
+    }
 
     input_absinfo infoX{}, infoY{};
-    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &infoX) != 0) return false;
-    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &infoY) != 0) return false;
+    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &infoX) != 0) return info;
+    if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &infoY) != 0) return info;
+    info.maxX = infoX.maximum;
+    info.maxY = infoY.maximum;
 
-    if (hasSlotOut) *hasSlotOut = hasSlot;
-    if (maxXOut)    *maxXOut = infoX.maximum;
-    if (maxYOut)    *maxYOut = infoY.maximum;
-    return true;
+    uint8_t props[(INPUT_PROP_MAX + 7) / 8] = {};
+    if (ioctl(fd, EVIOCGPROP(sizeof(props)), props) > 0) {
+        info.hasDirect = (props[INPUT_PROP_DIRECT / 8] >> (INPUT_PROP_DIRECT % 8)) & 1;
+    }
+
+    // Protocol B（带 ABS_MT_SLOT）照旧无条件接受。协议 A（无 SLOT）只在完整
+    // 直触签名齐备时开放：MT 位置轴 + BTN_TOUCH + INPUT_PROP_DIRECT。这条
+    // 路径是为华为/荣耀的 "input_mt_wrapper" 设的 —— 那类机器唯一的触摸节点
+    // 没有 ABS_MT_SLOT，但 BTN_TOUCH/DIRECT/TRACKING_ID 一样不缺；而指纹辅助
+    // 节点（vivo_ts_fp / vivo_fp）最多只凑齐 MT 位置轴。
+    if (info.hasSlot) {
+        info.ok = true;
+    } else {
+        info.ok = info.hasBtnTouch && info.hasDirect;
+    }
+    return info;
 }
 
 /// Enumerates /dev/input/event* and returns the paths of real panels.
@@ -458,13 +497,25 @@ void enumeratePanelsDetailed(std::vector<ReaderPanel>& out,
     const char* ourSysname = uinput_get_our_sysname();
     const bool haveOurVirtual = (ourSysname != nullptr && ourSysname[0] != '\0');
 
+    // Collected first, ranked afterwards: the "first in sorted path order"
+    // default was wrong — "/dev/input/event12" sorts before "/dev/input/event7"
+    // and a Bluetooth band mimicking a touchscreen would then be grabbed
+    // instead of the real panel.
+    struct FoundPanel {
+        std::string path;
+        std::string name;
+        bool ownVirtual;
+        int  score;
+        TouchProbeInfo probe;
+    };
+    std::vector<FoundPanel> found;
+
     for (const std::string& path : candidates) {
         int fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) continue;
 
-        bool hasSlot = false;
-        int maxX = 0, maxY = 0;
-        bool ok = probeTouchDevice(fd, &hasSlot, &maxX, &maxY);
+        TouchProbeInfo probe = probeTouchDevice(fd);
+        bool ok = probe.ok;
 
         char name[128] = {};
         if (ok && skipOurVirtualDevice) {
@@ -477,6 +528,21 @@ void enumeratePanelsDetailed(std::vector<ReaderPanel>& out,
         // rejected: it is the only way the user can tell two event nodes apart.
         if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) <= 0) {
             snprintf(name, sizeof(name), "(unnamed)");
+        }
+
+        // 带 MT 位置轴却被拒的节点值得记一笔：要么是被护栏正确挡下的指纹
+        // 辅助节点，要么是用户唯一的触摸屏、而我们的门槛对它太紧。
+        if (!ok && probe.hasMtPos) {
+            LOGI("panel %s '%s' has MT position axes but was rejected "
+                 "(slot=%d btnTouch=%d direct=%d)",
+                 path.c_str(), name, probe.hasSlot ? 1 : 0,
+                 probe.hasBtnTouch ? 1 : 0, probe.hasDirect ? 1 : 0);
+        }
+
+        // capability-wise a Bluetooth band can pass the probe; drop it by name.
+        if (ok && isBlacklistedPanelName(name)) {
+            LOGI("panel %s '%s' matches blacklist — skipped", path.c_str(), name);
+            ok = false;
         }
 
         // Own uinput? Walk /sys/class/input/<eventN>, readlink the symlink,
@@ -508,20 +574,38 @@ void enumeratePanelsDetailed(std::vector<ReaderPanel>& out,
         }
 
         if (ok) {
-            LOGI("panel %s max=%d,%d slot=%d own=%d", path.c_str(), maxX, maxY,
-                 hasSlot ? 1 : 0, ownVirtual ? 1 : 0);
-            g_panelPaths.push_back(path);
-            g_panelNames.emplace_back(name);
-            g_panelOwnVirtual.push_back(ownVirtual);
-            out.push_back({g_panelPaths.back().c_str(),
-                           g_panelNames.back().c_str(),
-                           ownVirtual});
-            if (static_cast<int>(out.size()) >= kMaxDevices) {
-                close(fd);
-                break;
-            }
+            // Real panels declare INPUT_PROP_DIRECT and carry the extra MT axes
+            // (TOUCH_MAJOR/PRESSURE/TRACKING_ID); accessories that merely mimic
+            // a touchscreen usually declare only the minimum set. Scored, not
+            // hard-filtered, so a panel that skips DIRECT still stays in the
+            // race. Ties keep the lexical path order (the old default).
+            int score = (probe.hasDirect ? 1 : 0) + probe.mtAxisCount;
+            LOGI("panel %s '%s' max=%d,%d slot=%d direct=%d mtAxes=%d score=%d own=%d",
+                 path.c_str(), name, probe.maxX, probe.maxY,
+                 probe.hasSlot ? 1 : 0, probe.hasDirect ? 1 : 0,
+                 probe.mtAxisCount, score, ownVirtual ? 1 : 0);
+            found.push_back({path, name, ownVirtual, score, probe});
         }
         close(fd);
+    }
+
+    std::stable_sort(found.begin(), found.end(),
+                     [](const FoundPanel& a, const FoundPanel& b) {
+                         return a.score > b.score;
+                     });
+    if (found.size() > static_cast<size_t>(kMaxDevices)) {
+        found.resize(static_cast<size_t>(kMaxDevices));
+    }
+
+    // Fill the static pools in ranked order so the const char* handed out below
+    // stays valid until the next enumeration.
+    for (const FoundPanel& f : found) {
+        g_panelPaths.push_back(f.path);
+        g_panelNames.push_back(f.name);
+        g_panelOwnVirtual.push_back(f.ownVirtual);
+        out.push_back({g_panelPaths.back().c_str(),
+                       g_panelNames.back().c_str(),
+                       f.ownVirtual});
     }
 }
 
@@ -788,11 +872,15 @@ extern "C" bool reader_init_with_path(const char* path, int screenW, int screenH
     }
     bool hasSlot = false;
     int maxX = 0, maxY = 0;
-    if (!probeTouchDevice(fd, &hasSlot, &maxX, &maxY)) {
+    TouchProbeInfo probe = probeTouchDevice(fd);
+    if (!probe.ok) {
         LOGE("probeTouchDevice rejected %s", path);
         close(fd);
         return false;
     }
+    hasSlot = probe.hasSlot;
+    maxX = probe.maxX;
+    maxY = probe.maxY;
     g_maxX = maxX;
     g_maxY = maxY;
     g_refHasSlot = hasSlot;

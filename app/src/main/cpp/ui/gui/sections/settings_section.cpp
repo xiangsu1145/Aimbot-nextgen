@@ -202,9 +202,9 @@ void driveInferenceCircle(PageSettings::InferenceAreaOverlay& a,
 void drawSettingsSection(ImDrawList* dl, float x, float& y, float w,
                          float /*bottomY*/, float s, float es, const Xf& xf,
                          Scroll& sc) {
-    const float gap   = 12.0f * s;
-    const float rowSw = widgets::kSwitchRowH   * s;
-    const float rowSl = widgets::kSliderRowH   * s;
+    const float gap   = csize(12.0f) * s;
+    const float rowSw = csize(widgets::kSwitchRowH)   * s;
+    const float rowSl = csize(widgets::kSliderRowH)   * s;
 
     auto wRect = [&](float wx, float wy, float ww, float wh) {
         const ImVec2 p = xf.pt(wx, wy - sc.offset);
@@ -245,19 +245,15 @@ void drawSettingsSection(ImDrawList* dl, float x, float& y, float w,
     widgets::switchButton(dl, wRect(x, y, w, rowSw), g_pageSettings.touchPassthrough, "允许触摸穿透", es);
     y += rowSw + gap;
 
-    // HIDDEN 2026-09-13: predictive / tracker UI rows are no longer drawn while
-    // the predictive F-term path is disabled (the user reverted to the old
-    // project's smoothVel-only F term). The widget states (showTracking,
-    // trackIou, trackConfirm, trackTerminate) and the syncSettingsPage writes
-    // into trackerConfig() are kept — they cost almost nothing and make
-    // re-enabling the predictive path a one-line change. To re-enable:
-    // uncomment the four blocks below.
-    //
-    // widgets::switchButton(dl, wRect(x, y, w, rowSw), g_pageSettings.showTracking, "显示追踪框", es);
-    // y += rowSw + gap;
-    // widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackIou,        "追踪IoU",   2, es); y += rowSl + gap;
-    // widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackConfirm,    "确认帧",    0, es); y += rowSl + gap;
-    // widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackTerminate,  "丢失帧",    0, es); y += rowSl + gap;
+    // Tracker tuning: ranges 1-10 for confirm/terminate per the 2026-09 design.
+    // trackPredictHoldFrames lives on the Aim page now (alongside the gains)
+    // because it directly gates how long the aim keeps a lock through an
+    // occlusion — it's an aim-time decision, not a tracker-association one.
+    widgets::switchButton(dl, wRect(x, y, w, rowSw), g_pageSettings.showTracking, "显示追踪框", es);
+    y += rowSw + gap;
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackIou,        "追踪IoU",   2, es); y += rowSl + gap;
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackConfirm,    "确认帧",    0, es); y += rowSl + gap;
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackTerminate,  "丢失帧",    0, es); y += rowSl + gap;
 
     // ── Exit / restore touch ───────────────────────────────────────────────
     // Last row on the page: the control you reach for when nothing else
@@ -309,8 +305,8 @@ void drawInferenceAreaOverlay() {
     dl->AddCircleFilled(ImVec2(a.cx,        a.cy + a.r), kInfTrigHandleDraw, kInfOverlayHandle);
     dl->AddCircleFilled(ImVec2(a.cx - a.r, a.cy       ), kInfTrigHandleDraw, kInfOverlayHandle);
 
-    const ImVec2 ts = font->CalcTextSizeA(kInfOverlayLabelSize, FLT_MAX, 0.0f, "推理区域");
-    dl->AddText(font, kInfOverlayLabelSize,
+    const ImVec2 ts = font->CalcTextSizeA(tsize(kInfOverlayLabelSize), FLT_MAX, 0.0f, "推理区域");
+    dl->AddText(font, tsize(kInfOverlayLabelSize),
                  ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f),
                  kInfOverlayLabel, "推理区域");
 }
@@ -319,9 +315,10 @@ void syncSettingsPage() {
     // Push the tracker tuning sliders into the global tracker config. Cheap;
     // runs every frame but only writes a few scalars.
     auto& cfg = tracking::trackerConfig();
-    cfg.iouThreshold    = g_pageSettings.trackIou.value;
-    cfg.confirmFrames   = static_cast<int>(g_pageSettings.trackConfirm.value + 0.5f);
-    cfg.terminateFrames = static_cast<int>(g_pageSettings.trackTerminate.value + 0.5f);
+    cfg.iouThreshold      = g_pageSettings.trackIou.value;
+    cfg.confirmFrames     = static_cast<int>(g_pageSettings.trackConfirm.value + 0.5f);
+    cfg.terminateFrames   = static_cast<int>(g_pageSettings.trackTerminate.value + 0.5f);
+    // predictHoldFrames is on the Aim page; syncAimPage() writes it.
 
     // Anything this page owns that reaches out of the menu is applied here, on
     // a transition, rather than being pushed by the draw call that flipped it
