@@ -130,11 +130,19 @@ constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 //        In 9 the reconstruction constant is estimated on-line (AlphaEstimator,
 //        derived from the fact that our own command history is known exactly and
 //        is the one regressor a target's smooth motion does not mimic) and kf is
-//        a plain STRENGTH, 0…0.20, so a small kf is the conservative choice
-//        rather than the worst one. The old default (3) would clamp to 0.20 and
-//        behave, but re-seeding makes the intent explicit: default 0.20.
-//        Measured: scripts/aim_selftrap_bench.py 表2/表8.
-constexpr int kCtlSchema = 9;
+//        a plain STRENGTH.
+//
+//        In 10 that strength's RANGE changes from 0…0.20 to 0…2.0 and the default
+//        from 0.20 to 1.00. The reconstruction made kf scale-free — its share of
+//        the DC carrier is kf·alpha/alpha_hat ≈ 0.8·kf, the same on every game —
+//        so the correct value is the CONSTANT ≈1.0 and 0.20 was simply below it:
+//        that ceiling is why the user's aim could not keep up while showing no
+//        overshoot. A stored 9 value (0.08…0.20) is a strength on the same scale
+//        but a wrong one, and reading it back would keep the user in the failure
+//        zone, so the set is re-seeded rather than migrated. See the round-12
+//        section of tracking/pid_controller.h and 表6 of
+//        scripts/aim_gate_lockout_bench.py.
+constexpr int kCtlSchema = 10;
 
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
@@ -347,12 +355,14 @@ void apply(const json& j) {
             a.kp.value = 0.10f;
             a.ki.value = 0.5f;
             a.kd.value = 0.20f;
-            // 0.20 is full feed-forward strength. A stored v8 value was a
-            // RECIPROCAL of the plant gain (calibrated to be 1/alpha, and the
-            // user's own value was 0.05 on a game where the correct figure was
-            // larger), so it cannot be carried across — the same digits would
-            // now mean "5% strength". Re-seed, do not migrate.
-            a.ffGain.value = 0.20f;
+            // 1.00 is the working value: a full DC carrier needs
+            // kf = alpha_hat/alpha (the reciprocal of the estimator's 0.8 bias).
+            // A stored v8 value was a RECIPROCAL of the plant gain (the user's own
+            // was 0.05) and a stored v9 value was a strength on a range that could
+            // not exceed 0.20 (his was 0.08) — either way the same digits are
+            // wrong here, and a small kf trails a strafe by hundreds of px. The
+            // set is therefore re-seeded, not migrated.
+            a.ffGain.value = 1.00f;
             LOGI("config: aim gains re-seeded for controller schema %d "
                  "(file had %d): kp=%.2f ki=%.1f kd=%.2f kf=%.2f",
                  kCtlSchema, storedCtl, a.kp.value, a.ki.value, a.kd.value,
@@ -361,8 +371,9 @@ void apply(const json& j) {
         getSlider(o, "outSmooth", a.outSmooth);
         getSlider(o, "delay", a.aimDelayFrames);
         // kf changes MEANING with the schema (v7 scaled it by 灵敏度补偿; v8 made
-        // it 1/alpha; v9 makes it a bare strength), so it is read only from a
-        // same-schema file. Reading it unconditionally would silently overwrite
+        // it 1/alpha; v9 made it a strength whose range stopped at 0.20; v10 is a
+        // strength that actually reaches the working value of 1.0), so it is read
+        // only from a same-schema file. Reading it unconditionally would silently overwrite
         // the re-seeded value above — the "re-seeded ... kf=" log line would be a
         // lie, and a number that meant something else under the old controller
         // would come back.

@@ -56,12 +56,78 @@
 //      alpha_hat UNDER-estimated  → negative → extra damping        SAFE
 //      alpha_hat exact            → zero    → a true feed-forward   IDEAL
 //      alpha_hat OVER-estimated   → positive → the (★) trap returns BAD
-//  and its size is scaled by kf, which is why a small kf is now genuinely the
-//  conservative choice — the opposite of round 10, where a small kf was the
-//  worst choice available. Measured over alpha = 0.5…2.5 with alpha_hat off by
-//  0.4×…2.0× and kf = 0.20 (表8): lag −5 px, sway 5…11 px, post-stop overshoot
-//  3…6 px, in every cell. kf = 1.0 needs a good alpha_hat; kf ≤ 0.5 does not.
-//  That robustness is the reason the slider stops at 0.20.
+//  and its size is scaled by kf, which is why a small kf is the conservative
+//  choice — the opposite of round 10. Two things in the paragraph above were
+//  CORRECTED by round 12 and must not be trusted: the bench that produced
+//  "kf ≤ 0.5 is the robust band, so the slider stops at 0.20" never tested an
+//  alpha below 0.5, and 0.20 is nowhere near the correct value — see the
+//  round-12 section below. Also note that "a small kf is safe" is a statement
+//  about STABILITY, not about tracking: a small kf is safe and useless.
+//
+//  ── ROUND 12: THE 0.20 CEILING ON kf WAS THE BUG ────────────────────────────
+//
+//  The user, at kp 0.06 / ki 0.1 / kd 0.15 / kf 0.08 with an in-game sensitivity
+//  of 70: "就是不过冲了，但是目标停下会左右抖几下，并且跟枪跟不上了。"
+//
+//  Both symptoms are two NUMBERS, and neither is one of his gains.
+//
+//  1. THE FEED-FORWARD'S GAIN ON TARGET VELOCITY IS kf/alpha_hat, NOT kf.
+//     Expand (★★) at DC — F = (kf/alpha_hat)·Δe + kf·u(k−L) — and substitute
+//     Δe = w − alpha·u(k−L):
+//
+//         F = (kf/alpha_hat)·w + kf·(1 − alpha/alpha_hat)·u(k−L)
+//
+//     The DC command a loop must produce to hold a target moving w view px per
+//     step is u_ss = w/alpha, so the fraction of that carrier the feed-forward
+//     supplies is
+//
+//         (kf/alpha_hat)/(1/alpha) = kf·alpha/alpha_hat ≈ 0.8·kf
+//
+//     — INDEPENDENT of alpha, i.e. of the game. At the old ceiling of 0.20 that
+//     is 16 %, and the user's 0.08 supplies 6 %. **kf could not reach the
+//     carrier, which is literally what "kf 跟不上枪" says.** The integral then
+//     had to carry the rest, and at low alpha the carrier is large: 50 finger
+//     px/step for a 600 px/s target at alpha = 0.1.
+//
+//  2. THE GATE MADE CARRYING IT IMPOSSIBLE. Holding that carrier with P alone
+//     needs an error of e = w/(alpha·kp) — 833 px at the user's gains — while
+//     the gate's threshold is 1.5 × box ≈ 96…450 px. So the loop is ALWAYS "not
+//     settled", and on that branch the integral is ZEROED, every frame, forever.
+//     It can never build the carrier; the error stays pinned at 833 px; and the
+//     only condition that would end it (|e| < 0.06·box) never arrives. The gate
+//     is a LATCH and |Δe| < 2 px cannot hold on a strafing target (Δe ≈ 5 px at
+//     600 px/s), so nothing opens it. Measured, alpha = 0.1, box 150 px
+//     (scripts/aim_gate_lockout_bench.py 表1/表2): gate shut 80…93 % of frames,
+//     error parked at 475…663 px, against 12 px with the gate off. THAT is
+//     "跟不上", and no value of kf inside 0…0.20 can tune out of it.
+//
+//  3. SO kf NOW REACHES 2.0, AND ITS CORRECT VALUE IS A CONSTANT. From (1),
+//     a full carrier needs kf = alpha_hat/alpha, i.e. the reciprocal of the
+//     estimator's own bias (1/0.8 = 1.25); with the feed-forward's filter lag
+//     the measured optimum is ~1.0. That number does NOT depend on the game, the
+//     sensitivity or the device, because alpha_hat is estimated on-line and the
+//     ratio is scale-free. The slider is a trim, not a calibration: 1.0 is the
+//     value, 0.8…1.5 the usable band, and 0 exactly switches F off.
+//     Measured at the user's gains, alpha = 0.1: kf 0.08 -> lag 663 px; 0.20 ->
+//     645; 0.40 -> 126; 0.60 -> 82; 0.80 -> 36; 1.00 -> −12; 1.20 -> −62.
+//     Across alpha = 0.05…2.5 at kf = 1.0: lag −1…−19 px. With alpha_hat wrong
+//     by 0.4×…3.0×: lag −33…+12 px. The old ceiling put the ENTIRE slider inside
+//     the first two cells.
+//
+//  4. THE FEED-FORWARD IS NO LONGER GATED. F is a MEASUREMENT (ŵ is
+//     reconstructed from the Δe just observed), not the "bet" the gate's
+//     rationale describes, so gating it protected nothing and latched the loop
+//     out of the regime it exists for. The gate now governs the INTEGRAL only —
+//     which is the one thing the reference PID's rule really protects.
+//
+//  The price, stated honestly: the feed-forward's NOISE gain is also
+//  kf/alpha_hat, so at kf = 1.0 and alpha = 0.1 a 1.5 px detection wobble
+//  becomes ~5 px of crosshair shimmer (表A) — that is what the user's small kf
+//  was accidentally buying, and it is much cheaper than a 650 px lag. The error
+//  is built from the tracker's SMOOTHED position, not the raw detector, so the
+//  figure in practice is nearer 1…3 px. If the shimmer is still objectionable,
+//  raise kFfTauSec (0.033 -> 0.05…0.08 trades a few px of lead for it) rather
+//  than lowering kf, which trades the tracking back.
 //
 //  ── THE GATE (ported from the reference PID the user pointed at) ────────────
 //
@@ -124,8 +190,9 @@
 //  with hysteresis was tried, was invented here rather than ported, and cost the
 //  final approach: a 250 px step reached |e| < 2 px in 76 frames with the switch
 //  against 20 without it. The GATE above is a different thing — it switches the
-//  feed-forward and the integral, not the proportional gain, so the approach is
-//  still driven at full authority.
+//  the INTEGRAL, not the proportional gain, so the approach is still driven at
+//  full authority. (Round 12 took the feed-forward out of its jurisdiction — see
+//  the round-12 section above.)
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -156,12 +223,16 @@ constexpr float kDerivTauSec = 0.025f;
 // NOT critical — measured, a wrong value anywhere from 2 to 7 changes the sway
 // by a few px — so it is a constant and never a slider.
 //
-// kFfStrengthMax: the top of the kf slider. 0.20 is where the residual self-term
-// stays small enough that alpha_hat barely matters; above it the loop starts to
-// depend on the estimate being right (表8).
+// kFfStrengthMax: the top of the kf slider. 2.0 — NOT 0.20. Round 11 had 0.20
+// and that ceiling was the bug the user was feeling: from the round-12 section,
+// the feed-forward's carrier fraction is ≈ 0.8·kf, so 0.20 caps it at 16 % of
+// the DC command the loop needs, no matter what the game's sensitivity is. The
+// CORRECT value is ~1.0 for every game (kf = alpha_hat/alpha, and alpha_hat is
+// estimated on-line), so the range has to straddle 1.0 comfortably on both
+// sides. 2.0 is headroom, not a target.
 constexpr float kFfTauSec      = 0.033f;
 constexpr int   kFfDelaySteps  = 5;
-constexpr float kFfStrengthMax = 0.20f;
+constexpr float kFfStrengthMax = 2.0f;
 
 // ── Soft start ──────────────────────────────────────────────────────────────
 //
@@ -338,9 +409,10 @@ public:
     // outSmooth : EMA on the output, 0..1. 1.0 = OFF (the default) and there is a
     //             reason it ships off: an EMA is pure phase lag, and phase lag is
     //             the one thing a delay-limited loop cannot afford.
-    // kf        : feed-forward STRENGTH, 0…kFfStrengthMax. It is no longer the
-    //             plant gain and no longer needs to be calibrated against one;
-    //             0 turns F off, 0.20 is full strength. See the header.
+    // kf        : feed-forward STRENGTH, 0…kFfStrengthMax. Not the plant gain,
+    //             and no longer a per-game calibration: the correct value is the
+    //             CONSTANT ≈1.0 (kf = alpha_hat/alpha, and alpha_hat is estimated
+    //             on-line), 0 turns F off, and 2.0 is headroom. See the header.
     //
     // NOTE: this does NOT reset the controller. See the class comment.
     void setGains(float kp_, float ki_, float kd_, float outSmooth_, float kf_) {
@@ -420,9 +492,11 @@ public:
         // Deadzone: suppress the proportional and derivative terms only.
         if (frozen) { p = 0.0f; d = 0.0f; }
 
-        // ── The gate ──────────────────────────────────────────────────────────
-        // ── See the header: transients are the one place a velocity
-        // feed-forward is worthless and an integrator can only do harm. The
+        // ── The gate: the INTEGRAL's transient guard ─────────────────────────
+        // See the header: an integrator can only do harm in a transient, and that
+        // is all this now governs — round 12 removed the feed-forward from its
+        // jurisdiction (see the FF branch below), because gating a MEASUREMENT
+        // protected nothing and latched the loop out of low-alpha tracking. The
         // threshold is in TARGET WIDTHS, so it means the same thing at any range,
         // and the integral is ZEROED (not frozen) on the far branch.
         bool allow = true;
@@ -451,8 +525,20 @@ public:
         // which is the trap in the header. u(k−L) is the delay-aligned sample out
         // of the ring: the command that actually produced the Δe we are looking
         // at, NOT the previous step's output.
+        //
+        // NOT gated by `allow` — deliberately. The gate's rationale is "a lead is
+        // a bet that the target keeps going", but this F is a MEASUREMENT: ŵ is
+        // reconstructed from the Δe just observed, so there is nothing to protect
+        // by suppressing it. Gating it does positive harm, because the gate is a
+        // LATCH: |Δe| < 2 px cannot hold on a strafing target, and the only other
+        // way back in is |e| < 0.06·box — unreachable at low alpha, where holding
+        // a moving target with P alone needs |e| = w/(alpha·kp) (833 px at
+        // alpha = 0.1, kp = 0.06) while the threshold is only 1.5·box. A gated
+        // feed-forward therefore locks ITSELF out exactly in the regime it exists
+        // for — that is the user's "跟不上" (表1/表2: gate shut 80…93 % of frames,
+        // error parked at 475…663 px).
         float ff = 0.0f;
-        if (kf > 0.0f && alphaHat > 0.0f && allow && !ffInhibit) {
+        if (kf > 0.0f && alphaHat > 0.0f && !ffInhibit) {
             const float af = dt / (dt + kFfTauSec);
             ffVel += af * ((de + alphaHat * uHist[uHead]) - ffVel);
             ff = std::clamp(kf * ffVel / alphaHat, -outLimit, outLimit);
@@ -512,10 +598,11 @@ public:
 
     /// Read-only views for the diagnostic log.
     ///
-    /// `ffValue()` is THE number to watch on a moving target: it should settle at
-    /// about kf × ΔT/alpha and HOLD there. Near zero while the error trails the
-    /// target means F is not running (kf = 0, the gate is shut, or every frame
-    /// reports targetChanged).
+    /// `ffValue()` is THE number to watch on a moving target: at kf ≈ 1.0 it
+    /// should settle at about ΔT/alpha — the WHOLE DC carrier — and hold there.
+    /// Near zero while the error trails the target means F is not running (kf = 0
+    /// or every frame reports targetChanged). Before round 12 it also settled low
+    /// whenever the gate was shut, which at low alpha was most of the time.
     ///
     /// `integralValue()` is the DC carrier: with kf = 0.20 it supplies most of
     /// u_ss, so it should be a SIZABLE number on a moving target and near zero on
@@ -540,7 +627,7 @@ private:
     float ki        = 0.5f;
     float kd        = 0.20f;
     float outSmooth = 1.0f;
-    float kf        = 0.20f;
+    float kf        = 1.0f;
     float alphaHat  = 1.0f;
 
     // ── State ─────────────────────────────────────────────────────────────────

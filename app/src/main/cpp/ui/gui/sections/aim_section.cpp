@@ -799,10 +799,16 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // overshot when the target stopped, all from the same cause.
     //
     // The reconstruction constant is now derived on-line (AlphaEstimator, in
-    // tracking/pid_controller.h) and kf is a plain strength, so a SMALL kf is
-    // genuinely the conservative choice — the reverse of round 10. Measured
-    // across alpha 0.5…2.5 with the constant off by 0.4×…2.0×: at 0.20 the lag
-    // is −5 px, the sway 5–11 px, the post-stop overshoot 3–6 px, in every cell.
+    // tracking/pid_controller.h) and kf is a plain strength — but the round-11
+    // range of 0…0.20 was still wrong, and it was the thing the user felt. At DC
+    // the feed-forward's share of the DC carrier is kf·alpha/alpha_hat ≈ 0.8·kf,
+    // independent of the game, so 0.20 could never supply more than 16 % of what
+    // a moving target needs and his 0.08 supplied 6 %. Measured at his gains,
+    // alpha = 0.1, 600 px/s: kf 0.08 -> lag 663 px, 0.20 -> 645, 0.40 -> 126,
+    // 0.80 -> 36, 1.00 -> −12. The correct value is a CONSTANT ≈1.0 (full carrier
+    // needs kf = alpha_hat/alpha, and alpha_hat is estimated on-line), so this row
+    // is a trim with a known setting rather than a calibration. See
+    // scripts/aim_gate_lockout_bench.py 表0/表6.
     //
     // Its row was 速度前馈 once, feeding an estimator that was structurally a
     // bare integrator (it measured its own output with no restoring term, so it
@@ -1060,11 +1066,12 @@ void syncAimPage() {
     //
     // Four gains and the output EMA: that is the whole parameter set. There is no
     // sensitivity compensation argument any more and nothing is scaled — the
-    // fifth argument is 前馈增益, which is both the feed-forward gain and the
-    // reciprocal of the reconstruction constant, so it carries the plant gain
-    // inside itself (kf = 1/alpha). The output ceiling and the derivative's
-    // filter constant are loop constants: tracking::kOutLimitPx / kTrimLimitPx /
-    // kDerivTauSec. See AimController::setGains().
+    // fifth argument is kf, the feed-forward STRENGTH. It is not the plant gain:
+    // the reconstruction constant is estimated on-line inside the controller, so
+    // kf is a plain multiplier whose correct value is the constant ≈1.0. The
+    // output ceiling and the derivative's filter constant are loop constants:
+    // tracking::kOutLimitPx / kTrimLimitPx / kDerivTauSec. See
+    // AimController::setGains().
     p.touchAim.aim.setGains(
         p.kp.value, p.ki.value, p.kd.value, p.outSmooth.value,
         p.ffGain.value);

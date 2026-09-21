@@ -149,7 +149,12 @@ def run(ctrl, alpha, scen, steps=2400, sigma=1.5, seed=7,
         if scen == "strafe":
             T = (speed / HZ) * k
         elif scen == "stop":
-            T = (speed / HZ) * min(t, tmove)
+            # ★★ 量纲修正（第十二轮）：这里原本写的是 (speed/HZ) * min(t, tmove)，
+            # 而 t 是**秒**，等于把"每步速度"又乘了一次秒。600px/s 的目标在 1.5s
+            # 里只走了 600/120/120*1.5 ≈ 0.06px，**等于静止目标**。
+            # 表2/表4/表8 里所有"停住过冲 3~6px / ki=2.0 只剩 7.5px"都是这样测出来的，
+            # 数值不可用。正确写法：min(k, tmove*HZ)。
+            T = (speed / HZ) * min(k, tmove * HZ)
         elif scen == "step":
             T = 250.0
         else:

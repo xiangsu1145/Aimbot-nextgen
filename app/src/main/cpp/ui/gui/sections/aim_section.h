@@ -137,11 +137,13 @@ struct AimController {
     /// There is NO sensitivity compensation here any more and no scaling of the
     /// gains or of the ceilings: kp, ki, kd and kf go in as they are.
     ///
-    /// `kf` is the feed-forward STRENGTH, 0…0.20 — it is NOT the plant gain any
-    /// more. The reconstruction constant is derived on-line (see `alphaEst`) and
-    /// pushed into both axes; round 10's demand that the user calibrate kf
-    /// against their game's sensitivity is what made a small kf actively worse
-    /// than zero. See the header of tracking/pid_controller.h.
+    /// `kf` is the feed-forward STRENGTH, 0…2.0 — it is NOT the plant gain. The
+    /// reconstruction constant is derived on-line (see `alphaEst`) and pushed
+    /// into both axes, which is what makes the correct kf a CONSTANT (~1.0)
+    /// instead of a per-game calibration, and what makes 1.0 rather than 0.20 the
+    /// working value. Round 11 capped it at 0.20 and that cap — not the user's
+    /// tuning — is why the aim could not keep up. See the header of
+    /// tracking/pid_controller.h, round-12 section.
     void setGains(float kp, float ki, float kd, float outSmooth, float kf) {
         this->ffGain = std::max(0.0f, kf);
         pidX.setGains(kp, ki, kd, outSmooth, kf);
@@ -241,7 +243,7 @@ struct AimController {
     float outLimitPx() const { return pidX.outLimitPx(); }
 
 private:
-    float ffGain = 0.20f;
+    float ffGain = 1.00f;
     /// One plant-gain fit, shared by both axes (alpha is the game's sensitivity,
     /// not an axis property).
     tracking::AlphaEstimator alphaEst;
@@ -478,29 +480,43 @@ struct PageAim {
     /// mechanism, which is why every attempt to tune them apart failed.
     ///
     /// NOW. The reconstruction constant is derived on-line (AlphaEstimator) and
-    /// kf is only a strength, 0…0.20:
+    /// kf is only a strength, 0…2.0:
     ///
     ///     ff = (kf/alpha_hat)·LPF( Δe + alpha_hat·u(k−L) )
     ///
-    /// Residual self-term = kf·(1 − alpha/alpha_hat)·u(k−L), so a small kf is now
-    /// genuinely the safe choice (the opposite of round 10). Measured across
-    /// alpha 0.5…2.5 with alpha_hat off by 0.4×…2.0×: at kf = 0.20 the lag is
-    /// −5 px, the sway 5–11 px and the post-stop overshoot 3–6 px in every cell
-    /// (scripts/aim_selftrap_bench.py 表8). That robustness is why the range
-    /// stops at 0.20.
+    /// Residual self-term = kf·(1 − alpha/alpha_hat)·u(k−L), so the error in the
+    /// constant is asymmetric: under-estimate = extra damping (safe), over-
+    /// estimate = the z = 1 trap returns (bad). "A small kf is safe" is therefore
+    /// true — and useless, which is the round-11 mistake this one fixes.
     ///
-    /// HOW TO SET IT. Watch the error while the target strafes at a constant
-    /// speed: one sign that persists = the crosshair trails = raise kf. Sway on a
-    /// STILL target at any kf means the problem is not kf at all — check
-    /// kp × alpha_hat (shown in the log) against 0.285, because that is the
-    /// delay's hard ceiling and no feed-forward setting will fix it.
+    /// THE RANGE WAS THE BUG. Expanding the formula at DC gives the feed-forward
+    /// a gain on TARGET VELOCITY of kf/alpha_hat and a share of the DC carrier of
+    ///
+    ///     kf·alpha/alpha_hat  ≈ 0.8·kf
+    ///
+    /// — independent of the game. A ceiling of 0.20 could therefore never supply
+    /// more than 16 % of the command the loop needs to hold a moving target, and
+    /// the user's 0.08 supplied 6 %: that is why "kf 跟不上枪" was literally
+    /// true, and why raising ki to compensate overshot instead (the integral is
+    /// the wrong carrier — it has to LEARN the velocity, and wind-up is the
+    /// price). Measured at his gains on a 600 px/s target, alpha = 0.1:
+    /// kf 0.08 -> lag 663 px, 0.20 -> 645, 0.40 -> 126, 0.80 -> 36, 1.00 -> −12.
+    ///
+    /// HOW TO SET IT — it is a CONSTANT, not a calibration. Full carrier needs
+    /// kf = alpha_hat/alpha, the reciprocal of the estimator's own 0.8 bias, so
+    /// ~1.0 on every game and every device; the usable band is 0.8…1.5. Watch the
+    /// error while the target strafes steadily: one persistent sign = trailing =
+    /// raise it; an error that leads (crosshair ahead) = lower it. Sway on a STILL
+    /// target is the OTHER knob — that is the feed-forward amplifying the
+    /// tracker's noise by kf/alpha_hat (12.5× at alpha 0.1), so lower kf or raise
+    /// kFfTauSec. And if the aim shakes at rest even with kf = 0, the cause is not
+    /// this row at all: check kp × alpha_hat (in the log) against 0.285.
     ///
     /// 0 turns the feed-forward off exactly and leaves the integral as the sole
-    /// DC carrier. Safe everywhere; it trails a fast strafe.
+    /// DC carrier. Safe everywhere, but it trails a strafe at low sensitivity.
     ///
-    /// Range 0.00–0.20, step 0.01, default 0.20 (full strength). The range is
-    /// sized to the robust band on purpose — see tracking/pid_controller.h.
-    widgets::SliderState ffGain{0.20f, 0.0f, 0.20f, 0.01f};
+    /// Range 0.00–2.00, step 0.05, default 1.00. See tracking/pid_controller.h.
+    widgets::SliderState ffGain{1.00f, 0.0f, 2.00f, 0.05f};
 
 
     /// Aim deadzone (0.0–1.0, one decimal): ports the old project's
