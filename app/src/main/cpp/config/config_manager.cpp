@@ -113,7 +113,28 @@ constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 //        against changed, so the whole set is re-seeded. Default kf = 3, correct
 //        for a low-sensitivity game and safe down to alpha ≈ 0.05.
 //        See scripts/aim_pidf_bench.py 表14 and tracking/pid_controller.h.
-constexpr int kCtlSchema = 8;
+//
+//  8 → 9  kf CHANGED MEANING, so the stored number is not migrated, only
+//        re-seeded. It was the feed-forward gain AND, through its reciprocal,
+//        the reconstruction constant — one number doing two jobs, which forced
+//        the residual self-term to be (1 − kf·alpha)·u. Expanded, that is
+//        ff = kf·LPF(Δe) + LPF(u(k−L)) — the second term has gain exactly 1,
+//        i.e. the controller was adding its own delayed command back into its
+//        input: a pole at z = 1, an accelerator with no brake. It tracked (a DC
+//        pole integrates a steady target to zero error) and it never settled
+//        (the same pole is marginally stable, so detector noise kept it moving)
+//        and it overshot when the target stopped, WITH ki = 0 — and ki simply
+//        stacked a second integrator on top (measured 3.3 px overshoot at ki = 0
+//        against 1554 px at ki = 0.5).
+//
+//        In 9 the reconstruction constant is estimated on-line (AlphaEstimator,
+//        derived from the fact that our own command history is known exactly and
+//        is the one regressor a target's smooth motion does not mimic) and kf is
+//        a plain STRENGTH, 0…0.20, so a small kf is the conservative choice
+//        rather than the worst one. The old default (3) would clamp to 0.20 and
+//        behave, but re-seeding makes the intent explicit: default 0.20.
+//        Measured: scripts/aim_selftrap_bench.py 表2/表8.
+constexpr int kCtlSchema = 9;
 
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
@@ -204,9 +225,11 @@ json serialize() {
         // files simply carry them as dead keys.
         o["ctl"] = kCtlSchema;
         putSlider(o, "delay", a.aimDelayFrames);
-        // "kf" is the feed-forward gain AND the reciprocal of the reconstruction
-        // constant — one value, two uses, and the second is why it cannot be
-        // split into two sliders. "ff" (v7's 灵敏度补偿) is gone.
+        // "kf" is the feed-forward STRENGTH (0…0.20) — a plain knob since v9. It
+        // used to be the gain AND, through its reciprocal, the reconstruction
+        // constant; that is what made ff add our own delayed command back into
+        // the input at gain 1. The constant is now derived on-line and nothing
+        // else about it is stored. "ff" (v7's 灵敏度补偿) is gone.
         putSlider(o, "kf", a.ffGain);
         putSlider(o, "trackPred", a.trackPredictHoldFrames);
         putSlider(o, "dz", a.deadzone);
@@ -324,11 +347,12 @@ void apply(const json& j) {
             a.kp.value = 0.10f;
             a.ki.value = 0.5f;
             a.kd.value = 0.20f;
-            // 3 is the default for a low-sensitivity game (alpha around 0.1
-            // wants about 10) and safe down to alpha around 0.05. A stored v7
-            // value meant "kf = 灵敏度补偿 × this", i.e. up to 48, so it cannot be
-            // carried across — and a small non-zero kf is worse than 0 anyway.
-            a.ffGain.value = 3.0f;
+            // 0.20 is full feed-forward strength. A stored v8 value was a
+            // RECIPROCAL of the plant gain (calibrated to be 1/alpha, and the
+            // user's own value was 0.05 on a game where the correct figure was
+            // larger), so it cannot be carried across — the same digits would
+            // now mean "5% strength". Re-seed, do not migrate.
+            a.ffGain.value = 0.20f;
             LOGI("config: aim gains re-seeded for controller schema %d "
                  "(file had %d): kp=%.2f ki=%.1f kd=%.2f kf=%.2f",
                  kCtlSchema, storedCtl, a.kp.value, a.ki.value, a.kd.value,
@@ -336,11 +360,12 @@ void apply(const json& j) {
         }
         getSlider(o, "outSmooth", a.outSmooth);
         getSlider(o, "delay", a.aimDelayFrames);
-        // kf changes MEANING with the schema (v7 scaled it by 灵敏度补偿), so it
-        // is read only from a same-schema file. Reading it unconditionally would
-        // silently overwrite the re-seeded value above — the "re-seeded ... kf="
-        // log line would be a lie, and a number that meant something else under
-        // the old controller would come back.
+        // kf changes MEANING with the schema (v7 scaled it by 灵敏度补偿; v8 made
+        // it 1/alpha; v9 makes it a bare strength), so it is read only from a
+        // same-schema file. Reading it unconditionally would silently overwrite
+        // the re-seeded value above — the "re-seeded ... kf=" log line would be a
+        // lie, and a number that meant something else under the old controller
+        // would come back.
         if (storedCtl == kCtlSchema) {
             getSlider(o, "kf", a.ffGain);
         }

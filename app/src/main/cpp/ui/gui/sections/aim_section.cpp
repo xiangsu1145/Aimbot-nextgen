@@ -266,6 +266,16 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     // integral and the derivative both need it; the proportional term must not
     // have it (its stability bound is a per-sample one).
     const float dt = std::clamp(io.DeltaTime, 1.0f / 2000.0f, 0.2f);
+
+    // The target's own size, as the gate's unit of measure. `lastTargetBox` is
+    // 0.5*max(w,h) (the same yardstick the lock-quality score uses), so the box's
+    // longer side is twice it. Passing the LIVE box rather than a pixel constant
+    // is the point: "far off" has to mean the same thing on a 20 px box at range
+    // and a 300 px one at contact range, and only a width-relative threshold does
+    // that. 0 disables the gate (the controller then runs open-loop on both the
+    // feed-forward and the integrator), which is the right behaviour if the
+    // tracker has no size yet.
+    st.aim.setTargetBoxPx(2.0f * st.lastTargetBox);
     // Deadzone — decoupled per-axis stop radius.  A single radial circle was the
     // old code's bug: a target oscillating along X keeps popping OUTSIDE the
     // circle even when Y is at rest, dragging X onto the target centre.  Per-axis
@@ -353,13 +363,15 @@ static void driveAimToTarget(TouchAimState& st, int slot,
         if (++sTick >= 480) {
             LOGI("aim: id=%d mean e=(%.1f,%.1f) tot=(%.2f,%.2f) "
                  "ff=(%.1f,%.1f) d=(%.2f,%.2f) trim=(%.1f,%.1f) "
-                 "kf=%.2f lim=%.0f yard=%.0f dt=%.1fms",
+                 "kf=%.2f a=%.2f%s lim=%.0f yard=%.0f dt=%.1fms",
                  st.lastTargetId,
                  sSumX / sTick, sSumY / sTick, pidX, pidY,
                  st.aim.ffX(), st.aim.ffY(),
                  st.aim.derivX(), st.aim.derivY(),
                  st.aim.trimX(), st.aim.trimY(),
-                 st.aim.ffGainValue(), st.aim.outLimitPx(),
+                 st.aim.ffGainValue(), st.aim.alphaHatValue(),
+                 st.aim.alphaValid() ? "" : "?",
+                 st.aim.outLimitPx(),
                  st.lastTargetBox, dt * 1000.0f);
             sTick = 0; sSumX = 0.0f; sSumY = 0.0f;
         }
@@ -775,25 +787,28 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     y += rowSl + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.aimDelayFrames,        "延迟补偿",  2, es);
     y += rowSl + gap;
-    // The feed-forward gain, and the only row in this page that is a
-    // CALIBRATION rather than a taste: kf = 1/alpha, the reciprocal of the game's
-    // sensitivity in view px per finger px.
+    // kf — the velocity feed-forward STRENGTH (0.00–0.20, step 0.01). The row is
+    // labelled "kf" and nothing else, because that is the number the user asked
+    // to be able to set precisely.
+    //
+    // It is NOT a calibration any more. Round 10 demanded kf = 1/alpha (the
+    // reciprocal of the game's sensitivity in view px per finger px), and that is
+    // what broke it: the number then did two jobs, and expanding the formula
+    // shows the second job was "add our own delayed command back into the input,
+    // with gain exactly 1". A pole at z = 1. It tracked and never settled and
+    // overshot when the target stopped, all from the same cause.
+    //
+    // The reconstruction constant is now derived on-line (AlphaEstimator, in
+    // tracking/pid_controller.h) and kf is a plain strength, so a SMALL kf is
+    // genuinely the conservative choice — the reverse of round 10. Measured
+    // across alpha 0.5…2.5 with the constant off by 0.4×…2.0×: at 0.20 the lag
+    // is −5 px, the sway 5–11 px, the post-stop overshoot 3–6 px, in every cell.
     //
     // Its row was 速度前馈 once, feeding an estimator that was structurally a
     // bare integrator (it measured its own output with no restoring term, so it
     // oscillated — 1453 px peak-to-peak at alpha = 2.5), and it was briefly two
-    // rows (this one plus 灵敏度补偿). Both are gone. The single knob now carries
-    // the whole plant gain because the reconstruction uses its own reciprocal as
-    // the assumed 1/alpha, so the same number appears twice and the residual
-    // self-term is exactly (1 − kf·alpha).
-    //
-    // Two things about tuning it that the measurements insist on:
-    //   * the criterion is the SIGN of the error on a steadily strafing target —
-    //     trailing means raise, leading means lower;
-    //   * the band near kf ~ 1/alpha·0.2 is WORSE than 0, so a small non-zero kf
-    //     is not a safe starting point. Jump to 3 or 4 rather than creeping.
-    // scripts/aim_pidf_bench.py 表14 is the map.
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ffGain,              "前馈增益",  2, es);
+    // rows (this one plus 灵敏度补偿). Both are gone.
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ffGain,              "kf",  2, es);
     y += rowSl + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.trackPredictHoldFrames,"预测帧数",  0, es);
     y += rowSl + gap;
@@ -801,7 +816,7 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // the ceiling that stops a re-lock from flinging the finger across the panel.
     // It is the constant tracking::kOutLimitPx (180 finger px/step, tanh), with a
     // separate, smaller leash on the integral (kTrimLimitPx, 90). Neither is
-    // scaled by anything — the plant gain enters the loop through 前馈增益 alone.
+    // scaled by anything.
 
     // ── Aim deadzone ────────────────────────────────────────────────────────
     // 0.0 = move onto the target centre; 1.0 = stop at the target edge. The

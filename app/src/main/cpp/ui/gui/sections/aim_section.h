@@ -135,17 +135,26 @@ struct AimController {
     /// new engagement calls reset() instead.
     ///
     /// There is NO sensitivity compensation here any more and no scaling of the
-    /// gains or of the ceilings: kp, ki, kd and kf go in as they are. `kf` is the
-    /// feed-forward gain and carries the plant gain inside itself — the
-    /// reconstruction uses its RECIPROCAL as the assumed 1/alpha, so the correct
-    /// setting is kf = 1/alpha and the residual self-term is (1 − kf·alpha)·u,
-    /// exactly zero when it is right. See the header of tracking/pid_controller.h
-    /// for why the number must be used twice, and for the measured band
-    /// (kf·alpha ≈ 0.75…1.5) that this implies.
+    /// gains or of the ceilings: kp, ki, kd and kf go in as they are.
+    ///
+    /// `kf` is the feed-forward STRENGTH, 0…0.20 — it is NOT the plant gain any
+    /// more. The reconstruction constant is derived on-line (see `alphaEst`) and
+    /// pushed into both axes; round 10's demand that the user calibrate kf
+    /// against their game's sensitivity is what made a small kf actively worse
+    /// than zero. See the header of tracking/pid_controller.h.
     void setGains(float kp, float ki, float kd, float outSmooth, float kf) {
         this->ffGain = std::max(0.0f, kf);
         pidX.setGains(kp, ki, kd, outSmooth, kf);
         pidY.setGains(kp, ki, kd, outSmooth, kf);
+    }
+
+    /// The engaged target's box width in screen px. Feeds the GATE — the
+    /// reference PID's trick of expressing "far off" in target widths rather than
+    /// pixels, so the same number means the same thing at every range. Call once
+    /// per frame before step(); the controller holds it until it changes.
+    void setTargetBoxPx(float px) {
+        pidX.setTargetBoxPx(px);
+        pidY.setTargetBoxPx(px);
     }
 
     /// Drive both axes, return the total displacement in px for THIS control
@@ -170,9 +179,32 @@ struct AimController {
     /// a switch changes both.
     void step(float errX, float errY, float dt, bool freezeX, bool freezeY,
               bool targetChanged, float& outX, float& outY) {
+        // The delay-aligned command must be read BEFORE update() shifts the ring:
+        // it is the u(k−L) that produced the error we are about to act on, and it
+        // is the regressor's increment in the plant-gain fit.
+        const float uDelayed = pidX.delayedCommand();
+
         outX = pidX.update(errX, dt, freezeX, targetChanged);
         outY = pidY.update(errY, dt, freezeY, targetChanged);
+
+        // The plant gain is a property of the game, not of an axis, so one fit on
+        // X serves both. It is off the critical path: the whole kf range stays
+        // stable with alpha_hat wrong by 2x in either direction, and `value()`
+        // never returns anything unset.
+        alphaEst.push(errX, uDelayed);
+        if (alphaEst.valid()) {
+            const float a = alphaEst.value();
+            pidX.setAlphaHat(a);
+            pidY.setAlphaHat(a);
+        }
     }
+
+    /// The estimated plant gain in force (alpha_hat), for the log. Compare it
+    /// against the box size and the reachable view speed to sanity-check the
+    /// gains: the P-loop's useful ceiling is kp·alpha < 0.285 at this delay.
+    float alphaHatValue() const { return pidX.alphaHatValue(); }
+    /// True once the plant-gain fit has ever converged. For the log.
+    bool  alphaValid() const { return alphaEst.valid(); }
 
     /// Trim of each axis, for the diagnostic log. See PPID::integralValue() —
     /// it is the RESIDUAL cleaner while the feed-forward runs, so it should stay
@@ -198,15 +230,21 @@ struct AimController {
     void reset() {
         pidX.reset();
         pidY.reset();
+        // NOT alphaEst: the plant gain belongs to the game, not to the engagement.
+        // Wiping it here would throw away a converged fit every time the finger is
+        // lifted, and the FF would spend the next 0.75 s back at the 1.0 default.
     }
 
-    /// The feed-forward gain in force (== kf == 1/alpha_hat), for the log.
+    /// The feed-forward gain in force (== kf == FF strength, 0…0.20), for the log.
     float ffGainValue() const { return ffGain; }
     /// The output ceiling in force (finger px/step). A constant.
     float outLimitPx() const { return pidX.outLimitPx(); }
 
 private:
-    float ffGain = 3.0f;
+    float ffGain = 0.20f;
+    /// One plant-gain fit, shared by both axes (alpha is the game's sensitivity,
+    /// not an axis property).
+    tracking::AlphaEstimator alphaEst;
 };
 
 // ── Aim-touch state machine ───────────────────────────────────────────────
@@ -421,52 +459,48 @@ struct PageAim {
     /// 丢失帧. Range 0–30, step 1 (30 ≈ 0.5 s of dead reckoning).
     widgets::SliderState trackPredictHoldFrames{3.0f, 0.0f, 30.0f, 1.0f};
 
-    /// 前馈增益 (kf) — the velocity feed-forward gain, and the ONE number the
-    /// loop cannot work out for itself: **kf = 1 / alpha**, alpha being the
-    /// game's sensitivity in view px per finger px.
+    /// kf — the velocity feed-forward STRENGTH. NOT the plant gain any more.
     ///
-    /// WHY IT IS THE PLANT INVERSE, NOT A TASTE. F reconstructs the target's own
-    /// screen velocity from our own output and the error —
+    /// ROUND 10 WAS WRONG, and the way it was wrong is worth keeping. It asked
+    /// for kf = 1/alpha, where alpha is the game's sensitivity in view px per
+    /// finger px. That is algebraically right and practically a trap, because the
+    /// number then carries two jobs at once — the STRENGTH of F and the
+    /// RECIPROCAL of the reconstruction constant — and expanding the formula
+    /// shows what that costs:
     ///
-    ///     w = Δe + u(k−L)/kf          F = kf · LPF(w)
+    ///     ff = kf·LPF(Δe) + LPF(u(k−L))            ← second term has gain 1
     ///
-    /// — because the crosshair is the screen centre, so the error IS the box's
-    /// screen coordinate and the camera rotation our own finger caused is sitting
-    /// inside it. The reconstruction subtracts that; the factor it subtracts with
-    /// is 1/kf. If 1/kf is not the real plant gain, the leftover is read back as
-    /// target velocity and the loop feeds itself. The same number therefore
-    /// appears twice — as the gain, and as the reciprocal of the reconstruction
-    /// constant — and the residual self-term is exactly (1 − kf·alpha)·u.
-    /// kf = 1/alpha makes it zero. That is the whole calibration.
+    /// The controller was adding its own delayed command back into its input.
+    /// That is a pole at z = 1: an accelerator with no brake. It "tracked"
+    /// (a DC pole integrates a steady target's motion to zero error) and it never
+    /// settled (the same pole is marginally stable, so noise keeps it moving),
+    /// and it OVERSHOT when the target stopped — with ki = 0. Those three are one
+    /// mechanism, which is why every attempt to tune them apart failed.
     ///
-    /// WHY IT CANNOT BE MEASURED INSTEAD. The tracker's velocity is the box's
-    /// SCREEN velocity and the aim's own output is in it
-    /// (tracker_velocity = ΔT_world − alpha·u), and since the error IS that same
-    /// screen coordinate the two signals are the same up to filtering — their
-    /// difference carries no information about alpha. A ring-detector was tried
-    /// as a fallback and rejected: it false-triggered to a 0.61 gain multiplier
-    /// on a STATIONARY target (scripts/aim_ring_guard.py).
+    /// NOW. The reconstruction constant is derived on-line (AlphaEstimator) and
+    /// kf is only a strength, 0…0.20:
     ///
-    /// HOW TO SET IT, on a moving target rather than a still one. The criterion
-    /// is the SIGN of the error while the target strafes steadily:
-    ///   * crosshair trails the target            → kf too small → RAISE it
-    ///   * crosshair leads / buzzes on a still target → kf too large → LOWER it
-    /// The usable band is kf·alpha ≈ 0.75…1.5, so a LOW-sensitivity game wants a
-    /// LARGE kf (alpha = 0.1 wants about 10). Do NOT creep up from 0.05: values
-    /// between 0 and about 1/alpha are WORSE than 0, because a small kf makes
-    /// alpha_hat = 1/kf huge and F degenerates into "repeat your own delayed
-    /// command" — the round-8 oscillator. If 1.0 rings, jump to 3 or 4; do not
-    /// fine-tune through the bad band. Measured map: scripts/aim_pidf_bench.py
-    /// 表14; the derivation is in tracking/pid_controller.h.
+    ///     ff = (kf/alpha_hat)·LPF( Δe + alpha_hat·u(k−L) )
     ///
-    /// 0 turns the feed-forward off exactly, and leaves the integral to carry a
-    /// moving target — safe everywhere, but it trails on a fast strafe at low
-    /// sensitivity, which is what this row is for.
+    /// Residual self-term = kf·(1 − alpha/alpha_hat)·u(k−L), so a small kf is now
+    /// genuinely the safe choice (the opposite of round 10). Measured across
+    /// alpha 0.5…2.5 with alpha_hat off by 0.4×…2.0×: at kf = 0.20 the lag is
+    /// −5 px, the sway 5–11 px and the post-stop overshoot 3–6 px in every cell
+    /// (scripts/aim_selftrap_bench.py 表8). That robustness is why the range
+    /// stops at 0.20.
     ///
-    /// Range 0–16, step 0.05. Default 3: right for a low-sensitivity game and
-    /// safe down to alpha ≈ 0.05. A normal-sensitivity game may prefer 1–2, and
-    /// must lower kp and kd as well — see the Kp note above.
-    widgets::SliderState ffGain{3.0f, 0.0f, 16.0f, 0.05f};
+    /// HOW TO SET IT. Watch the error while the target strafes at a constant
+    /// speed: one sign that persists = the crosshair trails = raise kf. Sway on a
+    /// STILL target at any kf means the problem is not kf at all — check
+    /// kp × alpha_hat (shown in the log) against 0.285, because that is the
+    /// delay's hard ceiling and no feed-forward setting will fix it.
+    ///
+    /// 0 turns the feed-forward off exactly and leaves the integral as the sole
+    /// DC carrier. Safe everywhere; it trails a fast strafe.
+    ///
+    /// Range 0.00–0.20, step 0.01, default 0.20 (full strength). The range is
+    /// sized to the robust band on purpose — see tracking/pid_controller.h.
+    widgets::SliderState ffGain{0.20f, 0.0f, 0.20f, 0.01f};
 
 
     /// Aim deadzone (0.0–1.0, one decimal): ports the old project's
