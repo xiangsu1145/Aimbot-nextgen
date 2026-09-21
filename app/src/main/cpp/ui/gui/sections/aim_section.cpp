@@ -289,12 +289,14 @@ static void driveAimToTarget(TouchAimState& st, int slot,
 
     float pidX = 0.0f, pidY = 0.0f;
     // Controller takes the raw error (target - crosshair) and returns the finger
-    // displacement for this step, in px. The two deadzone flags only HOLD the
-    // integrator of a frozen axis; the raw error still reaches the proportional
-    // and derivative terms so the derivative's state stays continuous (otherwise
-    // it spikes every time the target crosses the stop band). The output itself
-    // is still zeroed below, so the visible behaviour is unchanged — what changes
-    // is that the trim no longer accumulates behind a discarded output.
+    // displacement for this step, in px. The two deadzone flags make that axis
+    // HOLD inside its band: P and D stop driving, the integral is dropped from
+    // the output and bled off (round 15 — before that it kept driving, and that
+    // was the whole static shake and the creep-snap staircase), and the
+    // feed-forward is still added so a target actually moving through the band is
+    // still followed. The raw error still reaches the derivative term so its
+    // state stays continuous; otherwise it spikes every time the target crosses
+    // the stop band.
     //
     // `targetChanged` is passed straight through: the selection is "nearest
     // confirmed track", so it can land on a different enemy in one step, and
@@ -377,14 +379,15 @@ static void driveAimToTarget(TouchAimState& st, int slot,
         }
     }
 
-    // The per-axis freeze has ALREADY been applied inside the controller: it
-    // suppressed the proportional and derivative terms and held the integrator,
-    // while still adding what the loop has already learned. So the caller must
-    // NOT zero the axis here — doing that would leave whatever the loop had
-    // trimmed behind, and bring back the "target leaves the band, the crosshair
-    // snaps after it and overshoots" limit cycle around the deadzone edge — the
-    // very thing the per-axis freeze was introduced for. See
-    // AimController::step() and PPID::update()'s `frozen` note.
+    // The per-axis freeze has ALREADY been applied inside the controller, and it
+    // is not a plain "zero this axis": P and D stop driving, the integral is
+    // dropped from the output AND bled off, and the FEED-FORWARD is still added.
+    // So the caller must NOT zero the axis here — that would throw away the one
+    // term that is legitimately still acting (the measured target velocity), and
+    // turn the band into "the axis stops dead", which on a moving target is the
+    // creep-snap staircase the user reported. See AimController::step() and
+    // PPID::update()'s `frozen` note, and the round-15 section of
+    // tracking/pid_controller.h.
     float moveX = pidX;
     float moveY = pidY;
 
@@ -787,9 +790,9 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     y += rowSl + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.aimDelayFrames,        "延迟补偿",  2, es);
     y += rowSl + gap;
-    // kf — the velocity feed-forward STRENGTH (0.00–0.20, step 0.01). The row is
-    // labelled "kf" and nothing else, because that is the number the user asked
-    // to be able to set precisely.
+    // kf — the velocity feed-forward STRENGTH (0.00–0.50, step 0.01, default
+    // 0.05). The row is labelled "kf" and nothing else, because that is the
+    // number the user asked to be able to set precisely.
     //
     // It is NOT a calibration any more. Round 10 demanded kf = 1/alpha (the
     // reciprocal of the game's sensitivity in view px per finger px), and that is
@@ -798,26 +801,23 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // with gain exactly 1". A pole at z = 1. It tracked and never settled and
     // overshot when the target stopped, all from the same cause.
     //
-    // The reconstruction constant is now derived on-line (AlphaEstimator, in
-    // tracking/pid_controller.h) and kf is a plain strength — but the round-11
-    // range of 0…0.20 was still wrong, and it was the thing the user felt. At DC
-    // the feed-forward's share of the DC carrier is kf·alpha/alpha_hat ≈ 0.8·kf,
-    // independent of the game, so 0.20 could never supply more than 16 % of what
-    // a moving target needs and his 0.08 supplied 6 %.
+    // ROUND 15 — THE RANGE IS THE USER'S. He tuned the loop with kf at 0
+    // (kp 0.05 / ki 0.20 / kd 0.26) and it holds a moving target steadily, so the
+    // feed-forward is no longer the DC carrier in this build: the integral is,
+    // now that its leash is 150 and it unwinds at 6×. That makes kf a TRIM, and
+    // a trim belongs on a short, densely-stepped slider rather than on one that
+    // exists to reach a carrier. 0.50 is the ceiling for a reason that still
+    // holds from round 14 — the residual self-copy coefficient
+    // s = kf·(1 − alpha/alpha_hat) cannot leave the unit circle there even with
+    // the estimator off by 2× — so every position of the row is usable and none
+    // of them is a runway.
     //
-    // ROUND 14 then found the OTHER edge. The residual self-term is a self-COPY
-    // of our own delayed command with coefficient s = kf·(1 − alpha/alpha_hat),
-    // and that copy's characteristic equation is z^L = s, so it decays only while
-    // |s| < 1. At kf = 1.00 the coefficient can reach 1.00 — a fit that
-    // over-estimates alpha drives r = alpha/alpha_hat toward 0 and s toward +1,
-    // which is a pole ON the unit circle, the round-10 marginal case again. At
-    // 0.80 it cannot exceed 0.80, so the copy always decays, while the carrier
-    // share kf·r/(1 − kf + kf·r) stays 0.79…0.88 across the r = 1.0…2.0 that the
-    // bias is designed to produce. So 0.80 ships and 1.20 is the ceiling; the
-    // ~15 % of carrier kf leaves is the integral's job — which the integral can
-    // finally do now that its leash is 150 and the schedule no longer throttles
-    // it. There is no simulator number behind any of the above: u_ss = w/alpha
-    // and |s| < 1 are the whole argument, and the log shows both.
+    // HOW TO SET IT, now that the integral carries the load. 0 is a complete
+    // setting: the aim follows, the integral learns the target's velocity and the
+    // feed-forward does nothing. Raise it only to take high-frequency load off
+    // the integral (a strafe whose error keeps one sign and never quite closes),
+    // and stop as soon as the error stops showing a sign — past that all it does
+    // is pass the tracker's noise to the finger, amplified by kf/alpha_hat.
     //
     // Its row was 速度前馈 once, feeding an estimator that was structurally a
     // bare integrator (it measured its own output with no restoring term, so it
@@ -830,14 +830,30 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // 输出限幅 used to be a row here, and it never was a tuning parameter: it is
     // the ceiling that stops a re-lock from flinging the finger across the panel.
     // It is the constant tracking::kOutLimitPx (180 finger px/step, tanh), with a
-    // separate, smaller leash on the integral (kTrimLimitPx, 90). Neither is
-    // scaled by anything.
+    // separate, smaller leash on the integral (kTrimLimitPx, 150 since round 14 —
+    // at 90 the leash was a hard ceiling on how fast a target the integral could
+    // hold at all, not a safety rail). Neither is scaled by anything.
 
     // ── Aim deadzone ────────────────────────────────────────────────────────
-    // 0.0 = move onto the target centre; 1.0 = stop at the target edge. The
-    // stop radius is a fraction of the target box's half-size, so 0.1 still
-    // lands on the target and 1.0 stops at its nearest edge.
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.deadzone, "死区", 1, es);
+    // 0.0 = move onto the target CENTRE; 1.0 = stop at the target EDGE. The stop
+    // radius is a fraction of the target box's half-size, so 0.05 still lands on
+    // the target and 1.0 stops at its nearest edge.
+    //
+    // ROUND 15 — THIS ROW IS THE FIX for "静止不动的时候视角也一直晃" and for the
+    // staircase in Y when the target jumps, and until round 15 it could not have
+    // been: the band only switched off P and D, so the INTEGRAL kept driving the
+    // axis inside it — walking the view off the target until P snapped it back,
+    // over and over. It now holds the axis outright: P, D and I all stop driving,
+    // the integral's charge is bled off rather than held, and only the
+    // feed-forward is still added, which is what keeps a genuinely moving target
+    // followed THROUGH the band.
+    //
+    // Keep it SMALL — 0.1…0.3. Inside the band the integral is suppressed, so a
+    // large band with kf = 0 leaves nothing to carry motion and the aim moves in
+    // bursts; the band is for blocking the detector's jitter, not for blocking
+    // the target. Two decimals and a 0.05 step on purpose: finding the smallest
+    // value that does that is the whole exercise.
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.deadzone, "死区", 2, es);
     y += rowSl + gap;
 
     // ── Touch-area toggle ──────────────────────────────────────────────────

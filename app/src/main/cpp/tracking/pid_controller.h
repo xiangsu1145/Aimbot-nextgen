@@ -333,6 +333,66 @@
 //  None of the three causes above is a gain, and all three of the fixes are
 //  arithmetic (u_ss = w/alpha; 50/(ki·|e|·dt) frames; |s| < 1) — they need no
 //  simulator to check, only the log.
+//
+//  ── ROUND 15: THE DEADBAND WAS NOT CONNECTED TO THE INTEGRAL ────────────────
+//
+//  The user tuned it himself and got it tracking: kp 0.05 / ki 0.20 / kd 0.26 /
+//  kf 0.00 held a moving target steadily. Two symptoms were left, and he named
+//  the cause of both:
+//
+//      "静止不动的时候视角也一直晃 … 原因是ki。死区调1也没用。"
+//      "跳起来并且运动，这个时候y也会动，你的算法会变成一个一个阶梯状很抖。"
+//
+//  He is right, and the two symptoms are ONE bug. Inside the stop band the axis
+//  used to emit
+//
+//      u = 0·P + integral + 0·D + ff
+//
+//  — the proportional and derivative terms were suppressed, and the INTEGRAL
+//  was merely "held" (not accumulated) and still added to the output. So the
+//  one term the band was supposed to silence was the only term still driving:
+//
+//    * AT REST the trim is a standing charge with no restoring force. P — the
+//      only term that can unwind it — is switched off by the band itself, and
+//      the discharge path (kIntReleaseGain) needs |e| to be large, which by
+//      definition cannot happen while the aim is ON target. So the charge
+//      survives, keeps pushing the finger, walks the view off the target, the
+//      axis exits the band, P snaps it back — a relaxation cycle whose amplitude
+//      is the band width. That is the "一直晃", and it is why a bigger deadband
+//      did not help: 死区只管住了 P，没管住 I.
+//
+//    * ON A MOVING TARGET the same cycle repeats in whichever axis is inside
+//      its band (a jump moves Y fast, so Y spends time crossing in and out), and
+//      because the push and the snap alternate with the aim's integer finger
+//      steps, what the user sees is a STAIRCASE: creep, snap, creep, snap. The
+//      "阶梯状" is a relay limit cycle, not a quantisation artefact.
+//
+//  THE FIX — the band now means "hold", for every term that can move the axis:
+//
+//    1. Inside the band the integral is NOT added to the output. This is the
+//       whole point of the band: a bias has no justification while the aim is
+//       on target, so it must not be what pushes the finger.
+//    2. The charge is DRAINED, not held (kDzTrimDrainTauSec). Holding it only
+//       moves the problem to the band's exit, where it is spent as a lurch —
+//       which is the same failure the round-14 release rate was about, one
+//       order of magnitude smaller.
+//    3. The feed-forward is STILL added. It is a MEASUREMENT of the target's
+//       screen velocity, not an accumulated bias, so it cannot park a charge;
+//       keeping it is what lets a genuinely moving target be followed THROUGH
+//       the band, which is what stops the band from turning a strafe into the
+//       creep-snap staircase above. With kf = 0 there is no such signal, so a
+//       large deadzone plus kf = 0 will always move in bursts — the two knobs
+//       are complementary, and the deadzone belongs at 0.1…0.5 for blocking
+//       detector jitter, not at 1.0 for blocking motion.
+//
+//  And kf's range is now the user's: 0.00–0.50, default 0.05. Round 14 argued
+//  for 0.80 from the self-copy stability window; the user's own tuning found
+//  that the INTEGRAL carries the DC command perfectly well once its leash and
+//  its discharge rate are right, and a small kf is then a noise-free trim on top
+//  rather than the carrier. kf is his knob — 0.50 is the ceiling because the
+//  self-copy coefficient s = kf·(1 − alpha/alpha_hat) cannot leave the unit
+//  circle there even with the estimator off by 2×, so the whole slider is
+//  usable instead of ending in a runaway.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -369,6 +429,26 @@ constexpr float kTrimLimitPx = 150.0f;
 // e = -20 px, 120 Hz that is 3000 frames, twenty-five seconds of "很慢的描回来".
 constexpr float kIntReleaseGain = 6.0f;
 
+// ── The stop band's trim drain (round 15) ───────────────────────────────────
+//
+// Inside the deadzone the integral is neither accumulated NOR ADDED TO THE
+// OUTPUT, and whatever charge it holds is bled off with this time constant.
+// Two separate things, and both are needed:
+//
+//   * not added, because the band exists to stop the axis moving and the
+//     integral was — before round 15 — the only term the band did not silence.
+//     That is the static shake ("静止不动的时候视角也一直晃 … 原因是ki") and, in
+//     whichever axis crosses the band on a jump, the creep-snap staircase.
+//   * drained, because a charge held through the band is spent the instant the
+//     axis leaves it — the lurch the band was supposed to prevent, just delayed.
+//
+// 0.30 s is a deliberate middle: fast enough that a stationary target's trim is
+// gone before anyone can see it (a 50 px charge is at 2 px after ~40 frames),
+// slow enough that a target merely CROSSING the band does not wipe the carrier
+// the loop built for it. The drain is invisible while the contribution is
+// suppressed — it only decides what is left when the axis leaves.
+constexpr float kDzTrimDrainTauSec = 0.30f;
+
 constexpr float kDerivTauSec = 0.025f;
 
 // ── Feed-forward ────────────────────────────────────────────────────────────
@@ -384,36 +464,32 @@ constexpr float kDerivTauSec = 0.025f;
 // NOT critical — measured, a wrong value anywhere from 2 to 7 changes the sway
 // by a few px — so it is a constant and never a slider.
 //
-// ── ROUND 14: the kf ceiling is 1.20 and 0.80 is the working value ──────────
+// ── ROUND 15: the kf ceiling is 0.50 and 0.05 is the default ────────────────
 //
-// kFfStrengthMax is the top of the kf slider. Round 11 had 0.20, and that
-// ceiling was a real bug — from the round-12 section, the carrier share is
-// ≈ 0.8·kf, so 0.20 caps the feed-forward at 16 % of the DC command a moving
-// target needs, whatever the game's sensitivity. Round 12 then went to 2.0,
-// which over-corrected: the value that MATTERS is set by stability, not by the
-// carrier account, because the residual self-term is a self-COPY of our own
-// delayed command with coefficient
+// kFfStrengthMax is the top of the kf slider, and round 15 set it to the USER's
+// range. The reasoning below (the self-copy window) is still correct — it is
+// what proves 0.50 is SAFE — but it was being used to argue for a value rather
+// than for a ceiling, and that was one revision too far: round 14's own numbers
+// show the integral supplying 79…88 % of the carrier either way, so the choice
+// between 0.05 and 0.80 is a choice about how much of the DC command and how
+// much of the detector's noise reach the finger, not about whether the loop can
+// track. His tuning settled it: 0.05.
 //
-//     s = kf · (1 − alpha/alpha_hat)
-//
-// and the loop's characteristic equation for that copy is z^L = s, i.e.
-// |z| = |s|^(1/L). Stable only while |s| < 1. With the estimator's own bias and
-// its ±30 %, r = alpha/alpha_hat lands near 1.0…2.0, and then
+// With the estimator's bias and its ±30 %, r = alpha/alpha_hat lands near
+// 1.0…2.0, so
 //
 //     kf = 1.00  →  s = −1.00…0.00   a pole ON the unit circle   fragile
 //     kf = 0.80  →  s = −0.80…0.00   strictly inside it          safe
+//     kf = 0.50  →  s = −0.50…0.00   half the margin, still safe  usable
 //
-// while the carrier share kf·r/(1 − kf + kf·r) is 0.79…0.88 either way. 0.80
-// therefore buys the entire stability margin for the ~15 % of the carrier the
-// integral is already cleaning up — which is the trade "跟枪稳定不抖" asks for.
-// 1.20 stays reachable for a game whose alpha the fit cannot reach; above that
-// the self-copy is a limit cycle, not a trim.
+// and the whole 0.00–0.50 slider is therefore reachable without a runaway, which
+// is the property round 14 wanted and could only get by stopping at 0.80.
 //
-// kFfTauSec was 33 ms. At kf = 0.80 and alpha_hat = 0.1 the feed-forward's noise
-// gain is kf/alpha_hat = 8, so this filter is what decides how much of the
-// detector's wobble reaches the finger; 45 ms costs a few px of lead and takes a
-// stop's worth of shimmer out. It is a DELIBERATE trade, not a free lunch — if
-// tracking ever feels soft, this is the first number to put back.
+// kFfTauSec was 33 ms and is 45 ms. At kf = 0.80 and alpha_hat = 0.1 the
+// feed-forward's noise gain is kf/alpha_hat = 8; at the new default of 0.05 it
+// is 0.5, i.e. the feed-forward is no longer the loudest path for detector noise
+// either, so this filter is a belt rather than the mechanism now. It is kept
+// because a user who raises kf to 0.50 still needs it.
 //
 // kFfTauFastSec: the release time constant (round-13 point 4). Asymmetric on
 // purpose — a rising ŵ stays filtered against detector noise, a falling one is
@@ -427,7 +503,7 @@ constexpr float kDerivTauSec = 0.025f;
 constexpr float kFfTauSec      = 0.045f;
 constexpr float kFfTauFastSec  = 0.015f;
 constexpr int   kFfDelaySteps  = 5;
-constexpr float kFfStrengthMax = 1.20f;
+constexpr float kFfStrengthMax = 0.50f;
 constexpr float kFfGainMax     = 20.0f;
 constexpr float kFfVelMaxPx    = 60.0f;
 constexpr float kFfLimitPx     = 120.0f;
@@ -717,10 +793,12 @@ public:
     // outSmooth : EMA on the output, 0..1. 1.0 = OFF (the default) and there is a
     //             reason it ships off: an EMA is pure phase lag, and phase lag is
     //             the one thing a delay-limited loop cannot afford.
-    // kf        : feed-forward STRENGTH, 0…kFfStrengthMax. Not the plant gain,
-    //             and no longer a per-game calibration: the correct value is the
-    //             CONSTANT ≈1.0 (kf = alpha_hat/alpha, and alpha_hat is estimated
-    //             on-line), 0 turns F off, and 2.0 is headroom. See the header.
+    // kf        : feed-forward STRENGTH, 0…kFfStrengthMax (0.50 since round 15).
+    //             Not the plant gain, and not a per-game calibration: the
+    //             reconstruction constant is derived on-line (see `alphaEst`).
+    //             0 turns F off exactly — which is a perfectly good setting now
+    //             that the integral carries the DC command — and 0.05 … 0.20 is
+    //             a noise-free trim on top of it. See the round-15 section.
     //
     // NOTE: this does NOT reset the controller. See the class comment.
     void setGains(float kp_, float ki_, float kd_, float outSmooth_, float kf_) {
@@ -747,14 +825,20 @@ public:
     //
     // error         : current position error (target - crosshair), px
     // dt            : control step, seconds
-    // frozen        : true when this axis is inside its deadzone. The caller is
-    //                 discarding the proportional and derivative terms for this
-    //                 axis; the integrator is held, because accumulating behind
-    //                 a discarded output is wind-up and its symptom is a lurch
-    //                 the moment the target leaves the stop band. The trim AND
-    //                 the feed-forward are still added, so a target drifting
-    //                 through the band is still followed by what the loop has
-    //                 already learned rather than snapping back.
+    // frozen        : true when this axis is inside its deadzone. The axis HOLDS
+    //                 for this step: the proportional and derivative terms are
+    //                 discarded, the integrator is neither accumulated NOR ADDED
+    //                 TO THE OUTPUT, and whatever charge it holds is bled off
+    //                 (kDzTrimDrainTauSec). Round 14 held the charge and added
+    //                 it, which left the integral as the only term driving the
+    //                 finger inside the band the band was built to silence — the
+    //                 static shake and, in whichever axis crosses the band on a
+    //                 jump, the creep-snap staircase. See the round-15 section.
+    //                 The FEED-FORWARD is still added, because it is a
+    //                 measurement of the target's velocity rather than an
+    //                 accumulated bias: it holds no charge, and keeping it is
+    //                 what lets a genuinely moving target be followed THROUGH
+    //                 the band instead of the axis stopping dead inside it.
     // targetChanged : true when the caller switched to a DIFFERENT track this
     //                 step (it knows, from the track id). The integral, the
     //                 feed-forward velocity and the soft-start ramp are re-seeded
@@ -863,8 +947,37 @@ public:
         // per-sample one; see the class note).
         float p = kp * ramp * gainScale * error;
 
-        // Deadzone: suppress the proportional and derivative terms only.
-        if (frozen) { p = 0.0f; d = 0.0f; }
+        // ── Deadzone: the axis HOLDS. Round 15 ────────────────────────────────
+        //
+        // The round-14 version suppressed the proportional and the derivative
+        // term and merely held the integral — while still adding it. That left
+        // the one term the band exists to silence as the ONLY term still driving
+        // the finger, and it is the whole of round 15:
+        //
+        //   at rest      the trim is a standing charge with no restoring force
+        //                (P, the term that unwinds it, is what the band switched
+        //                off), so it walks the view off the target, the axis
+        //                leaves the band and P snaps it back — creep and snap,
+        //                repeating. That is "静止不动的时候视角也一直晃".
+        //   on a jump    the same cycle in whichever axis is crossing the band
+        //                (Y, when a target jumps) — the same creep and snap, seen
+        //                as the "阶梯状".
+        //
+        // So: the integral is dropped from the output AND bled off. Dropping it
+        // stops the axis moving on the frame the band is entered; bleeding it
+        // means there is no charge left to spend when the axis leaves. Note the
+        // feed-forward is deliberately NOT suppressed — it is a measurement of
+        // the target's screen velocity rather than an accumulated bias, so it
+        // carries no charge and is what keeps a genuinely moving target followed
+        // through the band.
+        float iTerm = integral;
+        if (frozen) {
+            p     = 0.0f;
+            d     = 0.0f;
+            iTerm = 0.0f;
+            integral -= integral * std::min(1.0f, dt / kDzTrimDrainTauSec);
+            if (std::fabs(integral) < 0.01f) integral = 0.0f;
+        }
 
         // ── Feed-forward: reconstruct the target's OWN screen velocity ───────
         // ŵ = Δe + alpha_hat·u(k−L), then scaled to finger px by 1/alpha_hat and
@@ -926,22 +1039,24 @@ public:
         //      so it is now released kIntReleaseGain times faster.
         //   3. BACK-CALCULATION, so the integral cannot park a reserve behind a
         //      clipped output and spend it later.
-        const float uWant = p + integral + d + ff;
+        const float uWant = p + iTerm + d + ff;
         const bool pushHi = uWant >=  outLimit && error > 0.0f;
         const bool pushLo = uWant <= -outLimit && error < 0.0f;
         if (!frozen && !pushHi && !pushLo) {
             const bool opposing = (integral * error) < 0.0f;
             integral += (opposing ? kIntReleaseGain : 1.0f) * ki * error * dt;
             integral  = std::clamp(integral, -trimLimit, trimLimit);
+            iTerm     = integral;   // keep the sum below in step with the state
         }
 
-        float u = softLimit(p + integral + d + ff, outLimit);
+        float u = softLimit(p + iTerm + d + ff, outLimit);
         // Give back exactly what the limiter refused to deliver, so the trim
         // tracks the command that was SENT rather than the one that was asked for.
-        if (!frozen && std::fabs(p + integral + d + ff) > outLimit) {
-            integral = std::clamp(integral + (u - (p + integral + d + ff)),
+        if (!frozen && std::fabs(p + iTerm + d + ff) > outLimit) {
+            integral = std::clamp(integral + (u - (p + iTerm + d + ff)),
                                   -trimLimit, trimLimit);
-            u = softLimit(p + integral + d + ff, outLimit);
+            iTerm    = integral;
+            u = softLimit(p + iTerm + d + ff, outLimit);
         }
 
         outPrev = outSmooth * u + (1.0f - outSmooth) * outPrev;
@@ -1018,7 +1133,9 @@ private:
     float ki        = 0.5f;
     float kd        = 0.20f;
     float outSmooth = 1.0f;
-    float kf        = 1.0f;
+    /// Round 15: matches the page's default. It used to be 1.0 — the round-13
+    /// fly-off value, kept only because nothing set it before the first frame.
+    float kf        = 0.05f;
     float alphaHat  = kAlphaHatSeed;   // NEVER 1.0 by default — see round 13
 
     // ── State ─────────────────────────────────────────────────────────────────

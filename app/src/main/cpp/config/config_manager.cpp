@@ -148,7 +148,14 @@ constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 // the fragile edge rather than an error, so it is deliberately NOT carried
 // across. kp/ki/kd are: they have meant the same thing in every schema, and
 // re-seeding them would throw away tuning the user did himself.
-constexpr int kCtlSchema = 11;
+// v12 (round 15): kf's range became the user's own — 0.00–0.50 with 0.05 as the
+// working value — after his own tuning (kf 0, kp 0.05, ki 0.20, kd 0.26) showed
+// the INTEGRAL carrying the DC command on its own. The meaning did not change
+// (still a plain strength), but a stored 0.80 is above the new ceiling and would
+// load as 0.50 — a value he never chose — so the row is re-seeded rather than
+// clamped into place. kp/ki/kd are NOT touched: they have meant the same thing in
+// every schema, and re-seeding them would throw away his tuning.
+constexpr int kCtlSchema = 12;
 
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
@@ -364,10 +371,11 @@ void apply(const json& j) {
             // kf is the one gain whose meaning HAS moved: v8 stored a reciprocal
             // of the plant gain (the user's was 0.05), v9 a strength on a range
             // that could not exceed 0.20 (his 0.08), v10 a strength that reached
-            // 1.00, and v11 narrows the range to 1.20 and moves the working value
-            // to 0.80. A stored 1.00 is not wrong so much as unlucky — it puts the
-            // self-copy pole exactly on the unit circle — so it is not migrated.
-            a.ffGain.value = 0.80f;
+            // 1.00, v11 narrowed the range to 1.20 around 0.80, and v12 makes the
+            // range his own — 0.50 with 0.05 as the working value. A stored 0.80
+            // is above that ceiling, so it is re-seeded rather than clamped: 0.50
+            // is a value he never chose and would have to discover.
+            a.ffGain.value = 0.05f;
             LOGI("config: kf re-seeded for controller schema %d (file had %d): "
                  "kf=%.2f — kp/ki/kd kept at %.2f/%.2f/%.2f",
                  kCtlSchema, storedCtl, a.ffGain.value,

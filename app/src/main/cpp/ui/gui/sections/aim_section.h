@@ -168,12 +168,13 @@ struct AimController {
     /// genuinely changes rate (120 Hz while aiming, 60 Hz in the detector tier).
     ///
     /// `freezeX` / `freezeY` are the caller's per-axis deadzone decisions, and
-    /// the caller must NOT zero the returned value afterwards. Inside the band
-    /// the controller itself suppresses the proportional and derivative terms
-    /// and holds the integrator while still adding what it has already learned,
-    /// so a slowly drifting target is still followed rather than being left
-    /// behind and then snapped after — the limit cycle the per-axis freeze was
-    /// added for.
+    /// the caller must NOT zero the returned value afterwards. Round 15 made the
+    /// band mean HOLD: inside it P and D stop driving, the integral is dropped
+    /// from the output and its charge bled off (kDzTrimDrainTauSec), and only the
+    /// feed-forward is still added — so a target genuinely moving through the
+    /// band is still followed, while the standing bias that used to walk a
+    /// resting aim off the target (and, on a jump, saw Y in and out of the band
+    /// as a staircase) has nothing left to spend.
     ///
     /// `targetChanged` says the caller picked a DIFFERENT track this step. The
     /// caller knows (it has the track id); the controller cannot tell a switch
@@ -246,7 +247,9 @@ struct AimController {
     float outLimitPx() const { return pidX.outLimitPx(); }
 
 private:
-    float ffGain = 0.80f;
+    /// Mirrors the kf row. 0.05 is the round-15 default: the integral carries
+    /// the DC command, the feed-forward trims it.
+    float ffGain = 0.05f;
     /// One plant-gain fit, shared by both axes (alpha is the game's sensitivity,
     /// not an axis property).
     tracking::AlphaEstimator alphaEst;
@@ -583,16 +586,51 @@ struct PageAim {
     /// requirement actually asks for. 1.20 stays reachable for a game whose
     /// alpha the fit cannot reach; past that the self-copy is a limit cycle, not
     /// a trim, and no gain underneath it will hide that.
-    widgets::SliderState ffGain{0.80f, 0.0f, 1.20f, 0.01f};
+    /// ROUND 15 — THE USER'S RANGE. 0.00–0.50, default 0.05.
+    ///
+    /// Round 14 set 0.80 as the working value on the strength of the self-copy
+    /// stability window, and that argument still holds — but it argued about
+    /// where the FEED-FORWARD may safely stop supplying the carrier, not about
+    /// what the user needs. He tuned the loop without it (kf 0, kp 0.05, ki 0.20,
+    /// kd 0.26) and the integral carries the DC command fine now that its leash
+    /// is 150 and it unwinds at 6×; with that working, a small kf is a trim on
+    /// top and 1.20 was only ever a way to get the crosshair off the screen.
+    ///
+    /// The ceiling is 0.50 because the residual self-copy coefficient
+    /// s = kf·(1 − alpha/alpha_hat) cannot reach the unit circle there even if
+    /// the estimator is off by 2× — so every position of the slider is usable and
+    /// nothing on it runs away. 0 still switches F off exactly.
+    ///
+    /// The DEADZONE and kf are complementary, and this is worth knowing before
+    /// setting either: inside the stop band the integral is suppressed (see
+    /// tracking/pid_controller.h, round 15), so the feed-forward is the only
+    /// term that can still follow motion through the band. kf = 0 + a large
+    /// deadzone therefore moves in bursts by construction.
+    widgets::SliderState ffGain{0.05f, 0.0f, 0.50f, 0.01f};
 
 
-    /// Aim deadzone (0.0–1.0, one decimal): ports the old project's
+    /// Aim deadzone (0.0–1.0, step 0.05, two decimals): ports the old project's
     /// `convergeThresh`. Once the TARGET is within `deadzone` of the screen
-    /// centre (crosshair) the finger stops nudging and holds steady, instead of
+    /// centre (crosshair) the axis HOLDS — proportional, derivative and integral
+    /// all stop driving it, and the integral's charge is bled off — instead of
     /// twitching around trying to land exactly on a jittering box. 0.0 = no
     /// deadzone (must converge to the pixel), 1.0 = stop as soon as the target
     /// is within ~8% of the shorter screen edge of the crosshair.
-    widgets::SliderState deadzone{0.0f, 0.0f, 1.0f, 0.1f};
+    ///
+    /// ⚠ THIS ROW WAS CONNECTED IN ROUND 15, and until then it did not do what
+    /// it says on two counts: (a) it only suppressed P and D, so the integral —
+    /// the one term that actually walks a resting aim off a target — kept
+    /// driving the finger inside the band; and (b) it therefore never stopped the
+    /// static shake, which is what the user was trying to kill with it. It also
+    /// only affected the GLOBAL band; see yFollow for the Y-only one.
+    ///
+    /// SET IT SMALL, and only for noise. The band is the loop's "on target"
+    /// declaration, and inside it the loop is deliberately open — the integral
+    /// is suppressed, so nothing is left to hold a MOVING target but the
+    /// feed-forward. A large deadzone with kf = 0 therefore moves in bursts by
+    /// construction. 0.1…0.3 kills detector jitter; 1.0 stops at the target's
+    /// edge and is a setting for a stationary target only.
+    widgets::SliderState deadzone{0.0f, 0.0f, 1.0f, 0.05f};
 
     /// Touch-area overlay (the dashed box on screen).
     TouchAreaOverlay touchArea;
