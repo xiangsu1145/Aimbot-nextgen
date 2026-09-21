@@ -137,13 +137,14 @@ struct AimController {
     /// There is NO sensitivity compensation here any more and no scaling of the
     /// gains or of the ceilings: kp, ki, kd and kf go in as they are.
     ///
-    /// `kf` is the feed-forward STRENGTH, 0…2.0 — it is NOT the plant gain. The
+    /// `kf` is the feed-forward STRENGTH, 0…1.20 — it is NOT the plant gain. The
     /// reconstruction constant is derived on-line (see `alphaEst`) and pushed
-    /// into both axes, which is what makes the correct kf a CONSTANT (~1.0)
-    /// instead of a per-game calibration, and what makes 1.0 rather than 0.20 the
-    /// working value. Round 11 capped it at 0.20 and that cap — not the user's
-    /// tuning — is why the aim could not keep up. See the header of
-    /// tracking/pid_controller.h, round-12 section.
+    /// into both axes, which is what makes kf a CONSTANT rather than a per-game
+    /// calibration. Round 11 capped it at 0.20 and that cap — not the user's
+    /// tuning — is why the aim could not keep up. The working value is 0.80, the
+    /// centre of the self-copy stability window, with the integral cleaning up
+    /// the ~15 % of carrier it leaves. See the round-14 section of
+    /// tracking/pid_controller.h.
     void setGains(float kp, float ki, float kd, float outSmooth, float kf) {
         this->ffGain = std::max(0.0f, kf);
         pidX.setGains(kp, ki, kd, outSmooth, kf);
@@ -239,13 +240,13 @@ struct AimController {
         // lifted, and the FF would spend the next 0.75 s back at the 1.0 default.
     }
 
-    /// The feed-forward gain in force (== kf == FF strength, 0…0.20), for the log.
+    /// The feed-forward gain in force (== kf == FF strength), for the log.
     float ffGainValue() const { return ffGain; }
     /// The output ceiling in force (finger px/step). A constant.
     float outLimitPx() const { return pidX.outLimitPx(); }
 
 private:
-    float ffGain = 1.00f;
+    float ffGain = 0.80f;
     /// One plant-gain fit, shared by both axes (alpha is the game's sensitivity,
     /// not an axis property).
     tracking::AlphaEstimator alphaEst;
@@ -431,8 +432,36 @@ struct PageAim {
     /// it is the ceiling that stops a re-lock from flinging the finger across
     /// the panel — so it is the constant tracking::kOutLimitPx (180 px/step,
     /// tanh) and the page draws no row for it. The integral's leash is the
-    /// constant tracking::kTrimLimitPx (90). Neither is scaled by anything:
+    /// constant tracking::kTrimLimitPx (150). Neither is scaled by anything:
     /// kf is the only place the plant gain enters, and it lives in its own row.
+    ///
+    /// ── ROUND 14: Ki IS A CARRIER, AND THE LEASH WAS STRANGLING IT ───────────
+    ///
+    /// The command a loop must HOLD on a target moving w view px per step is
+    /// u_ss = w/alpha — which at alpha = 0.1 is ten times w, not a tenth of the
+    /// output ceiling. So the old leash of 90 finger px/step was never a safety
+    /// rail; it was a hard ceiling on how fast a target the integral could hold
+    /// at all: 90 x 0.1 = 9 view px/step, i.e. 1080 px/s. Past that the integral
+    /// pins against the clamp and P has to make up the difference out of the
+    /// remaining error — hundreds of px of it. That, not the gain values, is why
+    /// a low-sensitivity game could not keep up once the feed-forward was small.
+    /// The leash is now 150, and the proximity schedule no longer throttles ki.
+    ///
+    /// The other half of the same bug is DISCHARGE RATE. The integral used to
+    /// come back at exactly the rate it went out — ki·e·dt — so a 50 px trim
+    /// built up against a strafe takes 50/(ki·|e|·dt) frames to give back. At
+    /// ki = 0.1, e = −20 px, 120 Hz that is 3000 frames: twenty-five seconds.
+    /// "ki 会导致过冲并且很慢的描回来" is that arithmetic, exactly. It now unwinds
+    /// kIntReleaseGain (6x) faster whenever the error is already pulling it back
+    /// toward zero (see PPID::update).
+    ///
+    /// Range 0–4, step 0.01, shown to TWO decimals. Step alone was never the
+    /// problem — with a one-decimal readout a 0.01 move is invisible, which is
+    /// what made it look like the step was still 0.1.
+    ///
+    /// How much ki you need depends on how much carrier kf is not supplying.
+    /// At kf = 0.80 the feed-forward carries ~85 %, so a small ki cleans up the
+    /// rest; at kf = 0 it carries the whole thing and wants 0.5–1.5.
     widgets::SliderState kp{0.10f, 0.0f, 0.6f, 0.01f};
     widgets::SliderState ki{0.5f, 0.0f, 4.0f, 0.01f};
     widgets::SliderState kd{0.20f, 0.0f, 2.0f, 0.01f};
@@ -524,7 +553,7 @@ struct PageAim {
     /// 0 turns the feed-forward off exactly and leaves the integral as the sole
     /// DC carrier. Safe everywhere, but it trails a strafe at low sensitivity.
     ///
-    /// Range 0.00–2.00, step 0.01, default 1.00. See tracking/pid_controller.h.
+    /// Range 0.00–1.20, step 0.01, default 0.80. See tracking/pid_controller.h.
     ///
     /// ROUND 13 — DO NOT PUSH THIS TO 1.00 BEFORE READING THE SEED CHANGE. The
     /// crosshair flew off the screen at kf = 1.00 because alpha_hat was still on
@@ -532,12 +561,29 @@ struct PageAim {
     /// kf·(1 − alpha/alpha_hat) is then +0.9·kf, i.e. 0.9 of positive feedback.
     /// The controller now seeds alpha_hat at 0.10 and pushes it from the first
     /// step rather than only after a successful fit, and the feed-forward is
-    /// bounded four ways, so 1.00 is safe — but if the crosshair ever runs away
-    /// again, the diagnostic order is: read `a=` in the log (it should be near
-    /// 0.1, NOT 1.0), then check `|Δe|` per frame against the 30 px jump
+    /// bounded four ways, so 1.00 is reachable — but if the crosshair ever runs
+    /// away again, the diagnostic order is: read `a=` in the log (it should be
+    /// near 0.1, NOT 1.0), then check `|Δe|` per frame against the jump
     /// detector, then lower kf. See the round-13 section of
     /// tracking/pid_controller.h.
-    widgets::SliderState ffGain{1.00f, 0.0f, 2.00f, 0.01f};
+    ///
+    /// ROUND 14 — WHY 0.80 IS THE DEFAULT AND WHY THE CEILING CAME DOWN TO 1.20.
+    /// The residual self-term is a self-COPY of our own delayed command, and a
+    /// copy with coefficient s is stable only while |s| < 1: the loop's
+    /// characteristic equation is z^L = s, so |z| = |s|^(1/L). With the
+    /// estimator's 0.7 bias plus its +/-30 %, r = alpha/alpha_hat lands in
+    /// roughly 1.0…2.0, and then
+    ///
+    ///     kf = 1.00  →  s = −1.00…0.00    a pole ON the unit circle   fragile
+    ///     kf = 0.80  →  s = −0.80…0.00    strictly inside it          safe
+    ///
+    /// while the carrier share kf·r/(1 − kf + kf·r) is 0.79…0.88 either way. So
+    /// 0.80 buys the entire stability margin for the ~15 % of the carrier the
+    /// integral is already cleaning up — which is the trade the "跟枪稳定不抖"
+    /// requirement actually asks for. 1.20 stays reachable for a game whose
+    /// alpha the fit cannot reach; past that the self-copy is a limit cycle, not
+    /// a trim, and no gain underneath it will hide that.
+    widgets::SliderState ffGain{0.80f, 0.0f, 1.20f, 0.01f};
 
 
     /// Aim deadzone (0.0–1.0, one decimal): ports the old project's

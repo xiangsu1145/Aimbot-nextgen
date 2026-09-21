@@ -776,7 +776,7 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // measured grid behind its default.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kp,        "Kp",       2, es);
     y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ki,        "Ki",       1, es);
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ki,        "Ki",       2, es);
     y += rowSl + gap;
     // Kd is PER STEP and dimensionless now (it used to be per-second, which made
     // its real weight kd*120 and put the useful part of the slider in its first
@@ -803,12 +803,21 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // range of 0…0.20 was still wrong, and it was the thing the user felt. At DC
     // the feed-forward's share of the DC carrier is kf·alpha/alpha_hat ≈ 0.8·kf,
     // independent of the game, so 0.20 could never supply more than 16 % of what
-    // a moving target needs and his 0.08 supplied 6 %. Measured at his gains,
-    // alpha = 0.1, 600 px/s: kf 0.08 -> lag 663 px, 0.20 -> 645, 0.40 -> 126,
-    // 0.80 -> 36, 1.00 -> −12. The correct value is a CONSTANT ≈1.0 (full carrier
-    // needs kf = alpha_hat/alpha, and alpha_hat is estimated on-line), so this row
-    // is a trim with a known setting rather than a calibration. See
-    // scripts/aim_gate_lockout_bench.py 表0/表6.
+    // a moving target needs and his 0.08 supplied 6 %.
+    //
+    // ROUND 14 then found the OTHER edge. The residual self-term is a self-COPY
+    // of our own delayed command with coefficient s = kf·(1 − alpha/alpha_hat),
+    // and that copy's characteristic equation is z^L = s, so it decays only while
+    // |s| < 1. At kf = 1.00 the coefficient can reach 1.00 — a fit that
+    // over-estimates alpha drives r = alpha/alpha_hat toward 0 and s toward +1,
+    // which is a pole ON the unit circle, the round-10 marginal case again. At
+    // 0.80 it cannot exceed 0.80, so the copy always decays, while the carrier
+    // share kf·r/(1 − kf + kf·r) stays 0.79…0.88 across the r = 1.0…2.0 that the
+    // bias is designed to produce. So 0.80 ships and 1.20 is the ceiling; the
+    // ~15 % of carrier kf leaves is the integral's job — which the integral can
+    // finally do now that its leash is 150 and the schedule no longer throttles
+    // it. There is no simulator number behind any of the above: u_ss = w/alpha
+    // and |s| < 1 are the whole argument, and the log shows both.
     //
     // Its row was 速度前馈 once, feeding an estimator that was structurally a
     // bare integrator (it measured its own output with no restoring term, so it

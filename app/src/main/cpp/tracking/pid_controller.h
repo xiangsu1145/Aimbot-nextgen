@@ -262,6 +262,77 @@
 //  the INTEGRAL, not the proportional gain, so the approach is still driven at
 //  full authority. (Round 12 took the feed-forward out of its jurisdiction — see
 //  the round-12 section above.)
+//
+//  ── ROUND 14: WHERE THE TRACKING WENT, AND WHY IT WAS NOT THE GAINS ─────────
+//
+//  The user, on the round-13 build: "kf 根本做不到跟枪 … ki 会导致过冲并且很慢的
+//  描回来 … 我之前让你修过冲乱晃的时候本地 git 提交的那个 kf 是左右晃，但是他可以有
+//  跟枪效果". The third clause is the one that matters: an EARLIER build tracked, so
+//  this was a regression rather than a tuning limit — and it had three causes,
+//  none of them a gain value.
+//
+//  1. THE INTEGRAL'S LEASH WAS 90, AND 90 IS A CEILING ON SPEED, NOT A RAIL.
+//     Holding a target that moves w view px per step needs a standing command of
+//     u_ss = w/alpha. At alpha = 0.1 that is TEN TIMES w — 50 finger px/step at
+//     600 px/s, 125 at 1500 — so a leash of 90 caps the integral at
+//     90 × 0.1 = 9 view px/step = 1080 px/s, and everything faster has to be paid
+//     for out of the P term's remaining error: hundreds of px of it. Raising ki
+//     could not have helped, for the same reason a bigger engine does not help a
+//     car whose speedometer is pegged. The leash is 150 now.
+//
+//  2. THE INTEGRAL CAME BACK AT THE RATE IT WENT OUT. A 50 px trim built against
+//     a strafe needs 50/(ki·|e|·dt) frames to return — at ki = 0.1, e = −20 px,
+//     120 Hz that is 3000 frames, twenty-five seconds. "很慢的描回来" is that
+//     arithmetic verbatim, and it is why "ki 会导致过冲" was unfixable by tuning:
+//     the wind-up was not the bug, the discharge rate was. The trim now unwinds
+//     kIntReleaseGain (6×) faster once the error has reversed.
+//
+//  3. THE PROXIMITY SCHEDULE WAS THROTTLING THE CARRIER. Ported in round 13 from
+//     pid (1).cpp, it scaled BOTH P and I down to a floor of 0.5 while the aim
+//     was far off — halving kp, and halving the integral, at the exact moment the
+//     integral had to build the DC carrier. Whatever it bought against a re-lock
+//     lurch, it cost the steady-state hold. Floor 0.75, and P alone.
+//
+//  And the SHAKE, which the user has reported since round 10 and which rounds
+//  11-13 kept attacking from the wrong side:
+//
+//      the residual self-term is a self-COPY of our own delayed command, with
+//      coefficient s = kf·(1 − alpha/alpha_hat), and the characteristic equation
+//      of that copy is z^L = s — so |z| = |s|^(1/L), and it is stable only while
+//      |s| < 1.
+//
+//  Round 10 had s ≈ 1, because in that formulation the copy's gain did not depend
+//  on kf at all — marginally stable, which is exactly "跟得上，但一直晃". Round 12
+//  then raised kf until |s| could reach 1 again and the crosshair left the screen.
+//  The answer is not a value of kf, it is a RANGE for it: with the estimator's
+//  bias and its ±30 %, r = alpha/alpha_hat lands near 1.0…2.0, and there kf = 0.80
+//  puts s in −0.80…0.00; on the other side of r it cannot exceed +0.80 either, so
+//  the copy ALWAYS decays. kf = 1.00 has no such property — an over-estimated
+//  alpha drives s to +1.00 and the pole onto the circle, which is the round-10
+//  marginal case wearing a different formula. Meanwhile the carrier share
+//  kf·r/(1 − kf + kf·r) is 0.79…0.88 at either setting. So the slider is
+//  0.00–1.20 with a working value of 0.80: 1.00 is reachable and is the EDGE, not
+//  the target. The ~15 % of carrier kf leaves is the integral's job now — a job
+//  the integral can finally do, because of (1) and (3).
+//
+//  Two more repairs, both about refusing to believe a fit that is not one:
+//
+//    * The alpha estimator's excitation guard tested the VARIANCE of U, which
+//      misses the case that matters: a steady track makes U a straight line in k,
+//      so the variance is large and U is COLLINEAR with the k regressor, the
+//      normal equations go near-singular, and the solve still returns a number.
+//      It now tests the correlation between U and k directly (reject above 0.985)
+//      and requires the fit to explain 75 % of the window's variance. A steady
+//      hold is rejected — correctly, because alpha is neither observable nor
+//      important then.
+//    * kJumpResetPx went 30 → 60, and the threshold now takes the larger of that
+//      and the target's own BOX WIDTH. Δe contains our own command; firing this
+//      branch zeroes the soft-start ramp and the integral, so a threshold close
+//      to a working strafe is itself a throttle.
+//
+//  None of the three causes above is a gain, and all three of the fixes are
+//  arithmetic (u_ss = w/alpha; 50/(ki·|e|·dt) frames; |s| < 1) — they need no
+//  simulator to check, only the log.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -276,7 +347,28 @@ namespace tracking {
 // Constants, NOT tuning parameters and NOT scaled by anything. See the header
 // for the coverage each one buys.
 constexpr float kOutLimitPx  = 180.0f;
-constexpr float kTrimLimitPx =  90.0f;
+
+// ── The integral's leash (round 14) ─────────────────────────────────────────
+//
+// This was 90, and 90 was not a safety rail — it was a hard ceiling on how fast
+// a target the integral could hold at all. Holding a target that moves w view px
+// per step needs a standing command of u_ss = w/alpha; at alpha = 0.1 that is TEN
+// TIMES w, so 90 finger px/step caps the view at 90 x 0.1 = 9 px/step, i.e.
+// 1080 px/s, and everything past that has to come out of the P term's remaining
+// error — hundreds of px of it. That is the arithmetic behind "kf 做不到跟枪"
+// once the feed-forward is small, and raising ki could not fix it because the
+// ceiling was above ki, not inside it.
+//
+// 150 is still strictly below the output ceiling, so softLimit() remains the
+// last word on what the world receives.
+constexpr float kTrimLimitPx = 150.0f;
+
+// How much faster the integral UNWINDS than it winds when the error has already
+// reversed and is pulling it back toward zero (round 14). Without this a trim of
+// 50 px built against a strafe comes back at ki·|e|·dt per frame — at ki = 0.1,
+// e = -20 px, 120 Hz that is 3000 frames, twenty-five seconds of "很慢的描回来".
+constexpr float kIntReleaseGain = 6.0f;
+
 constexpr float kDerivTauSec = 0.025f;
 
 // ── Feed-forward ────────────────────────────────────────────────────────────
@@ -292,27 +384,50 @@ constexpr float kDerivTauSec = 0.025f;
 // NOT critical — measured, a wrong value anywhere from 2 to 7 changes the sway
 // by a few px — so it is a constant and never a slider.
 //
-// kFfStrengthMax: the top of the kf slider. 2.0 — NOT 0.20. Round 11 had 0.20
-// and that ceiling was the bug the user was feeling: from the round-12 section,
-// the feed-forward's carrier fraction is ≈ 0.8·kf, so 0.20 caps it at 16 % of
-// the DC command the loop needs, no matter what the game's sensitivity is. The
-// CORRECT value is ~1.0 for every game (kf = alpha_hat/alpha, and alpha_hat is
-// estimated on-line), so the range has to straddle 1.0 comfortably on both
-// sides. 2.0 is headroom, not a target.
+// ── ROUND 14: the kf ceiling is 1.20 and 0.80 is the working value ──────────
 //
-// kFfTauFastSec: the release time constant (see round-13 point 4). Asymmetric
-// on purpose — a rising ŵ stays filtered against detector noise, a falling one
-// is followed immediately, because by then the old velocity is not a lead any
-// more, it is pure error.
+// kFfStrengthMax is the top of the kf slider. Round 11 had 0.20, and that
+// ceiling was a real bug — from the round-12 section, the carrier share is
+// ≈ 0.8·kf, so 0.20 caps the feed-forward at 16 % of the DC command a moving
+// target needs, whatever the game's sensitivity. Round 12 then went to 2.0,
+// which over-corrected: the value that MATTERS is set by stability, not by the
+// carrier account, because the residual self-term is a self-COPY of our own
+// delayed command with coefficient
+//
+//     s = kf · (1 − alpha/alpha_hat)
+//
+// and the loop's characteristic equation for that copy is z^L = s, i.e.
+// |z| = |s|^(1/L). Stable only while |s| < 1. With the estimator's own bias and
+// its ±30 %, r = alpha/alpha_hat lands near 1.0…2.0, and then
+//
+//     kf = 1.00  →  s = −1.00…0.00   a pole ON the unit circle   fragile
+//     kf = 0.80  →  s = −0.80…0.00   strictly inside it          safe
+//
+// while the carrier share kf·r/(1 − kf + kf·r) is 0.79…0.88 either way. 0.80
+// therefore buys the entire stability margin for the ~15 % of the carrier the
+// integral is already cleaning up — which is the trade "跟枪稳定不抖" asks for.
+// 1.20 stays reachable for a game whose alpha the fit cannot reach; above that
+// the self-copy is a limit cycle, not a trim.
+//
+// kFfTauSec was 33 ms. At kf = 0.80 and alpha_hat = 0.1 the feed-forward's noise
+// gain is kf/alpha_hat = 8, so this filter is what decides how much of the
+// detector's wobble reaches the finger; 45 ms costs a few px of lead and takes a
+// stop's worth of shimmer out. It is a DELIBERATE trade, not a free lunch — if
+// tracking ever feels soft, this is the first number to put back.
+//
+// kFfTauFastSec: the release time constant (round-13 point 4). Asymmetric on
+// purpose — a rising ŵ stays filtered against detector noise, a falling one is
+// followed immediately, because by then the old velocity is not a lead any more,
+// it is pure error.
 //
 // kFfGainMax / kFfVelMaxPx / kFfLimitPx / kFfDeadbandPx: the bounds from
 // round-13 point 3 and the deadband from point 5. All four exist so that a
 // WRONG alpha_hat is survivable rather than violent; none of them is the
 // mechanism.
-constexpr float kFfTauSec      = 0.033f;
-constexpr float kFfTauFastSec  = 0.012f;
+constexpr float kFfTauSec      = 0.045f;
+constexpr float kFfTauFastSec  = 0.015f;
 constexpr int   kFfDelaySteps  = 5;
-constexpr float kFfStrengthMax = 2.0f;
+constexpr float kFfStrengthMax = 1.20f;
 constexpr float kFfGainMax     = 20.0f;
 constexpr float kFfVelMaxPx    = 60.0f;
 constexpr float kFfLimitPx     = 120.0f;
@@ -321,9 +436,15 @@ constexpr float kFfDeadbandPx  = 0.5f;
 // ── Jump detector (pid (1).cpp:40) ──────────────────────────────────────────
 //
 // |Δe| above this, in screen px for ONE control step, is a re-lock, a flick or
-// a target switch rather than target motion. 30 px/step is 3600 px/s of screen
+// a target switch rather than target motion. 60 px/step is 7200 px/s of screen
 // velocity, well above anything a tracked target produces between detections.
-constexpr float kJumpResetPx = 30.0f;
+//
+// ROUND 14: raised from 30, and the threshold in update() now takes the LARGER
+// of this and the target's own BOX WIDTH. Δe contains our own delayed command —
+// Δe = w − alpha·u(k−L) — so a bare 30 was close enough to a working strafe to
+// fire on real motion, and firing this branch zeroes the soft-start ramp and the
+// integral, which is itself a throttle that reads as "跟不上".
+constexpr float kJumpResetPx = 60.0f;
 
 // ── Soft start ──────────────────────────────────────────────────────────────
 //
@@ -347,10 +468,17 @@ constexpr float kRampRate = 0.30f;
 // three times faster (a big error must not be driven at full authority).
 // kNearFloor is the 0.5 of `比例系数*0.5` — the weight never reaches zero, which
 // is what makes this a schedule and not the latch round 12 had to remove.
+//
+// ROUND 14: the floor is 0.75 and the schedule scales P ALONE. At 0.5 it was
+// halving kp on every approach — lengthening exactly the pull-in that "跟不上"
+// is about — and it was scaling ki as well, i.e. throttling the DC carrier by 2×
+// at the very moment the carrier has to be built. A 0.75 floor still softens a
+// re-lock's first frames, which is all this device was ever for, and leaves both
+// carrier channels (the integral and the feed-forward) untouched.
 constexpr float kGateFrac     = 1.5f;   // |e| >= this × box  ⇒ weight at floor
 constexpr float kNearRate     = 0.03f;  // per step, opening
 constexpr float kNearDropRate = 0.10f;  // per step, closing
-constexpr float kNearFloor    = 0.5f;   // minimum gain multiplier
+constexpr float kNearFloor    = 0.75f;  // minimum gain multiplier, P only
 
 // ── On-line plant-gain (alpha) estimation ───────────────────────────────────
 //
@@ -373,8 +501,15 @@ constexpr float kNearFloor    = 0.5f;   // minimum gain multiplier
 // is refitted every kAlphaSolveEvery steps and its error is ±30 %, so adopting
 // each one wholesale would step the loop gain around for no reason.
 constexpr float kAlphaBias       = 0.8f;
-constexpr float kAlphaMin        = 0.05f;
-constexpr float kAlphaMax        = 4.0f;
+// ROUND 14: narrowed from 0.05…4.0. The self-copy coefficient is
+// s = kf·(1 − alpha/alpha_hat), so a WILD fit is not a cosmetic problem: at
+// alpha_hat = 0.05 against a true alpha of 0.5 it is −7.2, |s| > 1, and the copy
+// stops being a damping term and becomes a limit cycle. A touch game's plant gain
+// does not plausibly sit outside 0.08…2.0, so the clamp can refuse to believe it
+// does, and even a clamped value leaves r inside the kf = 0.8 window
+// (r ∈ 0.25…2.25 for |s| < 1).
+constexpr float kAlphaMin        = 0.08f;
+constexpr float kAlphaMax        = 2.0f;
 constexpr float kAlphaHatSeed    = 0.10f;
 constexpr float kAlphaStep       = 0.35f;
 constexpr int   kAlphaSolveEvery = 15;
@@ -459,14 +594,44 @@ private:
                 b[r] += x[r] * y;
             }
         }
-        // Excitation guard: U must actually vary, or the fit is meaningless even
-        // when the matrix happens to invert.
+        // ── Excitation guard, and the round-14 correction to it ──────────────
+        //
+        // U must vary, AND it must vary in a way the polynomial terms cannot
+        // mimic. The original version tested variance alone, which does not catch
+        // the case that actually matters: while a target is tracked at a steady
+        // speed the command is nearly constant, so U is a STRAIGHT LINE in k —
+        // the variance is huge and U is collinear with the k regressor. The
+        // normal equations are then near-singular, the solve still returns a
+        // number, and that number can be anything inside the clamp.
+        //
+        // A wild alpha_hat is not cosmetic here: s = kf·(1 − alpha/alpha_hat) is
+        // the coefficient on a self-COPY of our own delayed command, so a wrong
+        // HIGH alpha_hat is positive feedback — the shake this round exists to
+        // remove. The correlation between U and k is the direct test.
+        //
+        // A high correlation does not mean the guard fires too often: steady
+        // tracking is precisely when alpha is unobservable AND when it does not
+        // matter, because the reconstruction is then driven by the observed
+        // error rather than by the assumed plant gain.
         double uMean = 0.0, uVar = 0.0;
         for (int i = 0; i < kWin; ++i) uMean += U_[i];
         uMean /= kWin;
         for (int i = 0; i < kWin; ++i) uVar += (U_[i] - uMean) * (U_[i] - uMean);
         uVar /= kWin;
         if (uVar < 9.0) return;                        // < 3 px rms of travel: skip
+
+        double kMean = 0.0, kVar = 0.0, ukCov = 0.0;
+        for (int i = 0; i < kWin; ++i) kMean += k_[i];
+        kMean /= kWin;
+        for (int i = 0; i < kWin; ++i) {
+            const double dk = k_[i] - kMean;
+            kVar  += dk * dk;
+            ukCov += (U_[i] - uMean) * dk;
+        }
+        kVar  /= kWin;
+        ukCov /= kWin;
+        if (kVar < 100.0) return;
+        if (std::fabs(ukCov / std::sqrt(uVar * kVar)) > 0.985) return;
 
         for (int i = 0; i < 4; ++i) {
             int pv = i;
@@ -487,7 +652,27 @@ private:
             x[i] = s / M[i][i];
         }
         const double a = x[3];
-        if (!(a > kAlphaMin && a < 8.0)) return;       // reject absurd fits
+        if (!(a > kAlphaMin && a < kAlphaMax)) return;  // reject absurd fits
+
+        // ── Second guard: the fit must actually EXPLAIN the window ────────────
+        // A spurious alpha can satisfy the normal equations without describing
+        // anything. Requiring the residual to be small against the error's own
+        // spread is what catches that. In a steady hold the spread is pure noise
+        // and this rejects — correctly, because alpha is not observable then.
+        double eMean = 0.0;
+        for (int i = 0; i < kWin; ++i) eMean += e_[i];
+        eMean /= kWin;
+        double rss = 0.0, eVar = 0.0;
+        for (int i = 0; i < kWin; ++i) {
+            const double fit = x[0] + x[1] * k_[i] + x[2] * k_[i] * k_[i] - a * U_[i];
+            const double r   = e_[i] - fit;
+            const double d   = e_[i] - eMean;
+            rss += r * r;
+            eVar += d * d;
+        }
+        if (eVar < 1e-6) return;
+        if (rss > 0.25 * eVar) return;                 // explains < 75 %: not a fit
+
         raw_ = static_cast<float>(a);
         // BLEND the fit in rather than adopting it (round-13 point 1). The fit is
         // refitted every kAlphaSolveEvery steps with a ±30 % error, so adopting
@@ -626,7 +811,14 @@ public:
         // is kJumpResetPx plus that (48 px at alpha 0.1, 210 px at alpha 1) — and
         // a flick or a re-lock at either sensitivity still clears it by a wide
         // margin.
-        if (std::fabs(de) > kJumpResetPx + alphaHat * kOutLimitPx) {
+        // ROUND 14: the threshold takes the LARGER of a fixed floor and the
+        // target's own BOX WIDTH. In one control step a target cannot travel more
+        // than its own width unless what changed was not target motion at all —
+        // and the box width is the only range-invariant yardstick available here.
+        // Our own contribution, alpha_hat·kOutLimitPx, is added on top because
+        // Δe contains it.
+        const float jumpPx = std::max(kJumpResetPx, boxPx) + alphaHat * kOutLimitPx;
+        if (std::fabs(de) > jumpPx) {
             ffVel     = 0.0f;
             ffInhibit = true;
             integral  = 0.0f;
@@ -644,12 +836,13 @@ public:
         //     else             w += ((阈值/|e|)·w − w) · 0.1
         //
         // The threshold is in TARGET WIDTHS (kGateFrac × box), which is the other
-        // reference file's device. The weight multiplies P and I, so a big error
-        // is approached at half authority and full authority is restored only as
-        // the aim closes — this is the reference's actual anti-overshoot
-        // mechanism, and it is a SCHEDULE, which no single gain value can
-        // express. The floor keeps it a schedule: round 12 removed the hard
-        // 已达标 latch because a weight that reaches zero can never reopen.
+        // reference file's device. The weight multiplies P ONLY (round 14), at a
+        // floor of 0.75: at the old 0.5 it was halving kp AND ki on every
+        // approach — lengthening the pull-in and throttling the DC carrier at the
+        // exact moment the carrier had to be built. What it still does is soften
+        // a re-lock's first frames, which is all this device was ever for.
+        // The floor keeps it a schedule rather than a latch: round 12 removed the
+        // hard 已达标 latch because a weight that reaches zero can never reopen.
         float want = 1.0f;
         float rate = kNearRate;
         if (boxPx > 0.0f) {
@@ -717,21 +910,39 @@ public:
         }
         ffInhibit = false;
 
-        // ── Integral: scheduled, and conditional on saturation ───────────────
-        // The accumulation is multiplied by gainScale — the reference's
-        // `积分累计 += e*0.5*dt` on its 未达标 branch, made continuous. Stop
-        // accumulating while the output is already saturated the way the error
-        // wants to push it; without this the integral builds a reserve behind a
-        // clipped output and spends it later.
-        const float raw = p + integral + d + ff;
-        const bool pushHi = raw >=  outLimit && error > 0.0f;
-        const bool pushLo = raw <= -outLimit && error < 0.0f;
+        // ── Integral: the DC carrier, unconditioned and quick to let go ──────
+        //
+        // ROUND 14 — three changes, all of them about one complaint
+        // ("ki 会导致过冲并且很慢的描回来"):
+        //
+        //   1. gainScale is GONE from this line. The proximity schedule was
+        //      throttling the carrier by up to 2x at exactly the moment the
+        //      carrier had to be built.
+        //   2. UNWIND FASTER THAN YOU WIND. The integral used to come back at
+        //      exactly the rate it went out — ki·e·dt — so a 50 px trim built
+        //      against a strafe took 50/(ki·|e|·dt) frames to give back. At
+        //      ki = 0.1, e = −20 px, 120 Hz that is 3000 frames: twenty-five
+        //      seconds. Once the error has reversed the trim is no longer wanted,
+        //      so it is now released kIntReleaseGain times faster.
+        //   3. BACK-CALCULATION, so the integral cannot park a reserve behind a
+        //      clipped output and spend it later.
+        const float uWant = p + integral + d + ff;
+        const bool pushHi = uWant >=  outLimit && error > 0.0f;
+        const bool pushLo = uWant <= -outLimit && error < 0.0f;
         if (!frozen && !pushHi && !pushLo) {
-            integral += ki * gainScale * error * dt;
+            const bool opposing = (integral * error) < 0.0f;
+            integral += (opposing ? kIntReleaseGain : 1.0f) * ki * error * dt;
             integral  = std::clamp(integral, -trimLimit, trimLimit);
         }
 
-        const float u = softLimit(p + integral + d + ff, outLimit);
+        float u = softLimit(p + integral + d + ff, outLimit);
+        // Give back exactly what the limiter refused to deliver, so the trim
+        // tracks the command that was SENT rather than the one that was asked for.
+        if (!frozen && std::fabs(p + integral + d + ff) > outLimit) {
+            integral = std::clamp(integral + (u - (p + integral + d + ff)),
+                                  -trimLimit, trimLimit);
+            u = softLimit(p + integral + d + ff, outLimit);
+        }
 
         outPrev = outSmooth * u + (1.0f - outSmooth) * outPrev;
 

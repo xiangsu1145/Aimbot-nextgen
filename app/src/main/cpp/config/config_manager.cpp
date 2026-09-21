@@ -142,7 +142,13 @@ constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 //        zone, so the set is re-seeded rather than migrated. See the round-12
 //        section of tracking/pid_controller.h and 表6 of
 //        scripts/aim_gate_lockout_bench.py.
-constexpr int kCtlSchema = 10;
+// v11 (round 14): kf's RANGE and WORKING VALUE both moved — 0.00–1.20 with 0.80
+// as the value, where the residual self-copy of our own delayed command is
+// strictly inside the unit circle for any estimator output. A stored 1.00 is
+// the fragile edge rather than an error, so it is deliberately NOT carried
+// across. kp/ki/kd are: they have meant the same thing in every schema, and
+// re-seeding them would throw away tuning the user did himself.
+constexpr int kCtlSchema = 11;
 
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
@@ -347,36 +353,35 @@ void apply(const json& j) {
         const int  storedCtl = (ctlIt != o.end() && ctlIt->is_number())
                                    ? static_cast<int>(ctlIt->get<double>())
                                    : 0;
-        if (storedCtl == kCtlSchema) {
-            getSlider(o, "kp", a.kp);
-            getSlider(o, "ki", a.ki);
-            getSlider(o, "kd", a.kd);
-        } else {
-            a.kp.value = 0.10f;
-            a.ki.value = 0.5f;
-            a.kd.value = 0.20f;
-            // 1.00 is the working value: a full DC carrier needs
-            // kf = alpha_hat/alpha (the reciprocal of the estimator's 0.8 bias).
-            // A stored v8 value was a RECIPROCAL of the plant gain (the user's own
-            // was 0.05) and a stored v9 value was a strength on a range that could
-            // not exceed 0.20 (his was 0.08) — either way the same digits are
-            // wrong here, and a small kf trails a strafe by hundreds of px. The
-            // set is therefore re-seeded, not migrated.
-            a.ffGain.value = 1.00f;
-            LOGI("config: aim gains re-seeded for controller schema %d "
-                 "(file had %d): kp=%.2f ki=%.1f kd=%.2f kf=%.2f",
-                 kCtlSchema, storedCtl, a.kp.value, a.ki.value, a.kd.value,
-                 a.ffGain.value);
+        // kp/ki/kd are read UNCONDITIONALLY (round 14). They are px of output
+        // per px of error per step, they have meant that in every schema, and
+        // re-seeding them across a version bump silently discards tuning the user
+        // did himself — which is the thing that makes him distrust the numbers.
+        getSlider(o, "kp", a.kp);
+        getSlider(o, "ki", a.ki);
+        getSlider(o, "kd", a.kd);
+        if (storedCtl != kCtlSchema) {
+            // kf is the one gain whose meaning HAS moved: v8 stored a reciprocal
+            // of the plant gain (the user's was 0.05), v9 a strength on a range
+            // that could not exceed 0.20 (his 0.08), v10 a strength that reached
+            // 1.00, and v11 narrows the range to 1.20 and moves the working value
+            // to 0.80. A stored 1.00 is not wrong so much as unlucky — it puts the
+            // self-copy pole exactly on the unit circle — so it is not migrated.
+            a.ffGain.value = 0.80f;
+            LOGI("config: kf re-seeded for controller schema %d (file had %d): "
+                 "kf=%.2f — kp/ki/kd kept at %.2f/%.2f/%.2f",
+                 kCtlSchema, storedCtl, a.ffGain.value,
+                 a.kp.value, a.ki.value, a.kd.value);
         }
         getSlider(o, "outSmooth", a.outSmooth);
         getSlider(o, "delay", a.aimDelayFrames);
-        // kf changes MEANING with the schema (v7 scaled it by 灵敏度补偿; v8 made
-        // it 1/alpha; v9 made it a strength whose range stopped at 0.20; v10 is a
-        // strength that actually reaches the working value of 1.0), so it is read
-        // only from a same-schema file. Reading it unconditionally would silently overwrite
-        // the re-seeded value above — the "re-seeded ... kf=" log line would be a
-        // lie, and a number that meant something else under the old controller
-        // would come back.
+        // kf is read only from a same-schema file, because its range and its
+        // working value have moved at almost every revision (v7 scaled it by
+        // 灵敏度补偿, v8 made it 1/alpha, v9 stopped its range at 0.20, v10 let it
+        // reach 1.00, v11 narrows the range to 1.20 around a working value of
+        // 0.80). Reading it unconditionally would silently overwrite the value
+        // re-seeded above — the "kf re-seeded" log line would be a lie, and a
+        // number that meant something else under the old controller would return.
         if (storedCtl == kCtlSchema) {
             getSlider(o, "kf", a.ffGain);
         }
