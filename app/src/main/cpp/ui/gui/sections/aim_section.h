@@ -137,13 +137,13 @@ struct AimController {
     /// There is NO sensitivity compensation here any more and no scaling of the
     /// gains or of the ceilings: kp, ki, kd and kf go in as they are.
     ///
-    /// `kf` is the feed-forward STRENGTH, 0…1.20 — it is NOT the plant gain. The
-    /// reconstruction constant is derived on-line (see `alphaEst`) and pushed
-    /// into both axes, which is what makes kf a CONSTANT rather than a per-game
-    /// calibration. Round 11 capped it at 0.20 and that cap — not the user's
-    /// tuning — is why the aim could not keep up. The working value is 0.80, the
-    /// centre of the self-copy stability window, with the integral cleaning up
-    /// the ~15 % of carrier it leaves. See the round-14 section of
+    /// `kf` is the feed-forward STRENGTH, 0…0.50 (round 15) — it is NOT the plant
+    /// gain. The reconstruction constant is derived on-line (see `alphaEst`) and
+    /// pushed into both axes. Round 11 capped it at 0.20 and that cap — not the
+    /// user's tuning — is why the aim could not keep up then; round 15 fixed the
+    /// other end, because the user's own tuning (kf 0, kp 0.05, ki 0.20, kd 0.26)
+    /// tracks perfectly with the integral as the carrier, which makes the
+    /// feed-forward a trim rather than a carrier. See the round-15 section of
     /// tracking/pid_controller.h.
     void setGains(float kp, float ki, float kd, float outSmooth, float kf) {
         this->ffGain = std::max(0.0f, kf);
@@ -462,9 +462,12 @@ struct PageAim {
     /// problem — with a one-decimal readout a 0.01 move is invisible, which is
     /// what made it look like the step was still 0.1.
     ///
-    /// How much ki you need depends on how much carrier kf is not supplying.
-    /// At kf = 0.80 the feed-forward carries ~85 %, so a small ki cleans up the
-    /// rest; at kf = 0 it carries the whole thing and wants 0.5–1.5.
+    /// How much ki you need depends on how much carrier kf is not supplying, and
+    /// round 15 moved the answer: with the shipped kf (0.05) the INTEGRAL is the
+    /// carrier and the user's own working pair is ki 0.20 with kf 0. A small kf
+    /// on top takes high-frequency load off the integral, which lets ki come
+    /// down; with no feed-forward at all (kf = 0) the integral carries the whole
+    /// DC command and 0.2–1.0 is the useful band.
     widgets::SliderState kp{0.10f, 0.0f, 0.6f, 0.01f};
     widgets::SliderState ki{0.5f, 0.0f, 4.0f, 0.01f};
     widgets::SliderState kd{0.20f, 0.0f, 2.0f, 0.01f};
@@ -521,7 +524,7 @@ struct PageAim {
     /// mechanism, which is why every attempt to tune them apart failed.
     ///
     /// NOW. The reconstruction constant is derived on-line (AlphaEstimator) and
-    /// kf is only a strength, 0…2.0:
+    /// kf is only a strength, 0…0.50:
     ///
     ///     ff = (kf/alpha_hat)·LPF( Δe + alpha_hat·u(k−L) )
     ///
@@ -556,7 +559,7 @@ struct PageAim {
     /// 0 turns the feed-forward off exactly and leaves the integral as the sole
     /// DC carrier. Safe everywhere, but it trails a strafe at low sensitivity.
     ///
-    /// Range 0.00–1.20, step 0.01, default 0.80. See tracking/pid_controller.h.
+    /// Range 0.00–0.50, step 0.01, default 0.05. See tracking/pid_controller.h.
     ///
     /// ROUND 13 — DO NOT PUSH THIS TO 1.00 BEFORE READING THE SEED CHANGE. The
     /// crosshair flew off the screen at kf = 1.00 because alpha_hat was still on
@@ -570,7 +573,9 @@ struct PageAim {
     /// detector, then lower kf. See the round-13 section of
     /// tracking/pid_controller.h.
     ///
-    /// ROUND 14 — WHY 0.80 IS THE DEFAULT AND WHY THE CEILING CAME DOWN TO 1.20.
+    /// ROUND 14 — WHY 0.80 BECAME THE DEFAULT, AND WHY THE CEILING CAME DOWN TO
+    /// 1.20. ⚠ SUPERSEDED BY ROUND 15 (0.50 / 0.05) — kept because the stability
+    /// argument below is exactly what shows the new ceiling is safe.
     /// The residual self-term is a self-COPY of our own delayed command, and a
     /// copy with coefficient s is stable only while |s| < 1: the loop's
     /// characteristic equation is z^L = s, so |z| = |s|^(1/L). With the
