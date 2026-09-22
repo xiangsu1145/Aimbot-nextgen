@@ -17,8 +17,8 @@ import java.net.URL
  *     ├── tflite/              downloaded .tflite files
  *     └── onnx/                downloaded .onnx files
  *
- * GitHub access always goes through a free acceleration proxy prefix — direct
- * raw.githubusercontent.com / github.com connections are never attempted.
+ * GitHub access prefers a free acceleration proxy prefix and keeps a direct
+ * connection as the LAST resort — see [candidateUrls].
  */
 object ModelRepository {
 
@@ -27,14 +27,21 @@ object ModelRepository {
         "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/models.json"
 
     /**
-     * Free GitHub acceleration proxies (prefix style: proxy + original URL).
-     * Tried top-down for both manifest fetches and model downloads; the list
-     * order is the only priority — no direct connection fallback, by design.
+     * Free GitHub acceleration proxies (prefix style: proxy + original URL),
+     * tried top-down for both manifest fetches and model downloads.
+     *
+     * These are volunteer-run and churn fast: a host that works today can be
+     * parked or gone next month, and a dead one usually still resolves in DNS
+     * while serving nothing, so it fails by timeout rather than by name. Treat
+     * this list as a starting order, not as the strategy — [candidateUrls]
+     * appends a direct connection after it, and ModelDownloadManager resumes
+     * partial files instead of restarting them.
      */
     val PROXY_PREFIXES: List<String> = listOf(
         "https://gh-proxy.com/",
         "https://ghproxy.net/",
         "https://ghfast.top/",
+        "https://gh-proxy.net/",
     )
 
     private const val HTTP_CONNECT_TIMEOUT_MS = 10_000
@@ -84,31 +91,45 @@ object ModelRepository {
     }
 
     /**
-     * Fetches the cloud manifest through the proxy list (top-down, first
+     * Fetches the cloud manifest through [candidateUrls] (top-down, first
      * success wins) and rewrites the local cache on success. Must be called
-     * off the main thread. Throws [IOException] when every proxy fails.
+     * off the main thread. Throws [IOException] when every source fails.
      */
     fun fetchCloudManifest(context: Context): List<ModelInfo> {
         var lastError: IOException? = null
-        for (prefix in PROXY_PREFIXES) {
+        for (url in candidateUrls(CLOUD_MANIFEST_URL)) {
             try {
-                val text = httpGetText(prefix + CLOUD_MANIFEST_URL)
+                val text = httpGetText(url)
                 val models = ModelInfo.parseList(text)
                 if (models.isNotEmpty()) {
                     writeManifestCache(context, models)
                     return models
                 }
-                lastError = IOException("empty model list via $prefix")
+                lastError = IOException("empty model list via $url")
             } catch (e: IOException) {
                 lastError = e
             }
         }
-        throw lastError ?: IOException("all GitHub proxies failed")
+        throw lastError ?: IOException("every source failed")
     }
 
-    /** Candidate download URLs for a model file, one per proxy, in priority order. */
+    /**
+     * Every URL worth trying for one original GitHub URL, in priority order:
+     * all proxies first, then the direct URL as a last resort.
+     *
+     * A direct attempt looks like dead weight, because raw.githubusercontent is
+     * blocked often enough that this app historically never tried it. But
+     * "often" is not "always", and the failure is not uniform: DNS is usually
+     * clean (real 185.199.x addresses) and the TCP handshake frequently
+     * succeeds, with only the TLS layer interfered with — and it comes and goes
+     * by line and by hour. As the final fallback it costs one extra attempt.
+     */
+    fun candidateUrls(originalUrl: String): List<String> =
+        PROXY_PREFIXES.map { it + originalUrl } + originalUrl
+
+    /** Candidate download URLs for a model file, in priority order. */
     fun candidateDownloadUrls(model: ModelInfo): List<String> =
-        PROXY_PREFIXES.map { it + model.modelUrl }
+        candidateUrls(model.modelUrl)
 
     /** Writes the manifest cache atomically enough for a tiny JSON document. */
     private fun writeManifestCache(context: Context, models: List<ModelInfo>) {
