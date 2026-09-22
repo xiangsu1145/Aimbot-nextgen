@@ -276,6 +276,15 @@ json serialize() {
         json ydz = json::object();
         for (const auto& [idx, s] : a.yFollow) ydz[std::to_string(idx)] = s.value;
         o["ydz"] = std::move(ydz);
+        // "yof" — per-class aim-height offset, a fraction OF the stop band above
+        // ("ydz"). Not part of the gains block and therefore not gated by
+        // kCtlSchema, like "ydz" itself: it is where the aim rests, not how hard
+        // it drives. A file without it leaves the map empty, and the UI seeds 0.5
+        // (= the box middle = the behaviour before the slider existed), so an old
+        // save needs no migration.
+        json yof = json::object();
+        for (const auto& [idx, s] : a.yOffset) yof[std::to_string(idx)] = s.value;
+        o["yof"] = std::move(yof);
         j["aim"] = std::move(o);
     }
     {
@@ -479,6 +488,21 @@ void apply(const json& j) {
                 ui::widgets::SliderState s{
                     std::clamp(v.get<float>(), 0.0f, 1.0f), 0.0f, 1.0f, 0.1f};
                 a.yFollow.emplace(idx, s);
+            }
+        }
+        // Its companion, read the same way and for the same classes. Absent in
+        // saves written before it existed: the map stays empty and the UI seeds
+        // 0.5, which is the pre-slider behaviour — no migration needed, and no
+        // schema bump, since this is not a gain.
+        if (const auto y = o.find("yof"); y != o.end() && y->is_object()) {
+            a.yOffset.clear();
+            for (const auto& [k, v] : y->items()) {
+                if (!v.is_number()) continue;
+                const int idx = std::atoi(k.c_str());
+                if (idx < 0 || idx >= 32) continue;
+                ui::widgets::SliderState s{
+                    std::clamp(v.get<float>(), 0.0f, 1.0f), 0.0f, 1.0f, 0.05f};
+                a.yOffset.emplace(idx, s);
             }
         }
     }

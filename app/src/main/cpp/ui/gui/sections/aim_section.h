@@ -847,6 +847,20 @@ struct PageAim {
     ///
     /// OFF: aim presses a separate synthetic finger at the touch-area centre;
     /// the player's own finger is mirrored to the game untouched. No takeover.
+    ///
+    /// Either way the screen carries exactly ONE touch point while the aim holds
+    /// it, and that is enforced in the READER rather than here — see
+    /// reader_set_point_guard(). A finger that lands inside the touch area while
+    /// the aim owns its contact is not mirrored at all, so pressing during an
+    /// engagement cannot turn into a second look contact (the "两个触摸点" bug).
+    /// First come, first served: a finger already down when the aim engages
+    /// keeps the point and the takeover drives it; a finger pressed afterwards
+    /// is refused — and stays refused until IT lifts, not until the aim lets go.
+    /// Releasing it earlier would drop it on the app at its current position
+    /// while the app's one look contact is wherever the aim left it, i.e. a
+    /// camera jump. Fingers outside the touch area — the fire button, the
+    /// trigger finger — are mirrored exactly as before, which the trigger in
+    /// particular requires: swallowing it would release the aim's own hold.
     widgets::SwitchState fusion{false};
 
     /// Continuous trigger — when on, the trigger-area switch is hidden on the
@@ -872,6 +886,33 @@ struct PageAim {
     /// Only classes currently *selected* in aimCategory get a slider row;
     /// values for unselected classes are kept. Keyed by class index.
     std::map<int, widgets::SliderState> yFollow;
+
+    /// Per-class aim-height offset (Y偏移·<类别>, 0.0–1.0, default 0.5): WHERE
+    /// along the Y deadzone band the crosshair comes to rest.
+    ///
+    /// 0.5 = the box middle, i.e. exactly what the aim did before this existed —
+    /// which is why it ships at 0.5. Larger aims HIGHER: the band is divided
+    /// top-down, so 1.0 is its top edge and 0.0 its bottom.
+    ///
+    /// ★ The BAND is the unit, not the box. The offset is
+    ///     (0.5 - v) * 2 * bandHalfPx,   bandHalfPx = max(全局死区, Y死区) * 框半高
+    /// — the Y stop radius actually in force. Two consequences, both deliberate:
+    ///   * the rest position is guaranteed to satisfy the very deadzone that
+    ///     decides whether Y is frozen, because the band IS the offset's range.
+    ///     A larger range would put the aim point OUTSIDE the band, the deadzone
+    ///     would then read "not on target" there and pull Y back to the middle,
+    ///     and the slider would end up fighting the loop instead of choosing
+    ///     where it rests;
+    ///   * with both deadzones at 0 (Y死区 defaults to 0.0) the band is 0 wide
+    ///     and the slider does nothing — it is a position WITHIN the stop band,
+    ///     so there has to be a band. Set Y死区 first.
+    ///
+    /// Applied to the aim point every frame, and that is still "Y is not
+    /// adjusted every frame": inside the band Y freezes exactly as before, so
+    /// the offset shows up where it is wanted — on the first pull-in, and again
+    /// whenever the target moves vertically out of the band. Keyed by class
+    /// index, values kept for unselected classes, same as yFollow.
+    std::map<int, widgets::SliderState> yOffset;
 
     /// The synthetic touch state machine — see TouchAimState for the rules.
     TouchAimState touchAim;

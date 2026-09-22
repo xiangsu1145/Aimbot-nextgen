@@ -232,6 +232,13 @@ bool realFingerInTouchArea(int& outId, float& outX, float& outY) {
     for (int i = 0; i < n; ++i) {
         if (pts[i].x < a.x || pts[i].x > a.x + a.w ||
             pts[i].y < a.y || pts[i].y > a.y + a.h) continue;
+        // A finger the single-point guard is withholding is on the glass but not
+        // in the app, so it cannot be the aim's contact. Picking it would also
+        // break the fusion takeover: there is no mirror slot to reserve for a
+        // finger the mirror is refusing, and `realId` changing to it reads as "a
+        // different finger is under the crosshair" — the condition that makes the
+        // aim hand back the finger it IS driving. So: skip it, keep looking.
+        if (reader_is_pointer_swallowed(pts[i].id)) continue;
         const float dx = pts[i].x - cx, dy = pts[i].y - cy;
         const float d2 = dx * dx + dy * dy;
         if (d2 < bestD2) {
@@ -256,7 +263,11 @@ bool realFingerInTouchArea(int& outId, float& outX, float& outY) {
 //
 // ROUND 17: all three are measured against `rawTarget` — the box centre the HUD
 // draws — and NOT against `target`, which is the same point pushed along the
-// tracker's velocity by the 延迟补偿 lead. The distinction is the whole fix for
+// tracker's velocity by the 延迟补偿 lead. (ROUND 25: both points now arrive
+// already shifted by the per-class Y偏移, so read "box centre" below as "the
+// height inside the box the aim was told to rest at"; the relationship between
+// the two — and why the freeze uses the un-leaded one — is unchanged.)
+// The distinction is the whole fix for
 // "准心一直锁在框旁边": with any lead the aim's OWN equilibrium sits v×lead off
 // the box, so a band centred on the lead point happily declares "on target" while
 // the crosshair is one box away from the enemy — and it stays there, because an
@@ -1085,14 +1096,26 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // not wipe the map.
     const size_t nCls = g_pageAim.aimCategory.itemPtrs.size();
     if (nCls > 0) {
+        // Stale indices (model switched to fewer classes) are pruned for BOTH
+        // maps, on the same rule: only while a class list exists — an unloaded
+        // model must not wipe either.
         for (auto it = g_pageAim.yFollow.begin(); it != g_pageAim.yFollow.end();) {
             if (it->first < 0 || static_cast<size_t>(it->first) >= nCls)
                 it = g_pageAim.yFollow.erase(it);
             else
                 ++it;
         }
+        for (auto it = g_pageAim.yOffset.begin(); it != g_pageAim.yOffset.end();) {
+            if (it->first < 0 || static_cast<size_t>(it->first) >= nCls)
+                it = g_pageAim.yOffset.erase(it);
+            else
+                ++it;
+        }
         for (size_t i = 0; i < nCls && i < 32; ++i) {
             if (!g_pageAim.aimCategory.isClassSelected(static_cast<int>(i))) continue;
+            const char* const clsName = g_pageAim.aimCategory.items[i].c_str();
+            char label[128];
+
             auto it = g_pageAim.yFollow.find(static_cast<int>(i));
             if (it == g_pageAim.yFollow.end()) {
                 it = g_pageAim.yFollow
@@ -1100,10 +1123,24 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
                                   widgets::SliderState{0.0f, 0.0f, 1.0f, 0.1f})
                          .first;
             }
-            char label[128];
-            snprintf(label, sizeof(label), "Y死区·%s",
-                     g_pageAim.aimCategory.items[i].c_str());
+            snprintf(label, sizeof(label), "Y死区·%s", clsName);
             widgets::sliderFloat(dl, wRect(x, y, w, rowSl), it->second, label, 1, es);
+            y += rowSl + gap;
+
+            // Where inside that stop band the crosshair comes to rest — see
+            // PageAim::yOffset. Sits directly under its own Y死区 because it is
+            // read as a fraction OF it. Two decimals and a 0.05 step: this one is
+            // a position, not a tolerance, and a 0.1 ladder is visibly coarse on
+            // a 200 px box.
+            auto io = g_pageAim.yOffset.find(static_cast<int>(i));
+            if (io == g_pageAim.yOffset.end()) {
+                io = g_pageAim.yOffset
+                         .emplace(static_cast<int>(i),
+                                  widgets::SliderState{0.5f, 0.0f, 1.0f, 0.05f})
+                         .first;
+            }
+            snprintf(label, sizeof(label), "Y偏移·%s", clsName);
+            widgets::sliderFloat(dl, wRect(x, y, w, rowSl), io->second, label, 2, es);
             y += rowSl + gap;
         }
     }
@@ -1178,7 +1215,7 @@ void drawAimOverlays() {
 
 // ── syncAimPage — the PIDF + uinput loop ────────────────────────────────────
 
-void syncAimPage() {
+static void syncAimPageInner() {
     PageAim& p = g_pageAim;
 
     // 丢框预测帧数 (predictHoldFrames) used to be published here. It moved to the
@@ -1433,7 +1470,11 @@ void syncAimPage() {
     // That is also why "移动一下屏幕就正常了": a re-association zeroes the
     // track's velocity, the v×lead offset collapses to 0, and the aim falls back
     // onto the box. See the round-17 note on PageAim::deadzone.
-    const ImVec2 rawTarget = target;   // the box centre, before any lead
+    // Not const: the Y偏移 below moves this and `target` together. It stays the
+    // point the deadzone measures against — the box centre as the user sees it,
+    // before any lead — and nothing else reads it (the HUD draws from its own
+    // detection copy), so offsetting it here cannot move anything on screen.
+    ImVec2 rawTarget = target;   // the box centre, before any lead
     // ── ROUND 19c: the velocity the lead multiplies MUST be low-passed ────────
     //
     // This is the FOURTH copy of one mistake, and the only one still live. The
@@ -1526,6 +1567,43 @@ void syncAimPage() {
     const auto yfIt = p.yFollow.find(bestCls);
     if (yfIt != p.yFollow.end()) yFollowV = std::clamp(yfIt->second.value, 0.0f, 1.0f);
     const float yDzPx = (hasTarget && yFollowV > 0.0f) ? yFollowV * boxHalfH : 0.0f;
+
+    // ── Per-class aim-height offset (Y偏移) ─────────────────────────────────
+    // Where along the Y stop band the crosshair comes to rest: 0.5 = the box
+    // middle (the behaviour before this existed), larger = higher, 0.0 = the
+    // bottom of the band.
+    //
+    // ROUND 25 — the unit is the BAND, not the box. The offset is a fraction of
+    // the Y stop radius actually in force (`max(dzYPx, yDzPx)`, the OR that
+    // decides the freeze below), so the rest position is by construction inside
+    // that band. That is not tidiness: it is what keeps the deadzone from
+    // undoing the offset. Put the aim point outside the band and the frozen-Y
+    // test reads "not on target" at the very place the aim is trying to rest, so
+    // Y un-freezes and walks the crosshair back to the middle — the slider would
+    // fight the loop instead of choosing where it stops. Scaling by the box
+    // instead of the band is exactly that failure, and it is the reason the
+    // band is the unit.
+    //
+    // Applied to BOTH the controller's target point and the deadzone's
+    // reference, by the same amount. Moving only the target would leave the
+    // freeze test measured from the untouched box centre — exactly one band away
+    // from the resting place at v = 1.0 — so the test would sit on its own
+    // boundary and chatter between frozen and not while Y is meant to be parked.
+    // Moving both makes the offset a real resting place: the loop stops there,
+    // the deadzone agrees that is on target, and how far the crosshair is off the
+    // box centre is exactly what the slider says.
+    //
+    // With both deadzones at 0 the band is 0 wide and the offset vanishes; there
+    // is no band to place the point in. Y死区 defaults to 0.0, so the slider is
+    // inert until one of the two is given a value — see the header.
+    float yOffsetV = 0.5f;
+    const auto yoIt = p.yOffset.find(bestCls);
+    if (yoIt != p.yOffset.end()) yOffsetV = std::clamp(yoIt->second.value, 0.0f, 1.0f);
+    const float yOffsetBandPx = std::max(dzYPx, yDzPx);
+    const float yOffsetPx = (0.5f - yOffsetV) * 2.0f * yOffsetBandPx;
+    // Screen Y grows downward, so "higher" is a negative displacement.
+    target.y    += yOffsetPx;
+    rawTarget.y += yOffsetPx;
 
     // ── Did the selection land on a DIFFERENT ENEMY this frame? ──────────────
     // The controller must be told, because it cannot tell a switch from the
@@ -1744,6 +1822,64 @@ void syncAimPage() {
         // Must come AFTER release(), which clears the flag.
         p.touchAim.carryTrim = true;
     }
+}
+
+// ── 单点守卫 (single-point guard) ────────────────────────────────────────────
+//
+// The aim holds ONE touch point on screen — either its own synthetic finger
+// (UINPUT_SLOT_PRIMARY) or a real finger it took over (touch fusion). A finger
+// the player presses down LATER must not become a second look contact: two
+// competing contacts is what makes the game's camera stutter, stop answering,
+// or turn the wrong way, and it is exactly what "自瞄的时候我再按下就变成两个
+// 触摸点了" was.
+//
+// The rule is first-come-first-served, and it is published to the reader (which
+// owns the mirror) rather than enforced here, because the decision has to be
+// made at the moment the finger LANDS — after the fact it is too late: the app
+// has already been told about the touch, and taking it back is a click.
+//
+//   * a finger already down when the aim engages keeps the point — the fusion
+//     takeover drives it, so the aim's point IS the player's finger;
+//   * a finger landing in the touch box while the aim holds a point does not
+//     reach the game at all — and it goes on not reaching it until that finger
+//     LIFTS, even after the aim has let go. Releasing it the moment the aim
+//     stops would drop it onto the app at its CURRENT position while the app's
+//     one look contact sits wherever the aim left it: a second contact landing
+//     tens of pixels away is a camera jump, the same fault in reverse. A finger
+//     the app was never told about is also one it does not have to be told
+//     about when it comes up — the lift is the only release the app cannot see;
+//   * everything outside the box — the fire button, the trigger finger — is
+//     mirrored exactly as before. Swallowing the trigger finger would release
+//     the aim's own hold, so this is a requirement, not a courtesy.
+//
+// Deliberately NOT armed while the aim is idle: then the finger has to reach
+// the mirror for the fusion takeover to find it (uinput_takeover_physical_id
+// only names a finger the mirror is carrying).
+static void publishPointGuard() {
+    PageAim& p = g_pageAim;
+    const bool holding = (p.touchAim.phase == TouchAimState::Phase::Pressed);
+    if (!holding || !p.touchArea.placed) {
+        // Disarming only stops NEW landings from being refused; it does not
+        // release the fingers already refused — those leave by lifting, which is
+        // the whole point (see the note above). So this runs every idle frame
+        // and is cheap: nothing happens unless the guard was armed.
+        reader_set_point_guard(nullptr, false, -1);
+        return;
+    }
+    const TouchAreaOverlay& a = p.touchArea;
+    const int rect[4] = {static_cast<int>(a.x), static_cast<int>(a.y),
+                         static_cast<int>(a.w), static_cast<int>(a.h)};
+    // The finger the aim drives has to keep its gesture: it IS the point, and
+    // the takeover needs it in the mirror so that handing it back is seamless.
+    const int keepId = p.touchAim.drivingReal ? p.touchAim.realId : -1;
+    reader_set_point_guard(rect, true, keepId);
+}
+
+void syncAimPage() {
+    syncAimPageInner();
+    // After the phase decisions for this frame, so the guard describes the
+    // contact the aim is actually holding right now.
+    publishPointGuard();
 }
 
 // ── Is the aim actually driving a finger right now? ─────────────────────────

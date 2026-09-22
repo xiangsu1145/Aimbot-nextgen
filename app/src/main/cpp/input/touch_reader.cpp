@@ -172,6 +172,37 @@ int  g_regionCount = 0;
 // is no longer there — and pass-through is the safe answer to a stale claim,
 // because a swallowed touch is invisible while a leaked one is merely unwanted.
 long long g_regionStampUs = 0;
+
+// ── Single-point guard (see reader_set_point_guard in the header) ────────────
+//
+// Published by the aim's render loop once per frame while it is holding a
+// contact, and read here by the mirror. Like the menu rectangles it is a claim
+// that expires: the publisher is a frame loop that can die, and a claim that
+// outlives its publisher is a dead patch on the touchscreen.
+constexpr long long kPointGuardStaleUs = 400'000;   // 400 ms ≈ 24 missed frames
+
+bool g_guardOn      = false;
+int  g_guardRect[4] = {0, 0, 0, 0};   // x, y, w, h — screen pixels
+/// Finger that must keep its gesture even if it is inside the rectangle: the
+/// real finger the aim has taken over. It is excluded from the mirror by the
+/// takeover itself, and it has to stay in the mirror's bookkeeping so that
+/// handing it back does not look like a lift. -1 when the aim is driving its
+/// own synthetic finger.
+int  g_guardKeepId  = -1;
+long long g_guardStampUs = 0;
+
+/// Panel ids whose mirror the guard has revoked, decided at LANDING and held
+/// until that finger lifts (or the guard ends). One decided gesture per entry —
+/// that is what keeps a swallowed finger from popping into existence mid-drag.
+int g_guardIds[kMaxSlots];
+int g_guardCount = 0;
+
+/// The ids of the previous mirror pass. "Landed just now" is the difference
+/// between "a finger the player is putting down while the aim holds the point"
+/// (swallow it) and "a finger that has been down for a while" (never take its
+/// gesture away mid-drag).
+int g_prevIds[kMaxSlots];
+int g_prevCount = 0;
 constexpr long long kRegionStaleUs = 1'000'000;   // 1 s ≈ 30 missed refreshes
 
 // Gesture-level swallow latch. A gesture is decided once, when its first finger
@@ -233,6 +264,14 @@ void clearFingerState() {
     g_usesMtReport = false;
     g_gestureActive   = false;
     g_gestureConsumed = false;
+    // The point guard dies with the finger state: its ids name fingers of a
+    // panel we are no longer reading, and the app below is being told everything
+    // lifts when the device is released (see uinput_mirror_clear), so there is
+    // no contact left for a swallowed id to jump away from.
+    g_guardOn     = false;
+    g_guardCount  = 0;
+    g_guardKeepId = -1;
+    g_prevCount   = 0;
 }
 
 /// Allocates the next invented Protocol A finger id.
@@ -307,6 +346,111 @@ bool pointInRegionsLocked(float x, float y) {
         if (x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]) return true;
     }
     return false;
+}
+
+/// The guard rectangle the aim published, if any. Caller must hold g_mutex.
+///
+/// Edges inclusive, matching realFingerInTouchArea() in aim_section.cpp — the
+/// guard and the fusion takeover are two halves of one rule, so "inside" has to
+/// mean the same rectangle to both. A finger on the boundary is one the takeover
+/// would find, so it is one the guard must be willing to refuse.
+bool pointInGuardRectLocked(float x, float y) {
+    if (g_guardRect[2] <= 0 || g_guardRect[3] <= 0) return false;
+    return x >= g_guardRect[0] && x <= g_guardRect[0] + g_guardRect[2] &&
+           y >= g_guardRect[1] && y <= g_guardRect[1] + g_guardRect[3];
+}
+
+/// Whether the mirror must drop finger `id`, currently at (x, y).
+///
+/// The decision is made ONCE per gesture, when the finger lands, and then
+/// remembered in g_guardIds until it lifts: a finger that vanishes mid-drag and
+/// reappears when it leaves the rectangle would reach the game as a fresh touch
+/// (a click at worst, a second competing look contact at best). Same per-gesture
+/// rule the menu rectangles follow. Caller must hold g_mutex.
+bool guardDropsLocked(int id, float x, float y) {
+    // ── Already swallowed: it stays swallowed until that finger LIFTS ─────────
+    //
+    // Answered first, ahead of "is the guard even armed", because this verdict
+    // deliberately outlives the guard. A swallowed finger has never been
+    // announced to the app, so the app is holding no state that needs
+    // correcting — but the instant we release it, it arrives AT ITS CURRENT
+    // POSITION, while the app's one look contact sits wherever the aim left it.
+    // Two contacts tens of pixels apart is a camera jump: releasing the finger
+    // before it lifts is the very glitch the guard exists to prevent, only on
+    // the way out instead of the way in.
+    //
+    // The lift is the one release the app cannot see at all. It was never told
+    // the finger went down, so it does not have to be told it came up. That is
+    // why the entry is retired by the lift (pruneGuardIdsLocked) and not by the
+    // aim letting go.
+    for (int i = 0; i < g_guardCount; ++i) {
+        if (g_guardIds[i] == id) return true;
+    }
+
+    if (!g_guardOn) return false;
+
+    // The guard is renewed every frame by the aim's render loop, so silence
+    // means the publisher is gone — and a guard nobody renews must not go on
+    // ACCEPTING landings for as long as the daemon lives. It only stops taking
+    // new fingers here: the ones it already swallowed still leave by lifting,
+    // because for them that is the only release that does not move the app's
+    // contact (and a hand cannot stay on the glass forever).
+    if (nowUs() - g_guardStampUs > kPointGuardStaleUs) {
+        LOGE("point guard went stale (%lld ms old) — no longer swallowing new "
+             "touches; %d finger(s) already swallowed will leave on lift",
+             (nowUs() - g_guardStampUs) / 1000, g_guardCount);
+        g_guardOn     = false;
+        g_guardKeepId = -1;
+        return false;
+    }
+
+    // The finger the aim is driving: the takeover already keeps it out of the
+    // mirror, and it must stay in the mirror's bookkeeping so handing it back
+    // is seamless (see uinput_release_takeover).
+    if (id == g_guardKeepId) return false;
+
+    // A finger that was already down when this pass began keeps its gesture.
+    // Taking it away now would arrive at the panel as a lift, and in a game a
+    // lift is a click — so the guard only ever decides fingers at landing.
+    for (int i = 0; i < g_prevCount; ++i) {
+        if (g_prevIds[i] == id) return false;
+    }
+
+    if (!pointInGuardRectLocked(x, y)) return false;
+
+    if (g_guardCount < kMaxSlots) {
+        g_guardIds[g_guardCount++] = id;
+        LOGI("point guard: finger id=%d landed at %d,%d inside the touch box — "
+             "not mirrored (the aim owns the touch point)", id,
+             static_cast<int>(x), static_cast<int>(y));
+    }
+    return true;
+}
+
+/// Retires the swallowed gestures whose finger is no longer on the glass.
+///
+/// Must run once per mirror pass — "the finger lifted" is only observable as
+/// absence from the pointer set, and the pass is the only place that set is
+/// available. Without it a swallowed id would sit in the list forever and be
+/// handed to the NEXT finger that happened to be given the same tracking id,
+/// which the panel does reuse. Caller must hold g_mutex.
+void pruneGuardIdsLocked() {
+    if (g_guardCount <= 0) return;
+    int kept = 0;
+    for (int i = 0; i < g_guardCount; ++i) {
+        const int id = g_guardIds[i];
+        bool down = false;
+        for (const ReaderPointer& p : g_pointers) {
+            if (p.id == id) { down = true; break; }
+        }
+        if (down) {
+            g_guardIds[kept++] = id;
+        } else {
+            LOGI("point guard: finger id=%d lifted — released (it was never "
+                 "mirrored, so the app sees nothing)", id);
+        }
+    }
+    g_guardCount = kept;
 }
 
 /// Rebuilds g_pointers from the decoded state. Caller must hold g_mutex.
@@ -796,10 +940,62 @@ void publishPointers(bool mirror) {
             // are present on a supposedly-B panel treat as fallback to compact.
             if (g_protoASnap.count > 0) useSlotsDirect = false;
         }
+        // The gesture's owning finger is decided on the finger that actually
+        // landed first, before the guard below may drop it — the menu rectangle
+        // test is about where the hand went down, not about what we chose to
+        // forward. (`xs[0]` is only the first finger until the filter runs.)
+        const int landingX = (n > 0) ? xs[0] : 0;
+        const int landingY = (n > 0) ? ys[0] : 0;
+
+        // ── Single-point guard ──────────────────────────────────────────────
+        // Drops the physical fingers whose landing the aim's own contact has
+        // already taken over (see reader_set_point_guard). Applied HERE, before
+        // either mirror view is used, so a swallowed finger is absent in both
+        // encodings: the compact list (Protocol A) and the slot-direct one
+        // (Protocol B) — and, just as important, it is absent from the moment
+        // it lands, so the app never sees a point appear and then vanish.
+        {
+            // Snapshot first: guardDropsLocked() answers "did this finger land
+            // just now?" by comparing against the previous pass, so the previous
+            // pass must still be intact while the verdicts are being made.
+            int landedIds[kMaxSlots];
+            const int landedCount = (n < kMaxSlots) ? n : kMaxSlots;
+            for (int i = 0; i < landedCount; ++i) landedIds[i] = ids[i];
+
+            int kept = 0;
+            for (int i = 0; i < n; ++i) {
+                if (guardDropsLocked(ids[i], xs[i], ys[i])) continue;
+                ids[kept]   = ids[i];
+                xs[kept]    = xs[i];
+                ys[kept]    = ys[i];
+                rawXs[kept] = rawXs[i];
+                rawYs[kept] = rawYs[i];
+                ++kept;
+            }
+            n = kept;
+            if (useSlotsDirect) {
+                for (int k = 0; k < kMaxSlots; ++k) {
+                    if (slotIds[k] >= 0 &&
+                        guardDropsLocked(slotIds[k], slotXs[k], slotYs[k])) {
+                        slotIds[k] = -1;   // "up": the app must not see it at all
+                    }
+                }
+            }
+
+            g_prevCount = landedCount;
+            for (int i = 0; i < landedCount; ++i) g_prevIds[i] = landedIds[i];
+
+            // Retire the swallowed gestures whose finger has left the glass.
+            // Done last, so a finger that landed in this very pass is still
+            // present in g_pointers when it is checked, and after the verdicts
+            // above, which read g_prevIds as "what was down before this pass".
+            pruneGuardIdsLocked();
+        }
+
         if (n > 0) {
             if (!g_gestureActive) {
-                g_gestureConsumed = pointInRegionsLocked(xs[0], ys[0]);
-                LOGD("gesture at %d,%d -> %s", xs[0], ys[0],
+                g_gestureConsumed = pointInRegionsLocked(landingX, landingY);
+                LOGD("gesture at %d,%d -> %s", landingX, landingY,
                      g_gestureConsumed ? "menu (swallowed)" : "passthrough");
             }
             g_gestureActive = true;
@@ -1068,6 +1264,78 @@ extern "C" void reader_set_regions(const int* rects, int count) {
 }
 
 extern "C" int reader_get_region_count(void) { return g_regionCount; }
+
+extern "C" void reader_set_point_guard(const int* rect, bool enabled, int keepId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!rect || !enabled) {
+        if (g_guardOn) {
+            LOGI("point guard: off — no longer swallowing new touches; %d "
+                 "finger(s) stay swallowed until they lift", g_guardCount);
+        }
+        // The swallowed ids are NOT cleared. Turning the guard off only stops
+        // NEW landings from being refused; a finger that was already refused is
+        // still invisible to the app, and letting it through now would drop it
+        // onto the app at its current position while the app's look contact is
+        // wherever the aim left it — a camera jump. It leaves by lifting.
+        // See guardDropsLocked / pruneGuardIdsLocked.
+        g_guardOn      = false;
+        g_guardKeepId  = -1;
+        g_guardStampUs = nowUs();
+        return;
+    }
+
+    // Updated every frame (the box can be dragged), and every frame is also the
+    // renewal that keeps the guard from expiring.
+    for (int i = 0; i < 4; ++i) g_guardRect[i] = rect[i];
+    g_guardKeepId  = keepId;
+    g_guardStampUs = nowUs();
+    if (g_guardOn) return;   // armed already: per-gesture verdicts are held
+
+    // ── Turning ON ──────────────────────────────────────────────────────────
+    // A finger that is ALREADY inside the box cannot keep its gesture: the aim
+    // is putting its own contact down this frame, and two look contacts at once
+    // is the state this guard exists to prevent. It is revoked here, once, so
+    // the aim's contact is the only one the app holds. From then on landings are
+    // refused as they happen (guardDropsLocked), which is the only way to refuse
+    // a touch without ever showing one: telling the app about it and taking it
+    // back one frame later is a click.
+    //
+    // The list is APPENDED to, never rebuilt. A finger swallowed during an
+    // earlier hold of the touch point is still unknown to the app — if the
+    // player never lifted it, it has to keep being unknown, or the release would
+    // be the jump described in guardDropsLocked.
+    //
+    // The exception is the finger the aim is driving: the takeover already keeps
+    // it out of the mirror, and it has to stay in the mirror's bookkeeping so
+    // that handing it back is seamless (uinput_release_takeover).
+    for (const ReaderPointer& p : g_pointers) {
+        if (p.id == keepId) continue;
+        if (!pointInGuardRectLocked(p.x, p.y)) continue;
+        bool known = false;
+        for (int i = 0; i < g_guardCount; ++i) {
+            if (g_guardIds[i] == p.id) { known = true; break; }
+        }
+        if (known) continue;
+        if (g_guardCount < kMaxSlots) g_guardIds[g_guardCount++] = p.id;
+    }
+    g_guardOn = true;
+    LOGI("point guard: on — rect %d,%d %dx%d keepId=%d, swallowing %d finger(s) "
+         "inside", g_guardRect[0], g_guardRect[1], g_guardRect[2],
+         g_guardRect[3], keepId, g_guardCount);
+}
+
+extern "C" bool reader_get_point_guard(void) { return g_guardOn; }
+
+extern "C" int reader_get_point_guard_count(void) { return g_guardCount; }
+
+extern "C" bool reader_is_pointer_swallowed(int id) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (int i = 0; i < g_guardCount; ++i) {
+        if (g_guardIds[i] == id) return true;
+    }
+    return false;
+}
 
 extern "C" int reader_poll(int timeoutMs) {
     if (!g_ready || g_fds.empty()) return -1;

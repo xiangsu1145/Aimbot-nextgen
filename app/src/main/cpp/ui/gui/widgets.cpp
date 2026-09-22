@@ -39,10 +39,19 @@ bool   g_pressValid = false;
 /// finger. Reset every frame by beginFrame() before any widget runs.
 bool   g_widgetDragging = false;
 
+/// The rectangle an open dropdown list may be *seen* in — the board narrows it
+/// to its own content clip while it draws (see setPopupBounds in widgets.h for
+/// why the display is the wrong answer). Empty = the whole display, which is
+/// the right answer in the modal dialogs: their popovers are painted after the
+/// board's clip has been popped, so nothing but the screen cuts them.
+Rect g_popupBounds{};
+
 // Forward-declared so the switch code in the gap between the two anonymous
 // namespaces can call it; the definition lives further down in the second
 // anonymous namespace near the click helpers.
 void pollPressOrigin();
+
+void setPopupBounds(const Rect& r) { g_popupBounds = r; }
 
 namespace {
 
@@ -92,17 +101,23 @@ constexpr float kDropdownInsetY = 5.0f;    // selector sits inset inside the row
 constexpr float kChevronW       = 17.0f;   // x extent of the "v" — clearly wider
 constexpr float kChevronH       = 8.0f;    // y extent — than it is tall, so the arms read as stubby
 constexpr float kChevronThick   = 3.4f;
+constexpr float kDropdownEdgeSlack = 12.0f;  // keep the last row off the bound
 constexpr float kPi             = 3.14159265358979323846f;
 
 // ── Dropdown / multi-select shared placement ─────────────────────────────────
 //
 // The open list expands downward from the selector by default. When the full
-// list would run past the bottom of the screen it is cut off there (the list
-// paints on the foreground draw list, so the panel edge is the only clip) —
-// the bottom entries would be unreachable. In that case, and when there is
-// actually room above, the list opens upward from above the field instead.
-// Both the paint paths and the hit-test paths take their `listTop` from here,
-// so they can never disagree about where the items are.
+// list would run past the bottom of the bound it can be *seen* in, it is cut
+// off there — the bottom entries would be unreachable. In that case, and when
+// there is actually room above, the list opens upward from above the field
+// instead. Both the paint paths and the hit-test paths take their `listTop`
+// from here, so they can never disagree about where the items are.
+//
+// The bound is whatever the current clip stack allows (see setPopupBounds):
+// the board's content clip while the board draws, the display otherwise. It
+// must be the clip and not the display — the clip is strictly smaller, so
+// measuring against the display would let a list be silently cut by the panel
+// without ever flipping.
 struct DropdownGeom {
     Rect  field;    // the selector pill inside the row
     float listTop;  // top edge of the open list
@@ -118,12 +133,41 @@ DropdownGeom dropdownGeom(const Rect& r, int count, float s) {
     const float listH  = count * csize(kDropdownItemH) * s;
     const float gap    = csize(kDropdownGap) * s;
     const float downTop = g.field.y + g.field.h + gap;
-    const float screenH = ImGui::GetIO().DisplaySize.y;
 
-    if (downTop + listH > screenH - gap &&
-        g.field.y - gap - listH >= 0.0f) {
+    // ── Measure against the BOUND, never the display ────────────────────────
+    //
+    // The display is not where the list ends. Its only clip is the draw list's
+    // own clip stack, and on the board that stack is already narrowed to the
+    // panel — a panel that keeps a 6% margin on every side and, in portrait, is
+    // a 3:4 slab centred in a 9:19.5 display, so its bottom edge sits hundreds
+    // of px *above* the screen's. Asking the screen therefore answers a question
+    // nobody asked: a list that the panel will cut off reads as "fits fine",
+    // never flips, and leaves its bottom entries unreachable — the intermittent
+    // "截断了却没往上升" symptom. `slack` holds the last row off the bound, so a
+    // list that only just fits does not end flush against the panel rim (which
+    // reads as "the last entry is cut off" even when it is not).
+    const bool  bounded  = g_popupBounds.w > 0.0f && g_popupBounds.h > 0.0f;
+    const float boundTop = bounded ? g_popupBounds.y : 0.0f;
+    const float boundBot = bounded ? g_popupBounds.y + g_popupBounds.h
+                                   : ImGui::GetIO().DisplaySize.y;
+    const float slack    = csize(kDropdownEdgeSlack) * s;
+
+    const float upTop     = g.field.y - gap - listH;   // top edge of an upward list
+    const float roomBelow = boundBot - slack - downTop;
+    const float roomAbove = g.field.y - gap - slack - boundTop;
+
+    if (listH <= roomBelow) {
+        g.listTop = downTop;                                  // fits below: stay put
+    } else if (listH <= roomAbove) {
         g.upward  = true;
-        g.listTop = g.field.y - gap - listH;   // bottom edge sits just above the field
+        g.listTop = upTop;             // bottom edge sits just above the field
+    } else if (roomAbove > roomBelow) {
+        // Taller than the bound either way — a list longer than the panel is
+        // going to lose an end whichever way it opens, so take the end that
+        // loses less. Both directions keep the entries nearest the field, so
+        // the choice is simply "which side has more room".
+        g.upward  = true;
+        g.listTop = upTop;
     } else {
         g.listTop = downTop;
     }
@@ -1012,6 +1056,12 @@ void consumeTap() {
 
 void beginFrame() {
     g_gestureConsumed = false;
+    // Start every frame with the display as the popup bound. The board narrows
+    // it again from inside its own content clip (hud.cpp), so this is what a
+    // popover drawn with no board at all — or a frame that skipped the board
+    // entirely — falls back to. Without it, a stale board rect would outlive
+    // the board that published it and quietly over-steer later popovers.
+    g_popupBounds = Rect{};
     // g_widgetDragging stays true across frames (it represents an in-flight
     // drag, not a one-shot gesture). The widget that owns the drag clears it
     // when the drag releases; for safety the scroll handler also clears it

@@ -504,6 +504,13 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
     dl->PushClipRect(xf.pt(ImVec2(r.x, ruleY)),
                      xf.pt(ImVec2(r.x + r.w, r.y + r.h)),
                      true);
+    // An open dropdown has to decide up-or-down against THIS clip rather than
+    // the screen — this clip is what actually cuts it, and it is far smaller
+    // than the screen (see widgets::setPopupBounds). Layout space, the same
+    // space the sections lay their rows out in, which is where the widget
+    // reads it back.
+    widgets::setPopupBounds(
+        widgets::Rect{r.x, ruleY, r.w, r.y + r.h - ruleY});
 
     // ── Dispatch to the active section ───────────────────────────────────────
     // The cursor `y` starts just under the hairline; each section's draw
@@ -646,6 +653,11 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
     // The outer full-board clip was already popped just before the section
     // dispatch — this one matches that inner push.
     dl->PopClipRect();
+
+    // Back to the display. The board's own clip is gone, so a popover opened
+    // from here on (the Model dialogs, which draw after drawContent) really is
+    // bounded by nothing but the screen and must be placed as such.
+    widgets::setPopupBounds(widgets::Rect{});
 }
 
 void drawBoard(ImDrawList* dl, const HudRect& r, float s, const Xf& xf) {

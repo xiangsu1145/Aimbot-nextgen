@@ -90,6 +90,67 @@ void reader_set_regions(const int* rects, int count);
 /// Number of rectangles currently published (diagnostics).
 int reader_get_region_count(void);
 
+/// ── Single-point guard (触摸单点守卫) ────────────────────────────────────────
+///
+/// While `enabled`, a physical finger that LANDS inside `rect` (x, y, w, h in
+/// screen pixels) is NOT mirrored to uinput — the app underneath never sees it,
+/// so the aim's own contact stays the only touch point on screen. This is the
+/// other half of touch fusion: fusion hands the aim's point to a finger the
+/// player already had down, and this keeps a finger he presses DOWN LATER from
+/// turning that into two look contacts (which is what makes the game's camera
+/// stutter or stop answering).
+///
+/// Deliberately narrow, because a swallowed touch is invisible while a leaked
+/// one is merely unwanted (same reasoning as the menu rectangles):
+///
+///   * only the finger's LANDING point is tested, and the verdict is held for
+///     the whole gesture — a finger that lands outside and drags in keeps its
+///     gesture, and a swallowed one stays swallowed even if it is dragged out.
+///     Flipping a finger mid-gesture would show up as a lift, i.e. a click.
+///   * a swallowed finger is released by ITS OWN LIFT, not by the guard ending.
+///     This is the part that keeps the coordinates continuous: the app was never
+///     told the finger went down, so it holds no contact for the finger; letting
+///     it through at any earlier moment would put it on screen at its current
+///     position, next to whatever contact the aim left behind — two look
+///     contacts tens of pixels apart. The lift is the one release the app cannot
+///     observe. `enabled = false` therefore only stops NEW landings from being
+///     refused (and the same applies when the guard expires below).
+///   * a finger that is ALREADY inside `rect` when the guard turns on cannot
+///     keep its gesture: the aim is putting its own contact down in that same
+///     frame and two look contacts is the state this guard exists to prevent, so
+///     it is revoked once, at that moment. `keepId` is the exception by design —
+///     it is the finger the aim has taken over, and the takeover needs it in the
+///     mirror so handing it back is seamless.
+///   * everything outside `rect` — fire buttons, the trigger finger — is
+///     mirrored exactly as before. Swallowing the trigger finger would release
+///     the aim's own hold, so this is not a convenience, it is required.
+///
+/// The publisher is a render loop, so the guard EXPIRES (see kPointGuardStaleUs)
+/// rather than being trusted indefinitely: a renderer that died while the guard
+/// was on must not go on refusing touches for as long as the daemon lives. On
+/// expiry it stops taking new fingers; the ones already swallowed still leave by
+/// lifting, since for them that is the only release that does not move the app's
+/// contact (and a hand cannot stay on the glass forever).
+///
+/// Pass `enabled = false` (rect may be null) to disarm the guard.
+void reader_set_point_guard(const int* rect, bool enabled, int keepId);
+
+/// Whether the guard is currently armed (diagnostics).
+bool reader_get_point_guard(void);
+
+/// How many fingers the guard is swallowing right now (diagnostics).
+int reader_get_point_guard_count(void);
+
+/// Whether finger `id` is currently withheld from the app by the point guard.
+///
+/// Such a finger is on the glass but NOT in the app — and everything that
+/// reasons about the app's input has to treat it that way. The fusion takeover
+/// in particular must not pick it: there is no mirror slot to reserve for a
+/// finger the mirror is refusing, and naming it would read to the aim as "a
+/// different finger is under the crosshair", which is the condition that makes
+/// it hand back the finger it IS driving. See realFingerInTouchArea().
+bool reader_is_pointer_swallowed(int id);
+
 /// Blocking wait for panel events.
 /// Returns >0 when the pointer set changed, 0 on timeout, <0 on error.
 /// When the sink is enabled, the new pointer set is mirrored to uinput here.

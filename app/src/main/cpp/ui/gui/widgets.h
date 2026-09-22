@@ -152,6 +152,22 @@ void dropdownList(ImDrawList* dl, const Rect& r, const DropdownState& st,
 /// can leave room for it.
 float dropdownListHeight(int count, float s);
 
+/// Declares the rectangle an open dropdown list is allowed to be seen in, in
+/// the same space the widget rectangles are given in. Pass an empty rect to go
+/// back to "the whole display".
+///
+/// A dropdown decides whether to open downward or upward by asking how much
+/// room it has, and the answer has to be the room it can actually be *seen* in.
+/// The list's only clip is the draw list's clip stack, so that rectangle is the
+/// clip — and on the board the clip is dramatically smaller than the screen: it
+/// keeps a 6% margin all round, and in portrait the board is a 3:4 slab centred
+/// in a much taller display, leaving its bottom edge hundreds of px above the
+/// screen's. Measured against the screen, a list the panel will cut off looks
+/// like it fits, so it never flips and its bottom entries are unreachable. The
+/// board therefore publishes its content clip here while it draws, and the
+/// modal dialogs — painted after that clip has been popped — leave it empty.
+void setPopupBounds(const Rect& r);
+
 /// Multi-select variant of dropdown(). Collapsed state shows the items
 /// currently set in `mask`, joined by ", " (truncated to fit). Open state
 /// lists every item with a left-side check mark when its bit is set. Tapping
