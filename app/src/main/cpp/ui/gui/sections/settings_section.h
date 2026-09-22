@@ -34,9 +34,29 @@ struct PageSettings {
     /// syncSettingsPage(); persisted as "touchPass" in config.json.
     widgets::SwitchState   touchPassthrough{false};
 
-    /// Draws the Kalman tracker's smoothed tracks as blue boxes with their
-    /// track id (no score, no class) — for watching identity stability and
-    /// smoothing, distinct from the raw red detection overlay. Off by default.
+    /// Draws the Kalman tracker's tracks, with their track id (no score, no
+    /// class) — for watching identity stability and smoothing, distinct from the
+    /// raw red detection overlay. Off by default.
+    ///
+    /// ONE switch, TWO appearances (round 18). A track WITH a fresh measurement
+    /// this frame is drawn solid blue, labelled "#id". A track whose centre is a
+    /// PREDICTION rather than an observation — it missed its detection and is
+    /// either coasting on its own velocity (inside `predictHoldFrames`) or held
+    /// frozen at its last known position — is drawn dashed amber, labelled
+    /// "P#id". Round 17 shipped those as two separate switches; the user removed
+    /// the second one, and he was right: the predicted box is a detail OF the
+    /// tracking view, not a view of its own, and the extra row only made the page
+    /// longer.
+    ///
+    /// The distinction itself is kept because of a real field report: "准心一直
+    /// 锁在框旁边" took a whole session to trace back to the aiming target being
+    /// the lead-shifted point rather than the box, and the reason it took that
+    /// long is that both boxes were drawn identically (or not at all). A
+    /// prediction is a different kind of claim from a measurement, and it now
+    /// looks like one.
+    ///
+    /// The raw red overlay (showDetections) is untouched by this and stays the
+    /// detector's own output, unsmoothed and unpredicted.
     widgets::SwitchState   showTracking{false};
 
     /// Multi-target Kalman tracker tuning (see tracking/kalman_tracker.h).
@@ -53,6 +73,22 @@ struct PageSettings {
     widgets::SliderState trackIou{0.15f, 0.05f, 0.6f, 0.05f};         // min association score
     widgets::SliderState trackConfirm{1.0f, 1.0f, 10.0f, 1.0f};      // frames to confirm a track
     widgets::SliderState trackTerminate{5.0f, 1.0f, 10.0f, 1.0f};    // missed frames before drop
+
+    /// 丢框预测帧数 — the Kalman forward-prediction window (round 18: moved here
+    /// from the Aim page, because it is pure tracker behaviour: it is the window
+    /// that 丢失帧 above must be at least as long as, and it belongs beside it).
+    ///
+    /// How many CONSECUTIVE missed frames the tracker keeps pushing the predicted
+    /// position along (vx, vy) before freezing at last_valid. 0 freezes instantly
+    /// (the pre-2026 behaviour), 3 ≈ 50 ms covers a brief occlusion, 5 ≈ 83 ms
+    /// covers ducking behind cover. The track's lifetime is automatically extended
+    /// to cover this window (see TrackerConfig::predictHoldFrames), so the value
+    /// you set here is the value you get — it is not silently capped by 丢失帧.
+    ///
+    /// This is also the window in which the aim is holding a PREDICTED box: the
+    /// dashed amber "P#id" boxes on the tracking overlay are exactly the frames
+    /// inside it. Range 0–30, step 1 (30 ≈ 0.5 s of dead reckoning), default 3.
+    widgets::SliderState trackPredictHoldFrames{3.0f, 0.0f, 30.0f, 1.0f};
 
     // ── Inference trigger ─────────────────────────────────────────────────
     //

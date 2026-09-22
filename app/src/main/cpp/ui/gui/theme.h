@@ -67,6 +67,17 @@ constexpr ImU32 TrackBox   = IM_COL32( 70, 150, 255, 240);
 constexpr ImU32 TrackPlate = IM_COL32( 40,  90, 200, 220);
 constexpr ImU32 TrackText  = IM_COL32(255, 255, 255, 255);
 
+// ── Prediction overlay ─────────────────────────────────────────────────────
+// The same tracks on the frames where the tracker has NO measurement, so the
+// published centre is a claim rather than an observation — coasting on the
+// Kalman velocity inside `predictHoldFrames`, then frozen at the last known
+// position. Amber and dashed (see drawTrackingOverlay), because "the model can
+// see this" and "the model is extrapolating this" must never look the same:
+// that ambiguity is exactly what made one field report expensive to trace.
+constexpr ImU32 PredBox   = IM_COL32(255, 176,  32, 245);
+constexpr ImU32 PredPlate = IM_COL32(198, 126,  16, 225);
+constexpr ImU32 PredText  = IM_COL32( 24,  16,   4, 255);
+
 }  // namespace theme
 }  // namespace ui
 }  // namespace aimbotng

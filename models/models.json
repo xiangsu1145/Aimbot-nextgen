@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "updatedAt": "2026-09-19",
+  "updatedAt": "2026-09-21",
   "models": [
     {
       "modelId": "tflite-wa-yolov8n-256-int8",
       "modelName": "WA YOLOv8n 256",
       "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/WA_YOLOV8n_256_3_int8.tflite",
-      "description": "WA 专用 YOLOv8n 检测模型，256x256 输入，INT8 全量化。体积小、推理快，单类别检测头，适合中低端机型 NPU/GPU 委托执行。",
+      "description": "Valorant YoloV8n INT8量化，256x256，无畏契约黄色，支持NPU推理",
       "resolution": "256x256",
       "quantize": "INT8",
       "classCount": 1
@@ -15,10 +15,37 @@
       "modelId": "tflite-valorant-v26n-256",
       "modelName": "Valorant v26n 256",
       "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/valorant_256_v26n.tflite",
-      "description": "Valorant 专用 v26n 检测模型，256x256 输入，INT8 量化，双类别检测头（头部/身体），输出布局 [1,6,1344]。",
+      "description": "Valorant Yolo26n INT8量化，高精度，256x256，无畏契约黄色，支持NPU推理",
       "resolution": "256x256",
       "quantize": "INT8",
       "classCount": 2
+    },
+    {
+      "modelId": "tflite-delta-r3fp16-v8s-256-int8",
+      "modelName": "Delta r3fp16 v8s 256",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Dawan_0314_r3fp16_v8s_256_int8.tflite",
+      "description": "三角洲行动 YOLOv8s INT8量化，256x256，三角洲行动，支持NPU推理",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 1
+    },
+    {
+      "modelId": "tflite-delta-0121-v11s-256-int8",
+      "modelName": "Delta 0121 v11s 256",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Dawan_0121_v11s_256_int8.tflite",
+      "description": "三角洲行动 YOLOv11s INT8量化，256x256，三角洲行动，支持NPU推理",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 1
+    },
+    {
+      "modelId": "tflite-valorant-mobile-v11s-256-int8",
+      "modelName": "Valorant mobile v11s 256",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Valorant_mobile_v11s_256_int8.tflite",
+      "description": "无畏契约 YOLOv11s INT8量化，256x256，手部高精度，支持NPU推理",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 1
     }
   ]
 }

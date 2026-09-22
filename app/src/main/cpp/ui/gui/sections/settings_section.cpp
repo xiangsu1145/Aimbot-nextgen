@@ -245,15 +245,21 @@ void drawSettingsSection(ImDrawList* dl, float x, float& y, float w,
     widgets::switchButton(dl, wRect(x, y, w, rowSw), g_pageSettings.touchPassthrough, "允许触摸穿透", es);
     y += rowSw + gap;
 
-    // Tracker tuning: ranges 1-10 for confirm/terminate per the 2026-09 design.
-    // trackPredictHoldFrames lives on the Aim page now (alongside the gains)
-    // because it directly gates how long the aim keeps a lock through an
-    // occlusion — it's an aim-time decision, not a tracker-association one.
+    // Overlay + tracker tuning.
+    // 显示追踪框 is the ONE box switch (round 18). Inside it, a track with a fresh
+    // measurement is solid blue "#id" and a track riding on prediction is dashed
+    // amber "P#id" — compare against the raw detector boxes on the detection page
+    // (showDetections), which stay unsmoothed and unpredicted.
+    //
+    // 丢框预测帧数 lives HERE as of round 18 (it was on the Aim page): it is pure
+    // tracker behaviour — it is the window 丢失帧 below must be at least as long
+    // as, and it sits next to it for that reason.
     widgets::switchButton(dl, wRect(x, y, w, rowSw), g_pageSettings.showTracking, "显示追踪框", es);
     y += rowSw + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackIou,        "追踪IoU",   2, es); y += rowSl + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackConfirm,    "确认帧",    0, es); y += rowSl + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackTerminate,  "丢失帧",    0, es); y += rowSl + gap;
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageSettings.trackPredictHoldFrames, "丢框预测帧数", 0, es); y += rowSl + gap;
 
     // ── Exit / restore touch ───────────────────────────────────────────────
     // Last row on the page: the control you reach for when nothing else
@@ -318,7 +324,11 @@ void syncSettingsPage() {
     cfg.iouThreshold      = g_pageSettings.trackIou.value;
     cfg.confirmFrames     = static_cast<int>(g_pageSettings.trackConfirm.value + 0.5f);
     cfg.terminateFrames   = static_cast<int>(g_pageSettings.trackTerminate.value + 0.5f);
-    // predictHoldFrames is on the Aim page; syncAimPage() writes it.
+    // 丢框预测帧数 — moved here from the Aim page in round 18. This page is where
+    // the rest of the tracker is tuned, and this is the window 丢失帧 above has to
+    // cover; syncAimPage() no longer writes it.
+    cfg.predictHoldFrames =
+        static_cast<int>(g_pageSettings.trackPredictHoldFrames.value + 0.5f);
 
     // Anything this page owns that reaches out of the menu is applied here, on
     // a transition, rather than being pushed by the draw call that flipped it

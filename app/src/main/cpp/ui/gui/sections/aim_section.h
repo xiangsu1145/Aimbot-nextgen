@@ -146,9 +146,62 @@ struct AimController {
     /// feed-forward a trim rather than a carrier. See the round-15 section of
     /// tracking/pid_controller.h.
     void setGains(float kp, float ki, float kd, float outSmooth, float kf) {
+        // The SLIDER's value, kept exactly as asked. This is what the config
+        // stores and what the user sees on the row — the knob is his.
         this->ffGain = std::max(0.0f, kf);
-        pidX.setGains(kp, ki, kd, outSmooth, kf);
-        pidY.setGains(kp, ki, kd, outSmooth, kf);
+
+        // ROUND 19: what actually reaches the axes is GUARDED. kf is a gain on
+        // the echo of our own delayed command (s = kf·(1 − alpha/alpha_hat)), so
+        // a large kf is only safe while alpha_hat is RIGHT — and the seed is a
+        // guess. See kFfGuardStrengthMax for the measurements behind that.
+        //
+        // The guard is a CAP and not a working point. It applies only while no
+        // fit has corroborated alpha_hat and lifts to whatever the slider says
+        // once two independent fits agree, so 激进/保守 stays the user's own
+        // knob; the guard only makes the first second safe instead of audible.
+        const float want = alphaTrusted()
+                               ? this->ffGain
+                               : std::min(this->ffGain, tracking::kFfGuardStrengthMax);
+
+        // Moved as a RATE, never as a step. A jump in kf is a jump in the DC
+        // carrier's split between the two channels, i.e. a velocity step — the
+        // same class of fault as round 15's "乱甩乱晃" — so it obeys the same
+        // rule as every other gate in the controller. This runs once per render
+        // frame, so the rate below is per-frame by construction.
+        kfEff_ += (want - kfEff_) * tracking::kFfGuardRate;
+        if (!std::isfinite(kfEff_)) kfEff_ = want;
+
+        pidX.setGains(kp, ki, kd, outSmooth, kfEff_);
+        pidY.setGains(kp, ki, kd, outSmooth, kfEff_);
+    }
+
+    /// True once the plant gain has been CORROBORATED — both fits have an answer
+    /// and the two agree. This is the gate the kf cap opens on, and it is the
+    /// whole reason there are two estimators.
+    ///
+    /// Neither fit is trusted alone. One works on the cumulative command and the
+    /// other on its differences, over different windows, sharing no arithmetic;
+    /// landing on the same alpha is therefore evidence rather than a restatement.
+    /// A single fit can satisfy its own normal equations while describing
+    /// nothing, and the price of believing such a fit is a full-strength kf on a
+    /// wrong alpha_hat, which is a ring on the device.
+    ///
+    /// The band is wide on purpose (0.6…1.7). Both values carry kAlphaBias, so a
+    /// correct pair sits near 1.0, and the width is there to absorb the ±30 %
+    /// each fit is known to carry — not to make the test easy.
+    ///
+    /// It latches: once corroborated, the cap stays open for the session. alpha
+    /// belongs to the GAME, not to the engagement, so lifting and re-pressing the
+    /// finger must not re-arm the guard. Nothing on the target-changed path
+    /// touches it for the same reason.
+    bool alphaTrusted() {
+        if (alphaTrusted_) return true;
+        if (!alphaEst.valid() || !slopeEst.valid()) return false;
+        const float a = alphaEst.value(), s = slopeEst.value();
+        if (!(a > 0.0f) || !(s > 0.0f)) return false;
+        const float r = s / a;
+        if (r > 0.6f && r < 1.7f) alphaTrusted_ = true;
+        return alphaTrusted_;
     }
 
     /// The engaged target's box width in screen px. Feeds the GATE — the
@@ -182,15 +235,23 @@ struct AimController {
     /// from fast motion by looking at the error alone, and guessing wrong cost
     /// the integral that damps a large swing. Both axes are resynced together —
     /// a switch changes both.
+    /// `measurementCorrected` is the caller's knowledge that the TRACKER
+    /// re-associated this step — it pulled the published centre back onto a
+    /// detector result one render frame old instead of letting the model advance
+    /// it by its own velocity. The controller must be told, and cannot infer it:
+    /// the artifact it has to reject is proportional to our own output, so from
+    /// the error alone it is indistinguishable from a genuinely fast target. See
+    /// the parameter of the same name on AimController::update().
     void step(float errX, float errY, float dt, bool freezeX, bool freezeY,
-              bool targetChanged, float& outX, float& outY) {
+              bool targetChanged, bool measurementCorrected,
+              float& outX, float& outY) {
         // The delay-aligned command must be read BEFORE update() shifts the ring:
         // it is the u(k−L) that produced the error we are about to act on, and it
         // is the regressor's increment in the plant-gain fit.
         const float uDelayed = pidX.delayedCommand();
 
-        outX = pidX.update(errX, dt, freezeX, targetChanged);
-        outY = pidY.update(errY, dt, freezeY, targetChanged);
+        outX = pidX.update(errX, dt, freezeX, targetChanged, measurementCorrected);
+        outY = pidY.update(errY, dt, freezeY, targetChanged, measurementCorrected);
 
         // The plant gain is a property of the game, not of an axis, so one fit on
         // X serves both. Pushed UNCONDITIONALLY, not only while valid(): the
@@ -201,7 +262,23 @@ struct AimController {
         // positive feedback and the crosshair leaving the screen. `valid()` is
         // now for the log's `?` marker only.
         alphaEst.push(errX, uDelayed);
-        const float a = alphaEst.value();
+        // ROUND 19: the SECOND, independent fit — differences against the delayed
+        // command instead of cumulative positions against it. Same inputs, an
+        // entirely different piece of arithmetic, which is what makes agreement
+        // between the two mean something (see alphaTrusted()).
+        slopeEst.push(errX, uDelayed);
+
+        // Where both have an answer they are AVERAGED rather than chosen between:
+        // each carries ±30 % of its own and the errors are of different kinds (one
+        // detrends quadratically over a longer window, the other linearly over a
+        // short one), so the mean is better than either. Where only one has an
+        // answer, that one is used — a surviving fit is still a measurement, and
+        // the seed is a guess.
+        const bool  pv = alphaEst.valid(), sv = slopeEst.valid();
+        const float a  = (pv && sv)
+                             ? 0.5f * (alphaEst.value() + slopeEst.value())
+                             : (pv ? alphaEst.value()
+                                   : (sv ? slopeEst.value() : alphaEst.value()));
         pidX.setAlphaHat(a);
         pidY.setAlphaHat(a);
     }
@@ -237,6 +314,16 @@ struct AimController {
     float carryX() const { return pidX.carryPx(); }
     float carryY() const { return pidY.carryPx(); }
 
+    /// True while the STOP DETECTOR (round 17) has that axis at rest — the
+    /// measured carrier has read ~0 for kStopHoldSteps in a row — and is
+    /// therefore bleeding the trim toward it. This is the mechanism that removes
+    /// the shake a large ki leaves behind when a moving target STOPS, and it is
+    /// the one case the deadzone's own trigger cannot reach, because the
+    /// oscillation itself holds |e| outside the band. Read it with trimX/Y and
+    /// carryX/Y; see PPID::stoppedNow() for what each combination means.
+    bool stoppedX() const { return pidX.stoppedNow(); }
+    bool stoppedY() const { return pidY.stoppedNow(); }
+
     /// The damping term's contribution to each axis's output, in px, for the
     /// diagnostic log. A D contribution that is always ~0 while the target
     /// strafes means kd is not doing anything; one that is comparable to the
@@ -252,18 +339,43 @@ struct AimController {
         // lifted, and the FF would spend the next 0.75 s back at the 1.0 default.
     }
 
-    /// The feed-forward gain in force (== kf == FF strength), for the log.
-    float ffGainValue() const { return ffGain; }
+    /// The feed-forward strength ACTUALLY in force, for the log — the slider's
+    /// value once the guard is open, the guarded value before that. Print THIS
+    /// one: `ffGainSlider()` below is the knob, and the two differ exactly when
+    /// the round-19 guard is doing something.
+    float ffGainValue() const { return kfEff_; }
+    /// The kf slider's own value, unguarded. The knob, not the working point.
+    float ffGainSlider() const { return ffGain; }
+    /// True once both fits have agreed on the plant gain. For the log: while it
+    /// is false the kf row is CAPPED, which is the intended state for the first
+    /// fraction of a second of a session and not a fault.
+    bool alphaCorroborated() const { return alphaTrusted_; }
     /// The output ceiling in force (finger px/step). A constant.
     float outLimitPx() const { return pidX.outLimitPx(); }
 
 private:
     /// Mirrors the kf row. 0.05 is the round-15 default: the integral carries
-    /// the DC command, the feed-forward trims it.
+    /// the DC command and the feed-forward trims it. ROUND 19 keeps that default
+    /// and widens the row to kFfStrengthMax (0.80) — the working point is still
+    /// the user's to pick, and 0.05 remains the shipped one.
     float ffGain = 0.05f;
+    /// The strength in force after the guard, rate-limited toward `ffGain`. It
+    /// starts at ZERO rather than at the slider's value: on the first frame
+    /// nobody has corroborated alpha_hat, and starting with the guard already
+    /// satisfied is the one thing that would make the guard useless. Rising from
+    /// zero costs nothing — the integral carries the DC command regardless of kf
+    /// — and, being a rate, it cannot step.
+    float kfEff_ = 0.0f;
     /// One plant-gain fit, shared by both axes (alpha is the game's sensitivity,
     /// not an axis property).
     tracking::AlphaEstimator alphaEst;
+    /// ROUND 19: a SECOND, independent fit on the same plant gain — a straight
+    /// line through (Δe, u(k−L)) instead of a quadratic through (e, U(k)). Its
+    /// whole purpose is to be something the first fit can be checked against;
+    /// see alphaTrusted().
+    tracking::SlopeAlphaEstimator slopeEst;
+    /// Latched by alphaTrusted(): true once both fits have agreed at least once.
+    bool alphaTrusted_ = false;
 };
 
 // ── Aim-touch state machine ───────────────────────────────────────────────
@@ -418,12 +530,20 @@ struct PageAim {
     /// the game's own sensitivity in view px per finger px. Nothing compensates
     /// for that any more, so a HIGH-sensitivity game is expected to lower kp —
     /// and at alpha above ~1.5 it must, or the loop rings no matter what kf is.
-    /// The shipped 0.10 is 4x inside the bound at alpha = 1.
+    /// The shipped 0.04 sits about 7x inside that bound at alpha = 1 and L = 6
+    /// (round 18; round 15 shipped 0.10, which was 3x). The margin is deliberately
+    /// large because the bound is worst-case in BOTH unknowns at once, and alpha
+    /// is estimated on-line rather than known.
     ///
     /// Ki (0–4, px of output per px-of-error-second): the term that erases the
     /// standing error a moving target would otherwise need. It is the DC carrier
     /// when the feed-forward is off, and a residual cleaner when it is on — so
-    /// 0.5 is the measured optimum with kp = 0.10 and is not a small mop-up value.
+    /// "the right ki" is a function of what kf is supplying, not a constant.
+    /// Round 15 measured 0.5 as the optimum with kp 0.10 and kf ≈ 0, and called
+    /// that "not a small mop-up value"; round 18 ships 0.12 with kp 0.04 and
+    /// kf 0.05, where the feed-forward carries the fast part and the integral only
+    /// has to hold the standing carrier. Both are correct readings of the same
+    /// rule, and neither number means anything without the others.
     /// Its row steps in 0.01 and shows two decimals: it stepped in 0.1 before,
     /// which made the whole useful range 0.0…0.2 three clicks wide.
     ///
@@ -437,10 +557,18 @@ struct PageAim {
     /// for buying phase margin. Measured optimum is kd ≈ 2·kp; going past that
     /// is how a high-alpha game starts to ring, for the same reason kp is.
     ///
-    /// 输出平滑 (outSmooth): a REAL output EMA, 1.0 = off. Off by default: it
-    /// adds phase lag, and phase lag is the one thing a delay-limited loop
-    /// cannot afford. Lower it for a gentler-looking motion and accept the
-    /// extra latency. Measured, 0.8 against 1.0 differs in the decimal places.
+    /// 输出平滑 (outSmooth): a REAL output EMA, 1.0 = off. Round 18 ships 0.85 —
+    /// NOT off, and that reversal is worth stating plainly rather than leaving to
+    /// be found. It adds phase lag, and phase lag is the one thing a delay-limited
+    /// loop cannot afford, so this row is a genuine trade and not free
+    /// smoothness: 0.85 cuts the step-to-step noise in the finger command (D
+    /// differences a noisy signal, and F passes the tracker's noise through) for a
+    /// bounded amount of lag. Read it AGAINST the gains, never on its own — if you
+    /// raise kd to buy damping and then raise this to hide the jitter, you have
+    /// spent the same damping twice.
+    ///
+    /// Go to 1.0 if the aim feels sluggish or overshoots; lower it if the crosshair
+    /// visibly trembles.
     ///
     /// 输出限幅 used to live here as a slider. It was never a tuning parameter —
     /// it is the ceiling that stops a re-lock from flinging the finger across
@@ -473,16 +601,36 @@ struct PageAim {
     /// problem — with a one-decimal readout a 0.01 move is invisible, which is
     /// what made it look like the step was still 0.1.
     ///
-    /// How much ki you need depends on how much carrier kf is not supplying, and
-    /// round 15 moved the answer: with the shipped kf (0.05) the INTEGRAL is the
-    /// carrier and the user's own working pair is ki 0.20 with kf 0. A small kf
-    /// on top takes high-frequency load off the integral, which lets ki come
-    /// down; with no feed-forward at all (kf = 0) the integral carries the whole
-    /// DC command and 0.2–1.0 is the useful band.
-    widgets::SliderState kp{0.10f, 0.0f, 0.6f, 0.01f};
-    widgets::SliderState ki{0.5f, 0.0f, 4.0f, 0.01f};
-    widgets::SliderState kd{0.20f, 0.0f, 2.0f, 0.01f};
-    widgets::SliderState outSmooth{1.0f, 0.0f, 1.0f, 0.05f};
+    /// How much ki you need depends on how much carrier kf is not supplying.
+    /// Round 15's reading was "with the shipped kf (0.05) the INTEGRAL is the
+    /// carrier, and the user's own working pair is ki 0.20 with kf = 0". Round 18
+    /// ships ki 0.12 with kf 0.05 and kp 0.04 — the same rule read at a different
+    /// point: kf takes the fast part of the carrier, so the integral comes down.
+    /// With no feed-forward at all (kf = 0) the integral carries the whole DC
+    /// command and 0.2–1.0 is the useful band.
+    /// ROUND 18 — THE SHIPPED SET IS THE USER'S CONVERGED ONE, and it is a
+    /// DIFFERENT BALANCE from round 15's, not a nudge: kp 0.04 / ki 0.12 /
+    /// kd 0.15 / kf 0.05, where round 15 shipped 0.10 / 0.5 / 0.20 with kf 0.05.
+    /// kf is no longer ~0, and that is what moved the other three: the
+    /// feed-forward takes the high-frequency load off the integral, so ki can
+    /// come down to a fifth, and a smaller kp with a smaller kd then holds the
+    /// phase margin. The two sets are not comparable number-for-number — read
+    /// the Kp/Ki note above for why "how much ki you need" is a function of "how
+    /// much carrier kf is not supplying".
+    ///
+    /// ⚠ NOTE ON HOW THESE REACH A DEVICE. kp/ki/kd/outSmooth/delay are read from
+    /// config.json UNCONDITIONALLY (see apply() in config_manager.cpp), so an
+    /// existing install keeps the tuning it already stored — a new default is
+    /// only observable on a fresh config file. That is deliberate (a stored
+    /// tuning is never silently overwritten), and it also means "I changed the
+    /// default" is not something you can verify without deleting config.json.
+    widgets::SliderState kp{0.04f, 0.0f, 0.6f, 0.01f};
+    widgets::SliderState ki{0.12f, 0.0f, 4.0f, 0.01f};
+    widgets::SliderState kd{0.15f, 0.0f, 2.0f, 0.01f};
+    /// 输出平滑 — EMA on the controller's output, 0..1, 1.0 = OFF. Shipped at
+    /// 0.85: it trades a small, bounded amount of phase lag for a real cut in the
+    /// finger-command noise. See the row's note in drawAimSection().
+    widgets::SliderState outSmooth{0.85f, 0.0f, 1.0f, 0.05f};
 
     /// Lead, in detector frames: how far ahead of its tracked centre the aim
     /// places the target, to pay for the delay between the screenshot the
@@ -490,31 +638,38 @@ struct PageAim {
     /// (target.x, target.y) += (vx, vy) * this, using the tracker's filtered
     /// velocity.
     ///
-    /// ⚠ DEFAULT IS NOW 0.0, and the reason matters: this term enters the output
-    /// through the proportional gain, so in steady state it adds Kp*v*this to
-    /// the finger's motion — which is the SAME channel as 速度前馈. With both at
-    /// their old defaults (1.0 here, 1.0 there) the loop was adding ≈1.5x the
-    /// target's velocity when 1.0x is what makes the crosshair travel with it,
-    /// and the surplus showed up as overshoot on every moving target. Two knobs
-    /// pushing on one term is exactly the "I tuned one and the other fought it"
-    /// trap; 速度前馈 is now the single velocity knob and this one is the
-    /// optional extra. See the Kp/Ki note above — with a working integrator the
-    /// lag is already handled, so starting at 0 loses nothing.
+    /// ⚠ ROUND 18: THE DEFAULT IS 0.20, and what this row is FOR matters as much
+    /// as what it costs — round 17 only learned the second half.
     ///
-    /// Range 0–5, step 0.05. Raise it if the crosshair trails a target that is
-    /// steadily moving; lower it (or zero it) if the crosshair overshoots one
-    /// that changes direction — a lead is a bet that the target keeps going.
-    widgets::SliderState aimDelayFrames{0.0f, 0.0f, 5.0f, 0.05f};
+    /// FOR: the screenshot the detector saw is already a few frames old by the
+    /// time a touch lands, so a target crossing at v px/frame is v·(that delay) px
+    /// further along than the box says. This term pays that bill by aiming at
+    /// (box centre + v·this), using the tracker's filtered velocity. It is the one
+    /// knob in the loop that makes it LEAD rather than lag, so it directly buys
+    /// reduced tracking lag on a moving target. That is its whole job, and it is
+    /// why it is not zero.
+    ///
+    /// COST (round 17 — the reason this row is now safe). It enters the output
+    /// through the proportional gain, i.e. the SAME channel as Kf, so the two add;
+    /// at the old default of 1.0 the surplus showed up as overshoot on every
+    /// moving target. Worse, it MOVES THE POINT THE LOOP CONSIDERS "ARRIVED": a
+    /// lead is a steady-state offset, so while the target keeps moving v is
+    /// non-zero and the aim can sit satisfied at box centre + v·this — which is
+    /// outside the box. That is precisely the round-17 "准心一直锁在框旁边"
+    /// report. The fix was NOT to remove the lead but to stop it from voting: the
+    /// deadzone and the error are now measured against the RAW box centre
+    /// (rawTarget in syncAimPage), while this term only shifts what the loop aims
+    /// AT. "移动一下屏幕就正常了" was the fingerprint of the old behaviour — a
+    /// re-association zeroes the track's velocity and the offset collapses.
+    ///
+    /// Range 0–5, step 0.05. Raise it if the crosshair trails a steadily moving
+    /// target; lower it (or zero it) if the crosshair overshoots one that changes
+    /// direction — a lead is a bet that the target keeps going.
+    widgets::SliderState aimDelayFrames{0.20f, 0.0f, 5.0f, 0.05f};
 
-    /// Kalman forward-prediction window: how many consecutive missed frames
-    /// the tracker continues to push the predicted position along (vx, vy)
-    /// before freezing at last_valid. 0 freezes instantly (the pre-2026
-    /// behaviour), 3 ≈ 50 ms covers a brief occlusion, 5 ≈ 83 ms covers
-    /// ducking behind cover. The track's lifetime is automatically extended to
-    /// cover this window (see TrackerConfig::predictHoldFrames), so the value
-    /// you set here is the value you get — it is no longer silently capped by
-    /// 丢失帧. Range 0–30, step 1 (30 ≈ 0.5 s of dead reckoning).
-    widgets::SliderState trackPredictHoldFrames{3.0f, 0.0f, 30.0f, 1.0f};
+    // 丢框预测帧数 (trackPredictHoldFrames) MOVED TO THE SETTINGS PAGE in round
+    // 18 — see settings_section.h, which now owns the slider and the note. It is
+    // tracker behaviour and it belongs next to 丢失帧, not next to the gains.
 
     /// kf — the velocity feed-forward STRENGTH. NOT the plant gain any more.
     ///
@@ -625,7 +780,12 @@ struct PageAim {
     /// toward the carrier the reconstruction measures the target to need, so a
     /// strafe is followed through the band at ANY kf including 0. Set the band by
     /// the target box's jitter alone; it no longer has to be traded against kf.
-    widgets::SliderState ffGain{0.05f, 0.0f, 0.50f, 0.01f};
+    // ROUND 19: the top of the row is the controller's OWN constant, not a
+    // duplicate of it — the two had drifted apart once already (the slider
+    // stopped at 0.50 while the header's own log line described a working point
+    // of 1.0), and a range that disagrees with the derivation is worse than a
+    // narrow one. 0.80 is the last value the self-copy window calls safe.
+    widgets::SliderState ffGain{0.05f, 0.0f, tracking::kFfStrengthMax, 0.01f};
 
 
     /// Aim deadzone (0.0–1.0, step 0.05, two decimals): ports the old project's
@@ -635,8 +795,35 @@ struct PageAim {
     /// carrier the reconstruction measures (0 at rest, so a standing charge no
     /// longer walks the view off a still target); the trim is still ADDED to the
     /// output, which is what round 15 got wrong. 0.0 = no
-    /// deadzone (must converge to the pixel), 1.0 = stop as soon as the target
-    /// is within ~8% of the shorter screen edge of the crosshair.
+    /// deadzone (must converge to the pixel); 1.0 = stop as soon as the
+    /// crosshair is inside the box at all.
+    ///
+    /// ⚠ ROUND 17: THE RADIUS IS PER-AXIS, AND IT IS MEASURED FROM THE RAW BOX
+    /// CENTRE. Both halves of that sentence were bugs until this round and the
+    /// user reported both as one symptom — "准心一直锁在框旁边，框在左边".
+    ///
+    ///   (a) The radius was `value × 0.5·min(w,h)` for BOTH axes, so on any box
+    ///       that is not square the X band and the Y band were different
+    ///       fractions of it (a tall box got an X band a third of its own half
+    ///       width). It is now X ⇒ `value × w/2`, Y ⇒ `value × h/2`, i.e. the
+    ///       "框内百分比" the slider says it is.
+    ///   (b) The band was measured from the LEAD-SHIFTED aim point (the target
+    ///       pushed along the tracker's velocity by 延迟补偿), NOT from the box
+    ///       the HUD draws. So with any lead at all the loop's own equilibrium —
+    ///       "the aim point is on the crosshair" — sits `v × lead` away from the
+    ///       box centre, and because that IS an equilibrium (e ≈ 0 there) the aim
+    ///       parked there and STAYED, one whole box off the target, for as long
+    ///       as the target kept moving. The band is now measured against the RAW
+    ///       centre — the same point the box is drawn at — while the controller
+    ///       still receives the lead-shifted error, so lead keeps helping the
+    ///       APPROACH and can no longer decide where the aim comes to rest.
+    ///       (This is also why "移动一下屏幕就正常了": a re-association zeroes
+    ///       the track's velocity, the v × lead offset collapses, and the aim
+    ///       falls back onto the box.)
+    ///
+    /// And the band's trigger now has a second, independent mechanism behind it:
+    /// see kStopHoldSteps in tracking/pid_controller.h for why a bleed gated on
+    /// |e| <= band could never fire on the shake it was written for.
     ///
     /// ⚠ THIS ROW WAS CONNECTED IN ROUND 15, and until then it did not do what
     /// it says on two counts: (a) it only suppressed P and D, so the integral —

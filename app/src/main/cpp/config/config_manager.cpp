@@ -252,7 +252,9 @@ json serialize() {
         // the input at gain 1. The constant is now derived on-line and nothing
         // else about it is stored. "ff" (v7's 灵敏度补偿) is gone.
         putSlider(o, "kf", a.ffGain);
-        putSlider(o, "trackPred", a.trackPredictHoldFrames);
+        // "trackPred" is NOT written here. It moved to the settings object in
+        // round 18 with the slider itself (see the "settings" block below):
+        // 丢框预测帧数 is tracker behaviour, not a gain, and the file now says so.
         putSlider(o, "dz", a.deadzone);
         putBox(o, "touch", a.touchArea.toggle.value,
                a.touchArea.x, a.touchArea.y, a.touchArea.w, a.touchArea.h,
@@ -390,10 +392,25 @@ void apply(const json& j) {
         // 0.80). Reading it unconditionally would silently overwrite the value
         // re-seeded above — the "kf re-seeded" log line would be a lie, and a
         // number that meant something else under the old controller would return.
+        //
+        // ROUND 19 widens the ceiling to 0.80 and deliberately leaves kCtlSchema
+        // where it is. A schema bump exists to stop a stored number being
+        // REINTERPRETED across a change of meaning, and nothing about the meaning
+        // moved here: 0.05 is still 0.05, and a stored 0.50 is still legal under
+        // the wider range. Bumping would throw away the user's own kf for no
+        // reason, which is the one behaviour this whole block exists to avoid.
+        // The gain that actually REACHES the axes is capped separately, and only
+        // while alpha_hat is uncorroborated — see kFfGuardStrengthMax.
         if (storedCtl == kCtlSchema) {
             getSlider(o, "kf", a.ffGain);
         }
-        getSlider(o, "trackPred", a.trackPredictHoldFrames);
+        // "trackPred" — the LEGACY location. Round 18 moved the slider to the
+        // Settings page, so a new file carries it under settings.trackPred and
+        // this read simply finds nothing; an older file still has it here, and
+        // reading it into the (now settings-owned) slider is what lets that value
+        // survive the move. The settings read runs LATER, so a new-format file's
+        // value still wins.
+        getSlider(o, "trackPred", ui::sections::g_pageSettings.trackPredictHoldFrames);
         getSlider(o, "dz", a.deadzone);
         bool on = false, placed = false;
         float x = -1, y = -1, w = 0, h = 0;
@@ -501,7 +518,9 @@ void apply(const json& j) {
         getSlider(o, "trackIou",  s.trackIou);
         getSlider(o, "trackConf", s.trackConfirm);
         getSlider(o, "trackTerm", s.trackTerminate);
-        // trackPred lives on the Aim page now → persisted under aim.trackPred
+        // 丢框预测帧数 — the slider moved here in round 18. See the legacy read in
+        // the aim block above for how an older file's value survives the move.
+        getSlider(o, "trackPred", s.trackPredictHoldFrames);
         bool on = false, placed = false;
         float cx = -1, cy = -1, r = 0;
         if (getCircle(o, "infArea", on, cx, cy, r, placed)) {

@@ -401,6 +401,56 @@
 //  self-copy coefficient s = kf·(1 − alpha/alpha_hat) cannot leave the unit
 //  circle there even with the estimator off by 2×, so the whole slider is
 //  usable instead of ending in a runaway.
+//
+//  ── ROUND 17: THE BLEED'S TRIGGER WAS INSIDE ITS OWN SYMPTOM ────────────────
+//
+//  The user, on the round-16 build, with the loop finally tracking well
+//  (kp 0.05 / ki 0.22 / kd 0.26 / kf 0): "低kp高ki这样能稳定跟枪，但是高ki，目标
+//  停下就会晃". He also reported the other half of the same report in the same
+//  breath and it is the key: "死区调1也没用".
+//
+//  Both sentences are one sentence. Round 15/16 built a bleed for exactly this
+//  shake and gated it on the stop band, |e| <= dz — and the shake is a LIMIT
+//  CYCLE WHOSE AMPLITUDE IS THE BAND. So:
+//
+//      the frames where the bleed is needed are the frames where |e| > dz,
+//      i.e. the frames where the bleed is switched off.
+//
+//  A bigger deadzone cannot help, and that is not a tuning observation, it is
+//  arithmetic: enlarging the band enlarges the cycle that escapes it. The two
+//  mechanisms were fighting over one trigger and the symptom won.
+//
+//  THE FIX IS TO TRIGGER ON A MEASUREMENT INSTEAD OF ON THE ERROR, and the
+//  measurement was already being computed. carry = ffVel/alpha_hat is the
+//  per-step velocity the reconstruction says the target needs, and it is built
+//  from Δe + alpha_hat·u(k−L) — our OWN delayed command is subtracted out of it.
+//  That single property is what makes it immune to the symptom: while the loop
+//  oscillates against a target that is standing still, carry still reads ~0,
+//  where the error reads "everything". On a strafe carry is the standing carrier
+//  itself, so the same rule leaves a working trim alone.
+//
+//      |trimWant| ~ 0 for kStopHoldSteps consecutive steps  ⇒  the target is at
+//      rest  ⇒  bleed the trim toward trimWant (== 0), at kStopBleedTauSec.
+//      (trimWant = carry − ff, the trim's own share of the carrier — round 19b.)
+//
+//  Three things this deliberately does NOT do:
+//
+//    * it does not suppress the trim's contribution (round 16's rule — the bleed
+//      moves a RATE);
+//    * it does not use a zero-crossing count as the trigger. A counter fires on
+//      every real turnaround and buys nothing here: the reconstruction above
+//      already answers "is the target moving", and the existing kIntReleaseGain
+//      path already handles a sign reversal;
+//    * it does not gate the accumulation while bleeding. At ki = 0.22 and 2 px
+//      of error the accumulation settles the trim at ki·e·tau ≈ 0.009 px/step
+//      against the discharge, so a second gate would only be a second place to
+//      get the rate-vs-contribution rule wrong.
+//
+//  Cost, stated: a target that holds still for 100 ms in the middle of a weave
+//  loses its trim there and has to rebuild it. That is the trade the report asks
+//  for — a stationary target no longer shakes — and kf > 0 covers the gap with a
+//  measurement rather than a charge. `stop=` on the aim telemetry line is this
+//  detector's state, per axis; read it with `trim` and `cr`.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -435,7 +485,25 @@ constexpr float kTrimLimitPx = 150.0f;
 // reversed and is pulling it back toward zero (round 14). Without this a trim of
 // 50 px built against a strafe comes back at ki·|e|·dt per frame — at ki = 0.1,
 // e = -20 px, 120 Hz that is 3000 frames, twenty-five seconds of "很慢的描回来".
-constexpr float kIntReleaseGain = 6.0f;
+//
+// ROUND 19c raised it 6 -> 20. This is the ONE constant in the stop path that
+// can be raised without touching the tracking case, and the reason is that it is
+// self-scaling: what it moves is 20·ki·|e|·dt, so a jitter-flipped error (|e| a
+// fraction of a pixel) moves almost nothing, while a genuine overshoot (|e| tens
+// of pixels) is emptied fast. That is also why it is safe on a target that
+// reverses — a strafe CHANGES SIGN with |e| small at the crossing, and what is
+// left there is the accumulator being carried across, which a faster unwind
+// helps rather than hurts (verified: the constant is bit-identical on a
+// constant-velocity strafe and marginally better on a 0.6 s zig-zag).
+//
+// What it fixes is the second half of the user's "先过冲然后立马拉回来，之后震荡"
+// (round 19c). The ff half of the carrier goes away in 15 ms on its own, but the
+// trim half can only be redeemed by reversed error — and the reversed error IS
+// the overshoot. At 6 the redemption lagged the measurement badly enough that
+// the trim was still pushing 8 steps after the target had stopped, which is what
+// the simulation shows as a 58 px peak against a 25 px floor set by
+// kFfDelaySteps alone.
+constexpr float kIntReleaseGain = 20.0f;
 
 // ── The stop band's trim bleed (round 15, corrected in round 16) ────────────
 //
@@ -458,22 +526,160 @@ constexpr float kIntReleaseGain = 6.0f;
 // the integral is pulled toward what the loop MEASURES the target to need,
 //
 //     carry = ffVel / alpha_hat        (finger px/step, from the reconstruction)
+//     trimWant = carry − ff            (round 19b: the trim's own SHARE of it)
 //
 // instead of toward zero. That distinction is load-bearing at exactly two
 // moments:
 //
 //   * AT REST carry is 0, so a standing charge is bled off and stops walking the
 //     view off the target — round 15's complaint, still fixed.
-//   * ON A STRAFE carry IS the carrier, so crossing the band no longer destroys
-//     what the loop learned and a moving target is still followed through it —
-//     which is what round 15 broke: it bled to zero, and with kf = 0 there was
-//     then nothing left to carry motion at all (burst, stall, burst).
+//   * ON A STRAFE carry IS the WHOLE carrier, and the trim is bled toward the
+//     part of it the feed-forward is NOT supplying — (1−kf) of it — so crossing
+//     the band no longer destroys what the loop learned and a moving target is
+//     still followed through it. Round 15 broke this by bleeding to zero, and
+//     with kf = 0 there was then nothing left to carry motion at all (burst,
+//     stall, burst).
+//
+// Before round 19 the second line read `trimWant = carry`, and that was correct:
+// with kf at 0.05, F supplied 5 % of the carrier and the trim's share was 95 % of
+// the whole thing. Raising the kf ceiling to 0.80 silently invalidated it — at
+// kf = 0.50 the target became twice the trim's share, the sum came out at
+// 1.5·u_ss, and the band turned into a limit cycle that reads on the device as
+// occasional left–right sway on the axis carrying the carrier. The fix is stated
+// as a conservation (whole minus what F gave) rather than as (1−kf)·carry so that
+// it stays right while ff is clamped, deadbanded or transient.
 //
 // 0.10 s, not 0.30: the bleed is only ever visible as the difference between the
 // charge and the measured carrier, and at rest that difference is the whole
 // charge — so it may not take a third of a second to leave. The 0.30 s round 15
 // used is part of why "视角一直晃" survived that build.
 constexpr float kDzTrimBleedTauSec = 0.10f;
+
+// ── The stop detector: the bleed's REAL trigger (round 17) ───────────────────
+//
+// Rounds 15/16 gave the trim a bleed but wired its trigger to the STOP BAND
+// (|e| <= dz). Held on a stationary target inside the band that is correct, and
+// it is also useless for the symptom the user actually reported, because of a
+// small trap worth stating plainly:
+//
+//     AN OSCILLATION KEEPS |e| OUTSIDE THE BAND BY CONSTRUCTION.
+//
+// The limit cycle's amplitude IS the band width (round 15's relaxation cycle:
+// creep, snap, creep), so the very frames this bleed exists to fix are the
+// frames where |e| > dz and the bleed is switched off. The mechanism was
+// competing with its own symptom for its trigger — and losing. That is the
+// precise reason "死区调 1 也没用" kept being true, whatever the band was set to.
+//
+// So the trigger moves onto a MEASUREMENT: carry = ffVel/alpha_hat, the per-step
+// velocity the reconstruction says the target needs. Two properties make it the
+// right variable, and the error has neither of them:
+//
+//   * carry is built from Δe + alpha_hat·u(k−L) — OUR OWN COMMAND IS SUBTRACTED
+//     OUT OF IT — so while the loop oscillates against a STATIONARY target,
+//     carry still reads ~0. It is immune to the symptom. The error is the
+//     symptom.
+//   * on a strafe carry IS the standing carrier, so the bleed leaves the trim
+//     exactly where the trim is doing real work — its own share of it, after F's
+//     part is subtracted (round 19b). Nothing has to be told which case it is in;
+//     the measurement answers it.
+//
+// kStopBleedTauSec is FAST (20 ms) because it has to outrun the limit cycle it
+// fights: 3 Hz is ~40 steps per period, and a charge that survives most of one
+// period has already walked the view off the target.
+//
+// kStopHoldSteps is the price of trusting a noisy measurement: the condition must
+// hold for this many CONSECUTIVE steps before the bleed engages (the counter
+// resets the instant it fails, so a resumed strafe is followed at once). It is
+// the only thing standing between "the target stopped" and "the target reversed
+// for a step". A weave crosses zero for a step or two; a stop stays there.
+//
+// ROUND 19c halved it, 12 -> 6 (100 ms -> 50 ms). It was 12 to keep a MISFIRE
+// from throwing away a charge the loop still needed, and round 19b removed that
+// price: the bleed's target is now trimWant, the trim's own SHARE of the carrier,
+// so a misfire no longer empties anything — it pulls the trim onto the value the
+// measurement is asking for, which on a strafe is the value it already holds.
+// What was left was pure delay, and delay here is paid in overshoot: the counter
+// only starts once ffVel has already decayed past the eps (6 steps), so 12 put
+// the discharge 18 steps after the stop, and the trim kept pushing for all of
+// them. Verified by simulation: 58 px peak -> 48 px at 12 -> 6 with a
+// constant-velocity strafe bit-identical, and the residual floor is now
+// kFfDelaySteps·w (the commands already in flight), not the counter.
+//
+// kStopHoldSteps needs a condition, and ROUND 22 replaced the one it had. The old
+// form —
+//
+//     |trimWant| < kStopCarryEpsPx   OR   |trimWant| < kStopCarryFrac · |trim|
+//
+// — reasoned carefully about trimWant = carry − ff being the carrier's TRIM SHARE
+// and about the ratio carry/trim = 1/(1−kf) getting harder as kf rises, and every
+// step of that reasoning is sound. It failed for a reason none of it addressed: at
+// the instant of the stop the measurement IS NOT SMALL. meas goes from ~0 (steady
+// strafe, de ≈ 0) to (alpha_hat − alpha)·u ≈ −2·u_ss, so |trimWant| does not drift
+// below 1 px — it jumps UP to roughly twice the trim. Neither disjunct can then
+// hold (the second would need |trim| > 2·|trimWant|), the counter never reached
+// kStopHoldSteps, and the charge standing at the moment of the stop was never
+// released at all. See kStopDropThreshold.
+//
+// The replacement asks a different question — not "is the charge justified?"
+// (which presumes the measurement is a valid carrier at that instant) but "did the
+// target stop?" — and answers it from the drop ratio, which is what makes it
+// independent of alpha_hat's bias. Once the answer is yes, trimWant has already
+// been forced to zero at the assignment above, so the bleed is a straight
+// discharge rather than a discharge onto a target that is itself a fault.
+//
+// (`cr` on the aim telemetry line still prints the WHOLE carrier, so at kf = 0.5
+// on a strafe the trim should read about half of it — that is the split working.)
+//
+// A zero-crossing COUNT is deliberately not a trigger here. It fires on every
+// real turnaround too, and "the target really did reverse" is handled by the
+// existing kIntReleaseGain path; all a counter would add is a reason to kill the
+// trim on legitimate motion. The measurement above already answers the question
+// the counter was being asked.
+//
+// Same rule as every other gate in this file (round 16): this moves the
+// integrator's RATE, never its CONTRIBUTION. trimWant is the target, and the
+// value is still added to the output on the step it is bled.
+// ROUND 22 raised this from 0.02 s. The release is now driven by a trigger that
+// actually fires (see kStopDropThreshold), so its RATE is what decides whether
+// the stop is smooth or a step: at 0.02 s a 15 px charge vanished in ~2 steps =
+// 6 px/step of velocity step, which is precisely the "乱甩" fault round 16 was
+// written to avoid. 0.15 s spreads the same release over ~18 steps.
+constexpr float kStopBleedTauSec = 0.15f;
+constexpr int   kStopHoldSteps   = 6;
+
+// ── ROUND 22: the stop detector reads a DIMENSIONLESS ratio ──────────────────
+//
+// Round 17's trigger was `|trimWant| < 1px || |trimWant| < 0.5·|integral|`, and
+// it cannot fire. trimWant is built from carry = ffVel/alpha_hat, and the instant
+// the target stops, de flips from ~0 to −alpha·u while meas becomes
+// (alpha_hat − alpha)·u — a CHANGED number, not a vanishing one. At
+// rho = alpha_hat/alpha ≈ 1/3 that is −2·u_ss, so |trimWant| jumps UP to ~2–3x
+// the trim: `wantMag < 1px` is false by an order of magnitude, and
+// `wantMag < 0.5·|integral|` needs |integral| > 2·wantMag ≈ 70 px when the trim
+// really only holds ~15 px. The charge standing in the integrator at the moment
+// of the stop is therefore never released — it keeps driving the crosshair past
+// the target, the error reverses, P and D drag it back, the residual is charged
+// again, and the axis rings. That is the reported "目标停下就一直左右晃".
+//
+// The fix is to stop asking alpha_hat anything. "The target stopped" physically
+// means ITS SPEED collapsed, and ffVel is our only estimate of that speed — so
+// the trigger is the FRACTIONAL DROP of |ffVel|, which carries no units and no
+// alpha_hat. pid_chirs.cpp:632 uses the same device (`drop = (|v_prev| −
+// |v|)/|v_prev|`), and it is why that controller needs no calibrated alpha to
+// survive a stop. This is the "两个状态，两套行为" the user asked for: while the
+// target moves (drop ≈ 0) nothing here runs at all and the follow is untouched.
+//
+// kStopDropVelMinPx guards the denominator: at rest |ffVel| is a few tenths of a
+// px/step of reconstruction noise, and a ratio taken there is meaningless (and
+// would fire on every frame). It must NOT be set from intuition about "walking
+// speed", because ffVel is a SCREEN px/step and on a steady strafe it settles at
+// ρ·w — at the seed rho = 1/3 and w = 5 px/step that is only ~1.7, so a floor of
+// 2.0 would have switched the whole detector off for exactly the user it is for.
+// 0.5 is ~2x the at-rest noise floor. kStopDropReleaseSec lets the flag latch
+// briefly, so one noisy step cannot end the "stopped" state mid-release.
+constexpr float kStopDropThreshold  = 0.45f;
+constexpr float kStopDropVelMinPx   = 0.5f;
+constexpr float kStopDropReleaseSec = 0.25f;
 
 constexpr float kDerivTauSec = 0.025f;
 
@@ -490,16 +696,25 @@ constexpr float kDerivTauSec = 0.025f;
 // NOT critical — measured, a wrong value anywhere from 2 to 7 changes the sway
 // by a few px — so it is a constant and never a slider.
 //
-// ── ROUND 15: the kf ceiling is 0.50 and 0.05 is the default ────────────────
+// ── ROUND 19: the kf ceiling is 0.80, and 0.05 is still the default ─────────
 //
-// kFfStrengthMax is the top of the kf slider, and round 15 set it to the USER's
-// range. The reasoning below (the self-copy window) is still correct — it is
-// what proves 0.50 is SAFE — but it was being used to argue for a value rather
-// than for a ceiling, and that was one revision too far: round 14's own numbers
-// show the integral supplying 79…88 % of the carrier either way, so the choice
-// between 0.05 and 0.80 is a choice about how much of the DC command and how
-// much of the detector's noise reach the finger, not about whether the loop can
-// track. His tuning settled it: 0.05.
+// kFfStrengthMax is the top of the kf slider. Round 15 set it to the user's own
+// range (0.50); round 19 widens it to 0.80, the last value the self-copy window
+// below calls SAFE. The range and the stability argument had been talking past
+// each other for two rounds: 0.50 was derived as the top of a USABLE range and
+// then quoted as a ceiling, while the controller's own log line (ffValue() is
+// THE number to watch … at kf ≈ 1.0 it should settle at about ΔT/alpha — the
+// WHOLE DC carrier) describes a working point the slider could not reach.
+//
+// What decides the ceiling is not the SIZE of kf. The DC carrier splits
+// kf / (1 − kf) with alpha_hat cancelling exactly (round-18 section), so kf is a
+// choice about how much of the DC command and how much of the detector's noise
+// reach the finger — NOT about whether the loop can track. What kf does buy,
+// dangerously, is gain on the ECHO: s = kf·(1 − alpha/alpha_hat) is the
+// coefficient on a copy of our own delayed command, so a HIGH kf on an
+// alpha_hat that is merely PLAUSIBLE is the shake this round exists to remove.
+// That is a question about alpha_hat being CORRECT, not about kf being large,
+// and round 19 answers it with the guard below instead of by clipping the knob.
 //
 // With the estimator's bias and its ±30 %, r = alpha/alpha_hat lands near
 // 1.0…2.0, so
@@ -508,14 +723,14 @@ constexpr float kDerivTauSec = 0.025f;
 //     kf = 0.80  →  s = −0.80…0.00   strictly inside it          safe
 //     kf = 0.50  →  s = −0.50…0.00   half the margin, still safe  usable
 //
-// and the whole 0.00–0.50 slider is therefore reachable without a runaway, which
-// is the property round 14 wanted and could only get by stopping at 0.80.
+// and the whole 0.00–0.80 slider is therefore reachable without a runaway, and
+// the top of it is now the value this derivation actually endorses.
 //
 // kFfTauSec was 33 ms and is 45 ms. At kf = 0.80 and alpha_hat = 0.1 the
 // feed-forward's noise gain is kf/alpha_hat = 8; at the new default of 0.05 it
 // is 0.5, i.e. the feed-forward is no longer the loudest path for detector noise
 // either, so this filter is a belt rather than the mechanism now. It is kept
-// because a user who raises kf to 0.50 still needs it.
+// because a user who raises kf to 0.80 still needs it.
 //
 // kFfTauFastSec: the release time constant (round-13 point 4). Asymmetric on
 // purpose — a rising ŵ stays filtered against detector noise, a falling one is
@@ -529,11 +744,70 @@ constexpr float kDerivTauSec = 0.025f;
 constexpr float kFfTauSec      = 0.045f;
 constexpr float kFfTauFastSec  = 0.015f;
 constexpr int   kFfDelaySteps  = 5;
-constexpr float kFfStrengthMax = 0.50f;
+
+// kReconHoldMaxSteps: round 20. The reconstruction samples Δe only on steps the
+// tracker did NOT correct (see AimController::update's `measurementCorrected`),
+// because on a corrected step Δe carries the Kalman innovation rather than a
+// velocity. In the normal regime that is a clean sample every other step — the
+// detector is ~60 Hz against a 120 Hz loop — and two consecutive corrected steps
+// never happen. They DO happen the moment the render loop stalls to the
+// detector's rate: then every frame consumes a new result, `reconHold` runs up
+// unchecked, and holding "until the next clean sample" would freeze the velocity
+// for ever, which reads as 完全跟不上 — a far worse failure than the ring this
+// exists to remove. So the hold is bounded: after this many consecutive corrected
+// steps the sample is taken anyway. 2 is the smallest value that leaves the
+// 60 Hz-detector regime untouched (a clean step always intervenes) while keeping
+// the degenerate regime at a 50 % sample rate instead of zero.
+constexpr int   kReconHoldMaxSteps = 2;
+constexpr float kFfStrengthMax = 0.80f;
 constexpr float kFfGainMax     = 20.0f;
 constexpr float kFfVelMaxPx    = 60.0f;
 constexpr float kFfLimitPx     = 120.0f;
 constexpr float kFfDeadbandPx  = 0.5f;
+
+// ── ROUND 19: the kf GUARD — a cap on the effective strength, not on the knob ─
+//
+// The complaint that started this round is precise — "ki 可以让跟枪很稳，但是目标
+// 停止之后就会震荡" — and the tuning the user found for it is "kf 小了不抖但跟不上,
+// kf 大了跟得上但抖". Both halves are real, and they are two different mechanisms:
+//
+//   * kf SMALL is quiet because the echo gain s = kf·(1 − alpha/alpha_hat) is
+//     small, and it does not keep up because the integral then has to carry
+//     (1 − kf) of the DC command — which is exactly what "ki 低了跟不上" is.
+//   * kf LARGE keeps up for the same sentence read backwards, and shakes because
+//     |s| grows with kf, and s is a gain on a copy of our OWN delayed command.
+//     Round 18 measured the crossing point on the device: 0.05 quiet, 0.15 quiet,
+//     0.50 an even-amplitude ring, 1.00 divergent.
+//
+// So |s| < 1 is the whole game, and s depends on alpha_hat being RIGHT — not on
+// kf being small. The seed is a guess (kAlphaHatSeed = 0.10) and the estimator
+// can take a second to corroborate it, which is the second the user sees as
+// "第一次启动自瞄会一直晃，多晃几下就平稳了": the shake was the excitation the
+// estimator needed before it would fit anything.
+//
+// Round 19 therefore caps the EFFECTIVE strength while the estimate is
+// uncorroborated and lifts the cap once it is. Two consequences:
+//
+//   1. The slider still means what it says. It is clamped only for as long as
+//      nobody has confirmed alpha_hat, never permanently — a user who wants to
+//      work at 0.80 gets 0.80, with an estimate that two independent fits agree
+//      on. The working point stays his knob; just the guard is ours.
+//   2. The startup shake goes away by CONSTRUCTION rather than by tolerance: the
+//      loop starts under the cap, i.e. guaranteed quiet, and the excitation the
+//      estimator needs comes from the aim's own approach instead of from the
+//      oscillation. Round 18's "shake for a second, then settle" cannot arise any
+//      more, because nothing about the loop needs the shake.
+//
+// 0.15 is not a tuning value — it is the largest strength round 18 measured as
+// quiet at the WORST alpha_hat the clamp can hold. It is a floor of safety, so it
+// is deliberately NOT a slider.
+constexpr float kFfGuardStrengthMax = 0.15f;
+// How fast the effective strength may travel toward the slider's value once the
+// cap is lifted. Per RENDER frame (setGains runs there), so it is a rate and not
+// a time constant — ~0.5 s at 120 Hz. A step in kf is a step in the DC carrier's
+// split, i.e. a velocity step, which is the same class of fault as round 15's
+// "乱甩乱晃"; so it moves like every other gate in this file: a RATE, never a jump.
+constexpr float kFfGuardRate        = 0.05f;
 
 // ── Jump detector (pid (1).cpp:40) ──────────────────────────────────────────
 //
@@ -615,6 +889,18 @@ constexpr float kAlphaMax        = 2.0f;
 constexpr float kAlphaHatSeed    = 0.10f;
 constexpr float kAlphaStep       = 0.35f;
 constexpr int   kAlphaSolveEvery = 15;
+// ROUND 19b: the rate at which the CONTROLLER adopts a new alpha_hat, per control
+// step. The estimator moves in visible jumps — it refits every kAlphaSolveEvery
+// steps and blends by kAlphaStep, and the value the controller is handed also
+// steps when the second fit joins the average — and alpha_hat is now the
+// DENOMINATOR of both the feed-forward gain (kf/alpha_hat) and the measured
+// carrier (ffVel/alpha_hat). The DC cancellation ff = kf·u_ss only holds once
+// ffVel has re-converged, which takes kFfTauSec, so every jump in alpha_hat is a
+// kFfTauSec-long ripple on the term that now carries most of the command.
+// Adopting it as a rate is that ripple divided by ~30; it costs nothing, because
+// alpha belongs to the GAME and not to the engagement — a plant gain that takes a
+// second to be adopted is not a plant gain that was ever needed sooner.
+constexpr float kAlphaUseRate    = 0.01f;
 
 namespace {
 // ── Soft limiter ─────────────────────────────────────────────────────────────
@@ -651,7 +937,14 @@ static inline float softLimit(float v, float limit) {
 // (0.10 — the SAFE side, never 1.0 again; see the round-13 header section) and
 // the whole kf range stays stable with alpha_hat off by 2× either way.
 struct AlphaEstimator {
-    static constexpr int kWin = 60;      // 0.5 s at 120 Hz
+    // ROUND 19: 60 → 24. At 60 the first fit could not happen until 0.5 s of
+    // tracking had elapsed, and the guards below then had to be satisfied by a
+    // window that is mostly a steady hold — which is precisely the window in
+    // which u does not vary and the fit is refused. The estimator was therefore
+    // slow for a reason that also made it unlikely, and the loop paid for it
+    // with the startup shake (see kFfGuardStrengthMax). A 0.2 s window at
+    // 120 Hz is 24 samples, which is still far more than the 4 parameters need.
+    static constexpr int kWin = 24;      // 0.2 s at 120 Hz
 
     void reset() {
         head_ = count_ = tick_ = 0;
@@ -720,7 +1013,13 @@ private:
         uMean /= kWin;
         for (int i = 0; i < kWin; ++i) uVar += (U_[i] - uMean) * (U_[i] - uMean);
         uVar /= kWin;
-        if (uVar < 9.0) return;                        // < 3 px rms of travel: skip
+        // ROUND 19: 9.0 (3 px rms) → 1.0 (1 px rms). The old number asked the
+        // command to swing 3 px rms before alpha was even looked for, and a
+        // tracking loop that is doing its job does not swing that much: the only
+        // windows that ever qualified were the approach and the flick, never the
+        // hold. The collinearity test below is the guard that actually protects
+        // the fit from a steady hold, so this one need not be strict as well.
+        if (uVar < 1.0) return;                        // < 1 px rms: no spread, alpha unobservable
 
         double kMean = 0.0, kVar = 0.0, ukCov = 0.0;
         for (int i = 0; i < kWin; ++i) kMean += k_[i];
@@ -732,8 +1031,20 @@ private:
         }
         kVar  /= kWin;
         ukCov /= kWin;
-        if (kVar < 100.0) return;
-        if (std::fabs(ukCov / std::sqrt(uVar * kVar)) > 0.985) return;
+        // A window of consecutive ticks has variance (kWin² − 1)/12, i.e. 47.9 at
+        // kWin = 24 and 300 at the old 60. So this is a singularity valve, not a
+        // selectivity knob — it can only fire when the window is NOT filled with
+        // consecutive steps. ROUND 19 lowers the threshold with the window: left
+        // at 100 it would have rejected every single fit, silently, because 47.9
+        // < 100.
+        if (kVar < 20.0) return;
+        // ROUND 19: 0.985 → 0.97. This correlation is the direct test for "u is
+        // just a straight line in k", so it is the guard doing the real work —
+        // and 0.985 is close enough to 1 that a slightly wandering command
+        // passes while U and k are still nearly collinear, which is how a
+        // spurious alpha gets through. The window is 4x shorter now, so the same
+        // protection costs less selectivity and it can afford to be tightened.
+        if (std::fabs(ukCov / std::sqrt(uVar * kVar)) > 0.97) return;
 
         for (int i = 0; i < 4; ++i) {
             int pv = i;
@@ -796,6 +1107,168 @@ private:
     bool  valid_ = false;
 };
 
+// ── Slope alpha estimator (round 19) ────────────────────────────────────────
+//
+// The identity the feed-forward already reconstructs from (see update()) is
+//
+//     Δe_k = w_k − alpha · u(k−L)
+//
+// Δe is the error's one-step difference and u(k−L) the delay-aligned command —
+// the same pair of numbers the estimator above consumes, read at the same point
+// in the loop, so this costs no extra plumbing. Fitting that line answers "what
+// is alpha" with ONE regressor instead of four:
+//
+//     slope      = −alpha
+//     intercept  =  w   (the target's own screen velocity, free of alpha_hat)
+//
+// WHY A SECOND ESTIMATOR AND NOT A REPLACEMENT. The 4-parameter fit above is
+// computed on U, the CUMULATIVE command. That is what forces it to need a long
+// window and a large uVar before it will even try, and what forces it to carry a
+// c0 + c1·k + c2·k² polynomial plus a guard against that polynomial being
+// collinear with U. Differencing removes the polynomial by construction: a
+// smoothly moving target contributes to Δe only its own ΔT, which over a short
+// window is well described by a STRAIGHT line — and that is exactly what c1·k
+// absorbs here.
+//
+// What differencing does NOT remove is the blind spot. With a constant command
+// the regressor has no spread and nothing is identified, so returning without a
+// new answer is correct behaviour rather than a failure: that is the moment alpha
+// is unobservable AND does not matter, because the reconstruction is then driven
+// by the observed error and not by the assumed plant gain.
+//
+// The two fits are genuinely independent — cumulative positions with a quadratic
+// detrend versus differences with a linear one, over different window lengths.
+// Two independent methods landing on the same alpha is real evidence, and that
+// agreement is what `AimController::step()` gates the kf guard on (see
+// kFfGuardStrengthMax). Neither estimator is trusted on its own.
+//
+// ROUND 19 deliberately gives this one NO residual guard. The polynomial fit
+// needs one because a 4-parameter solve over a short window can satisfy the
+// normal equations while describing nothing; a 2-parameter line cannot — and the
+// question a residual guard was really answering ("is this fit believable?") is
+// answered far better by two independent fits agreeing than by a threshold on
+// either one of them.
+struct SlopeAlphaEstimator {
+    static constexpr int kWin = 24;      // 0.2 s at 120 Hz
+
+    void reset() {
+        head_ = count_ = tick_ = 0;
+        havePrev_ = false;
+        prevE_ = 0.0f;
+        alpha_ = kAlphaHatSeed;
+        valid_ = false;
+    }
+
+    /// One control step. `e` is the raw error in screen px and `uDelayed` the
+    /// command from kFfDelaySteps steps ago — exactly the arguments the
+    /// polynomial estimator takes.
+    void push(float e, float uDelayed) {
+        if (!(std::isfinite(e) && std::isfinite(uDelayed))) return;
+        // The first sample can only seed the difference; every step after it
+        // contributes one pair. The pairing is (Δe_k, u(k−L)) — the one the
+        // physical identity describes — NOT (Δe_k, u_k).
+        if (!havePrev_) { prevE_ = e; havePrev_ = true; return; }
+        const float de = e - prevE_;
+        prevE_ = e;
+
+        dE_[head_] = de;
+        U_[head_]  = uDelayed;
+        k_[head_]  = static_cast<float>(tick_);
+        head_ = (head_ + 1) % kWin;
+        if (count_ < kWin) ++count_;
+        ++tick_;
+        if (count_ == kWin && (tick_ % kAlphaSolveEvery) == 0) solve();
+    }
+
+    /// The value to USE, read alongside the polynomial estimator's. Never unset.
+    float value() const { return alpha_; }
+    /// True once THIS fit has succeeded at least once.
+    bool  valid() const { return valid_; }
+
+private:
+    void solve() {
+        // Normal equations for [c0, c1, alpha] with regressors [1, k, −u].
+        double M[3][3] = {{0}}, b[3] = {0};
+        for (int i = 0; i < kWin; ++i) {
+            const double x[3] = {1.0, k_[i], -double(U_[i])};
+            const double y = dE_[i];
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) M[r][c] += x[r] * x[c];
+                b[r] += x[r] * y;
+            }
+        }
+
+        // ── Excitation guard: the same test, for the same reason ─────────────
+        // u must SPREAD, and it must not spread along k. A steady hold gives a
+        // nearly constant u (no spread); a slow ramp of u gives a spread that is
+        // collinear with k, which c1·k then absorbs — leaving the alpha column
+        // explaining nothing while the solve still returns some number inside the
+        // clamp. Both cases are refused, and refusing costs nothing.
+        double uMean = 0.0, uVar = 0.0;
+        for (int i = 0; i < kWin; ++i) uMean += U_[i];
+        uMean /= kWin;
+        for (int i = 0; i < kWin; ++i) uVar += (U_[i] - uMean) * (U_[i] - uMean);
+        uVar /= kWin;
+        if (uVar < 1.0) return;
+
+        double kMean = 0.0, kVar = 0.0, ukCov = 0.0;
+        for (int i = 0; i < kWin; ++i) kMean += k_[i];
+        kMean /= kWin;
+        for (int i = 0; i < kWin; ++i) {
+            const double dk = k_[i] - kMean;
+            kVar  += dk * dk;
+            ukCov += (U_[i] - uMean) * dk;
+        }
+        kVar  /= kWin;
+        ukCov /= kWin;
+        if (kVar < 20.0) return;
+        if (std::fabs(ukCov / std::sqrt(uVar * kVar)) > 0.97) return;
+
+        for (int i = 0; i < 3; ++i) {
+            int pv = i;
+            for (int r = i + 1; r < 3; ++r) if (std::fabs(M[r][i]) > std::fabs(M[pv][i])) pv = r;
+            if (std::fabs(M[pv][i]) < 1e-9) return;    // singular: keep the old value
+            for (int c = 0; c < 3; ++c) std::swap(M[i][c], M[pv][c]);
+            std::swap(b[i], b[pv]);
+            for (int r = i + 1; r < 3; ++r) {
+                const double f = M[r][i] / M[i][i];
+                for (int c = i; c < 3; ++c) M[r][c] -= f * M[i][c];
+                b[r] -= f * b[i];
+            }
+        }
+        double x[3] = {0};
+        for (int i = 2; i >= 0; --i) {
+            double s = b[i];
+            for (int j = i + 1; j < 3; ++j) s -= M[i][j] * x[j];
+            x[i] = s / M[i][i];
+        }
+
+        // The coefficient on the regressor −u IS alpha, because Δe = w − alpha·u.
+        // The clamp refuses absurd fits for the same reason the other estimator
+        // does: at alpha_hat = 0.05 against a true 0.5 the echo coefficient is
+        // s = −7.2 and the self-copy stops being damping.
+        const double a = x[2];
+        if (!(a > kAlphaMin && a < kAlphaMax)) return;
+
+        // Same bias, same blend, same reason: the fit is refitted every
+        // kAlphaSolveEvery steps, so adopting each one wholesale would walk the
+        // loop gain around for nothing.
+        const float want = std::clamp(kAlphaBias * static_cast<float>(a),
+                                      kAlphaMin, kAlphaMax);
+        alpha_ += kAlphaStep * (want - alpha_);
+        valid_ = true;
+    }
+
+    float dE_[kWin] = {0.0f};
+    float U_[kWin]  = {0.0f};
+    float k_[kWin]  = {0.0f};
+    int   head_ = 0, count_ = 0, tick_ = 0;
+    bool  havePrev_ = false;
+    float prevE_ = 0.0f;
+    float alpha_ = kAlphaHatSeed;
+    bool  valid_ = false;
+};
+
 // ── Per-step position controller ─────────────────────────────────────────────
 //
 // update() takes the position error in px and returns the finger displacement
@@ -837,10 +1310,25 @@ public:
         trimLimit = kTrimLimitPx;
     }
 
-    /// The reconstruction constant, from the estimator. Only ever changes the
-    /// residual self-term, never the loop's gain, so a bad value degrades the
-    /// damping rather than the stability near the working point.
-    void setAlphaHat(float a) { alphaHat = std::clamp(a, kAlphaMin, kAlphaMax); }
+    /// The reconstruction constant, from the estimator.
+    ///
+    /// ROUND 19b: adopted AS A RATE, not assigned. The old comment claimed this
+    /// "only ever changes the residual self-term, never the loop's gain" — that
+    /// was written when kf shipped at 0.05 and F carried 5 % of the command, and
+    /// it stopped being true the moment round 19 let kf reach 0.80. alpha_hat is
+    /// the denominator of the feed-forward gain (kf/alpha_hat) AND of the
+    /// measured carrier (ffVel/alpha_hat), so a step in it is a step in the
+    /// crosshair's velocity, and the estimator produced one every
+    /// kAlphaSolveEvery steps. See kAlphaUseRate.
+    ///
+    /// The first value is adopted whole: at start-up the seed is a guess and
+    /// there is nothing to step away from, and the kf guard is holding the
+    /// feed-forward down anyway.
+    void setAlphaHat(float a) {
+        const float want = std::clamp(a, kAlphaMin, kAlphaMax);
+        if (!alphaHatInit_) { alphaHat = want; alphaHatInit_ = true; return; }
+        alphaHat += kAlphaUseRate * (want - alphaHat);
+    }
 
     /// The engaged target's box width in screen px — the UNITS of the proximity
     /// weight's threshold (kGateFrac × this). Passing <= 0 disables the schedule
@@ -857,14 +1345,25 @@ public:
     //                 what amplify the detector's jitter — the band's real job),
     //                 the integrator stops accumulating, and the charge it holds
     //                 is bled toward what the reconstruction measures the target
-    //                 to need — carry = ffVel/alpha_hat, i.e. toward zero at rest
-    //                 and toward the standing carrier on a strafe
-    //                 (kDzTrimBleedTauSec). It is STILL ADDED to the output at
+    //                 to need — MINUS the part the feed-forward is already
+    //                 supplying this step (round 19b: trimWant = carry − ff,
+    //                 carry = ffVel/alpha_hat). At rest both terms are 0; on a
+    //                 strafe the trim is left holding its own (1−kf) share of the
+    //                 standing carrier and not the whole of it, which is what
+    //                 stops the band from over-charging it once kf is large
+    //                 enough to matter (kDzTrimBleedTauSec). It is STILL ADDED to the output at
     //                 all times, and round 15 is the reason that sentence has to
     //                 be here: it suppressed the contribution, which turned the
     //                 band into a bang-bang in a per-step displacement term and
     //                 read on the device as "乱甩乱晃". The feed-forward is
     //                 added as always.
+    //
+    //                 NOTE (round 17): `frozen` is NOT the only route into that
+    //                 bleed any more, and it never could be — see kStopHoldSteps.
+    //                 A charge that oscillates holds |e| outside the band by
+    //                 construction, so the band's own trigger is absent exactly
+    //                 when the bleed is needed. The stop detector is the second
+    //                 trigger, on the measurement rather than on the error.
     // targetChanged : true when the caller switched to a DIFFERENT track this
     //                 step (it knows, from the track id). The integral, the
     //                 feed-forward velocity and the soft-start ramp are re-seeded
@@ -877,8 +1376,33 @@ public:
     //                 the right thing to subtract.
     //
     // Returns: finger displacement for this step, px.
+    //
+    // measurementCorrected : ROUND 20. True when the TRACKER re-associated this
+    //                 step — it pulled the published centre back onto a detector
+    //                 result that is already a render frame old
+    //                 (kalman_tracker.cpp: predictAll runs every render frame,
+    //                 matchAndUpdate only on a fresh result). On those steps de is
+    //                 NOT a velocity: it is the constant-velocity extrapolation
+    //                 PLUS the correction kick, and the kick is the distance the
+    //                 prediction had already run — proportional to how far WE
+    //                 rotated the view since the last detector result. The
+    //                 tracker's own note measures the cost at 9…41 px of
+    //                 published lag and vx ±22 %. Feeding that into the
+    //                 reconstruction puts our own view rotation back into the
+    //                 loop through BOTH agents that multiply a velocity — the
+    //                 feed-forward (× kf) and the integrator (carry → trimWant,
+    //                 × 1) — which is why "the faster the view moves, the worse
+    //                 it shakes" and why a tiny ki behaves the same way.
+    //                 On a step the tracker did NOT correct, the model advanced
+    //                 the published centre by exactly its own (vx, vy), so de
+    //                 there IS the Kalman velocity, clean. The reconstruction
+    //                 therefore samples de only on those steps and RE-USES the
+    //                 last clean sample in between, so its sample rate becomes the
+    //                 detector's — the rate the quantity is actually measured at.
+    //                 Default false = never gate, i.e. the pre-round-20 behaviour,
+    //                 so a caller that does not know is not silently changed.
     float update(float error, float dt, bool frozen = false,
-                 bool targetChanged = false) {
+                 bool targetChanged = false, bool measurementCorrected = false) {
         if (!std::isfinite(error) || dt <= 0.0f) return 0.0f;
 
         if (targetChanged) {
@@ -889,8 +1413,12 @@ public:
                                  // the lurch this branch exists to avoid.
             ramp      = 0.0f;
             ffVel     = 0.0f;
+            ffVelPrev = 0.0f;   // round 22: a new enemy's speed is not this one's,
+            stopDrop  = 0.0f;   //   so losing the old track is not a "stop"
             ffInhibit = true;
             nearW     = 0.0f;
+            stopSteps = 0;   // a new enemy's "we have been at rest" count is not ours
+            deCleanValid = false;   // the old track's clean sample is not the new one's
         }
 
         // ── Soft start ────────────────────────────────────────────────────────
@@ -930,11 +1458,15 @@ public:
         const float jumpPx = std::max(kJumpResetPx, boxPx) + alphaHat * kOutLimitPx;
         if (std::fabs(de) > jumpPx) {
             ffVel     = 0.0f;
+            ffVelPrev = 0.0f;   // round 22: a jump is not a deceleration
+            stopDrop  = 0.0f;
             ffInhibit = true;
             integral  = 0.0f;
             deriv     = 0.0f;
             nearW     = 0.0f;
             ramp      = 0.0f;
+            stopSteps = 0;   // a jump is not rest — do not let the count survive it
+            deCleanValid = false;   // Δe across a jump is not a velocity either
         }
 
         // ── Proximity weight: the reference's gain SCHEDULE ──────────────────
@@ -1027,13 +1559,60 @@ public:
         // needed, which is why round 15's band could only bleed to zero.
         const bool velValid = (alphaHat > 0.0f) && !ffInhibit;
         float ff = 0.0f;
+        // ── ROUND 20: sample de only where de IS a velocity ──────────────────
+        //
+        // de is the step-to-step change of the tracker's PUBLISHED centre, and
+        // that centre follows two different laws depending on the step
+        // (kalman_tracker.cpp:503-521): on a step the detector produced nothing
+        // new, predictAll advanced it by exactly (vx, vy), so de == vx and is
+        // clean; on a step the tracker re-associated, matchAndUpdate pulled it
+        // back onto a measurement that is already a render frame old, so
+        // de == vx + kick — and the kick is the distance the prediction had
+        // already run, i.e. proportional to OUR OWN view rotation over the
+        // detector period. That is the "the faster the view moves, the worse it
+        // shakes" mechanism, and it is why the corruption scales with |u|: it
+        // re-enters the loop through ff (× kf) AND through carry → trimWant →
+        // the integrator (× 1), so a tiny ki rings just as well as a large one.
+        //
+        // So the sample is taken only from an UNCORRECTED step, and it is HELD
+        // across corrected ones rather than dropped, so the filter's bandwidth
+        // stays the detector's own and never collapses if the detector happens to
+        // run at the render rate.
         if (velValid) {
-            const float meas = std::clamp(de + alphaHat * uHist[uHead],
+            if (!measurementCorrected) {
+                deClean      = de;
+                deCleanValid = true;
+                reconHold    = 0;
+            } else if (++reconHold >= kReconHoldMaxSteps) {
+                // Watchdog: nothing but corrected steps in a row means the render
+                // loop has fallen to the detector's rate. Reusing the held sample
+                // there would freeze the velocity for ever — take this one and
+                // accept its innovation, which at that rate is only a single
+                // render frame of drift. See kReconHoldMaxSteps.
+                deClean      = de;
+                deCleanValid = true;
+                reconHold    = 0;
+            }
+        }
+        // Round 22: the fractional drop of the reconstructed speed is the stop
+        // detector's input. It is MEASURED inside the block below (without a fresh
+        // sample it has no meaning) and DECAYED outside it (so a stretch with no
+        // valid sample cannot leave the flag stuck on).
+        float dropNow = 0.0f;
+        if (velValid && deCleanValid) {
+            const float meas = std::clamp(deClean + alphaHat * uHist[uHead],
                                           -kFfVelMaxPx, kFfVelMaxPx);
             const float tau  = (std::fabs(meas) < std::fabs(ffVel))
                                    ? kFfTauFastSec : kFfTauSec;
             const float af   = dt / (dt + tau);
+            ffVelPrev = ffVel;      // the DENOMINATOR, captured before the filter moves
             ffVel += af * (meas - ffVel);
+            {
+                const float aPrev = std::fabs(ffVelPrev);
+                const float aNow  = std::fabs(ffVel);
+                if (aPrev > kStopDropVelMinPx && aPrev > aNow)
+                    dropNow = (aPrev - aNow) / aPrev;
+            }
             if (kf > 0.0f) {
                 const float gain = std::min(kf / alphaHat, kFfGainMax);
                 ff = std::clamp(gain * ffVel, -kFfLimitPx, kFfLimitPx);
@@ -1043,7 +1622,76 @@ public:
                 if (std::fabs(ff) < kFfDeadbandPx) ff = 0.0f;
             }
         }
+        // Round 22: instant attack, slow release. The flag must catch the first
+        // frame of the collapse, but one soft step must not clear it and restart
+        // the release from scratch. While the target is moving dropNow == 0 and
+        // this decays to zero on its own, which is what leaves the follow untouched.
+        stopDrop = std::max(dropNow, stopDrop - dt / kStopDropReleaseSec);
+        if (stopDrop < 0.0f) stopDrop = 0.0f;
         ffInhibit = false;
+
+        // ── The measured carrier, computed whether the band is open or shut ───
+        //
+        // ffVel/alpha_hat is in the trim's own units — finger px per step — which
+        // is what makes it usable as a target at all; the 0.5 px deadband keeps a
+        // jitter-driven ŵ from leaving a permanent sub-pixel charge at rest.
+        //
+        // It is hoisted out of the `frozen` branch (round 17) because TWO
+        // mechanisms now read it: the stop band's bleed, and the stop detector
+        // that triggers when the target comes to rest. It is a MEASUREMENT, so
+        // there was never a reason to read it only inside the band.
+        const bool  haveCarry = (alphaHat > 0.0f) && velValid;
+        float carry = 0.0f;
+        if (haveCarry) {
+            carry = std::clamp(ffVel / alphaHat, -trimLimit, trimLimit);
+            if (std::fabs(carry) < kFfDeadbandPx) carry = 0.0f;
+        }
+
+        // ── ROUND 19b: the trim's TARGET is the carrier's TRIM SHARE ──────────
+        //
+        // carry = ffVel/alpha_hat is the WHOLE carrier — the total command the
+        // target's motion demands — not the part the integral is supposed to
+        // supply. The two are only the same number while kf is ~0.05 and F is
+        // carrying 5 % of it. At kf = 0.50 the split is half and half, so a trim
+        // bled toward `carry` is bled to TWICE its share: the sum becomes
+        // 1.5·u_ss, the crosshair is pushed past the target, the error leaves the
+        // band, P and D switch back on and drag it in, the band re-closes and the
+        // charge is pumped again — a limit cycle, on the axis carrying the
+        // carrier, and only while the crosshair is close enough to be frozen.
+        // That is the "有时候左右晃" round 19 traded the violent shake for.
+        //
+        // Written as a CONSERVATION and not as a formula: the trim wants what is
+        // left after the feed-forward has supplied its own part this step. It is
+        // therefore right at every kf, right while ff is clamped or deadbanded,
+        // and at kf = 0 it is `carry` verbatim — which is the behaviour the whole
+        // deadzone was tuned against, so this cannot regress the old settings.
+        float trimWant = integral;                 // no measurement: hold
+        // Clamped to the leash: carry and ff each carry their own limit, so their
+        // difference can exceed it, and the old target could not — a charge that
+        // is allowed to park above trimLimit is a charge the integrator will
+        // spend later, which is the exact fault back-calculation exists to stop.
+        if (haveCarry) {
+            if (stopDrop > kStopDropThreshold) {
+                // ROUND 22: the target has stopped. The charge standing in the
+                // integrator is no longer what its motion demands — it is now pure
+                // poison — so the target becomes ZERO and the two branches below
+                // discharge it. Deliberately NOT `carry`: at the instant of the
+                // stop, carry is built from meas = (alpha_hat − alpha)·u, which at
+                // rho < 1 is the old carrier NEGATED and amplified (≈ −2·u_ss).
+                // Bleeding toward that is charging the integrator in REVERSE, not
+                // releasing it, and it is what turned round 19's overshoot into a
+                // standing oscillation. See kStopDropThreshold.
+                trimWant = 0.0f;
+            } else {
+                const float want = std::clamp(carry - ff, -trimLimit, trimLimit);
+                // ROUND 22: a measurement is believed only while it agrees with the
+                // charge it is asking about. Same sign is the steady strafe, where
+                // carry == u_ss and this is round 16's own schedule kept intact.
+                // Opposite sign is the reconstruction quoting our own output back
+                // at us — following it there is exactly how the loop flips sign.
+                if (want * integral >= 0.0f) trimWant = want;
+            }
+        }
 
         // ── Deadzone, part 2: the trim bleeds toward the MEASURED CARRIER ─────
         //
@@ -1062,15 +1710,48 @@ public:
         // and at kf = 0 that made the band zero the axis outright.
         float iTerm = integral;
         if (frozen) {
-            float carry = integral;                        // no measurement: hold
-            if (velValid) {
-                carry = std::clamp(ffVel / alphaHat, -trimLimit, trimLimit);
-                if (std::fabs(carry) < kFfDeadbandPx) carry = 0.0f;
-            }
+            const float want  = trimWant;   // the trim's own share of the carrier
             const float bleed = std::min(1.0f, dt / kDzTrimBleedTauSec);
-            integral += (carry - integral) * bleed;
+            integral += (want - integral) * bleed;
             if (std::fabs(integral) < 0.01f) integral = 0.0f;
             iTerm = integral;
+        } else if (haveCarry) {
+            // ── Stop detector (round 22): a DIMENSIONLESS trigger ─────────────
+            //
+            // Round 17 asked the MEASUREMENT whether the charge was still
+            // justified, via |trimWant| — and that test could never fire (see
+            // kStopDropThreshold for the arithmetic). What replaces it is the
+            // fractional collapse of |ffVel|: the physical definition of "the
+            // target stopped", and a ratio, so there is no alpha_hat in it to be
+            // wrong. pid_chirs.cpp:632 reaches for the same quantity.
+            //
+            // This is the state in which a standing charge is pure poison: a
+            // per-step displacement with no restoring force, which the stop band
+            // cannot reach because the oscillation that charge produces is what
+            // holds |e| OUTSIDE the band. The band and this branch cover the two
+            // halves of that fault — the band handles the charge that has wandered
+            // inside it, this one handles the charge that cannot.
+            //
+            // The bleed is toward trimWant, which this trigger has just set to
+            // ZERO, so it is a discharge and not a reversal. The value still enters
+            // the sum on every step — it just decays at kStopBleedTauSec — and the
+            // accumulation below still runs against it, so a target that is only
+            // slowing rather than stopped re-charges almost immediately.
+            const bool restNow = (stopDrop > kStopDropThreshold);
+            if (restNow) ++stopSteps;
+            else         stopSteps = 0;
+            if (stopSteps >= kStopHoldSteps && std::fabs(integral) > 0.01f) {
+                const float bleed = std::min(1.0f, dt / kStopBleedTauSec);
+                integral += (trimWant - integral) * bleed;
+                if (std::fabs(integral) < 0.01f) integral = 0.0f;
+                iTerm = integral;
+                // ROUND 22: and the reconstruction goes with it. ffVel is what fed
+                // the charge in the first place, and until now nothing ever cleared
+                // it — the stop path released the integrator and left the velocity
+                // estimate standing, which treated half the fault. Same rate for
+                // both, so neither is left behind to keep the axis awake.
+                ffVel -= ffVel * bleed;
+            }
         }
 
         // ── Integral: the DC carrier, unconditioned and quick to let go ──────
@@ -1094,7 +1775,25 @@ public:
         const bool pushLo = uWant <= -outLimit && error < 0.0f;
         if (!frozen && !pushHi && !pushLo) {
             const bool opposing = (integral * error) < 0.0f;
-            integral += (opposing ? kIntReleaseGain : 1.0f) * ki * error * dt;
+            if (opposing) {
+                // ROUND 22: the fast release is CLAMPED AT ZERO. Written as
+                // `integral += kIntReleaseGain·ki·e·dt` — the old form — a reversed
+                // error pushed the charge THROUGH zero and built it up in the
+                // opposite direction. That is not releasing an overshoot, it is
+                // re-charging the axis backwards, and it is the engine of the ring:
+                // the charge swings + → − → + and the crosshair with it, because
+                // releasing only makes the error reverse again. Here |integral| can
+                // only be REDUCED; once it reaches zero the ordinary accumulation
+                // below takes over and the axis may legitimately reverse. Same speed
+                // as before, minus the reversal.
+                const float release = kIntReleaseGain * ki * std::fabs(error) * dt;
+                if (release > 0.0f) {
+                    const float mag = std::fabs(integral) - release;
+                    integral = (mag > 0.0f) ? std::copysign(mag, integral) : 0.0f;
+                }
+            } else {
+                integral += ki * error * dt;
+            }
             integral  = std::clamp(integral, -trimLimit, trimLimit);
             iTerm     = integral;   // keep the sum below in step with the state
         }
@@ -1139,9 +1838,15 @@ public:
         deriv     = 0.0f;
         ramp      = 0.0f;
         ffVel     = 0.0f;
+        ffVelPrev = 0.0f;
+        stopDrop  = 0.0f;
         ffInhibit = false;
+        deClean      = 0.0f;
+        deCleanValid = false;
+        reconHold    = 0;
         uHead     = 0;
         nearW     = 0.0f;
+        stopSteps = 0;
         for (int i = 0; i < kFfDelaySteps; ++i) uHist[i] = 0.0f;
     }
 
@@ -1185,6 +1890,16 @@ public:
     /// Kept for the log: "on target" now means the schedule is mostly open.
     bool  settledNow()     const { return nearW > kNearFloor; }
 
+    /// True while the STOP DETECTOR has the target held at rest (round 17) and
+    /// the trim is consequently being bled toward the measured carrier — which is
+    /// zero at rest. Read it against `trim` and `carryPx`, and read all three
+    /// together: engaged with trim decaying toward carry is the mechanism working;
+    /// engaged with trim NOT decaying means the accumulation is outrunning the
+    /// bleed; not engaged while the aim sits still means carry is not reading ~0,
+    /// i.e. the reconstruction is being fed a velocity that is not there (check
+    /// alpha_hat against `a=` on the log line before touching ki).
+    bool  stoppedNow()     const { return stopSteps >= kStopHoldSteps; }
+
 private:
     float kp        = 0.10f;
     float ki        = 0.5f;
@@ -1194,6 +1909,11 @@ private:
     /// fly-off value, kept only because nothing set it before the first frame.
     float kf        = 0.05f;
     float alphaHat  = kAlphaHatSeed;   // NEVER 1.0 by default — see round 13
+    /// False until the first value has been adopted whole — see setAlphaHat().
+    /// Deliberately NOT cleared by reset(): the plant gain belongs to the game,
+    /// so a fresh engagement must not make the controller crawl back to a value
+    /// it had already learned.
+    bool  alphaHatInit_ = false;
 
     // ── State ─────────────────────────────────────────────────────────────────
     float integral  = 0.0f;
@@ -1203,12 +1923,34 @@ private:
     float ramp      = 0.0f;   // soft-start ramp, 0..1
     float ffVel     = 0.0f;   // filtered ŵ, the target's own screen velocity
     bool  ffInhibit = false;  // one step of silence after a jump or a switch
+    // Round 22: the stop detector's two new states. ffVelPrev is the previous
+    // step's filtered speed — the DENOMINATOR of the fractional drop, so it has
+    // to be captured before the filter is advanced. stopDrop is that ratio after
+    // its short latch: 0 while the target is moving, ~1 the moment it stops.
+    float ffVelPrev = 0.0f;
+    float stopDrop  = 0.0f;
+    /// ROUND 20. The last `de` that came off a step the tracker did NOT correct,
+    /// i.e. a clean sample of its own velocity state. See the note on the gated
+    /// reconstruction in update(): on a corrected step `de` carries the Kalman
+    /// innovation, which is proportional to OUR OWN view rotation.
+    float deClean      = 0.0f;
+    bool  deCleanValid = false;
+    /// Consecutive corrected steps since the last clean sample — the watchdog
+    /// that stops the hold from becoming a freeze. See kReconHoldMaxSteps.
+    int   reconHold    = 0;
     float outLimit  = kOutLimitPx;
     float trimLimit = kTrimLimitPx;
 
     // Proximity weight (the reference's gain schedule)
     float boxPx     = 0.0f;   // engaged target's box width; 0 = schedule off
     float nearW     = 0.0f;   // 0…1, rate-limited; P and I follow it
+
+    // Stop detector (round 22): consecutive steps the drop ratio said "stopped".
+    // Drives the trim bleed that kills the shake a big ki leaves behind when the
+    // target stops — the one case the deadzone's own |e| <= dz trigger cannot
+    // reach, because the oscillation it was meant to kill is what keeps |e| out
+    // of the band. See kStopHoldSteps.
+    int   stopSteps = 0;
 
     float uHist[kFfDelaySteps] = {0.0f};  // our own commands, for u(k−L)
     int   uHead    = 0;                   // index of the OLDEST entry

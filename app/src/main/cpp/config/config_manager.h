@@ -4,8 +4,12 @@
 //  Saves what the user can see and touch: every slider / switch /
 //  category-mask on the Aim and Trigger pages, the Capture size, and the
 //  visible Settings switches — into /data/local/tmp/aimbotng/config.json.
-//  Rows that are compiled in but currently hidden (Aim 提前量, the tracker
-//  tuning rows on Settings) are deliberately NOT stored.
+//  Every row the user can SEE is stored, and that includes the tracker tuning
+//  on Settings (trackIou / 确认帧 / 丢失帧 / 丢框预测帧数) and the aim-time rows
+//  on the Aim page (死区 / 延迟补偿 / 输出平滑). An earlier version of this
+//  comment claimed the tracker rows were "deliberately NOT stored" and that
+//  Aim 提前量 was hidden — both stopped being true the moment those rows got
+//  sliders, and a stale note here is a trap for the next reader.
 //
 //  Two entry points, both cheap:
 //    load()         — read the file into the page states. Called once from

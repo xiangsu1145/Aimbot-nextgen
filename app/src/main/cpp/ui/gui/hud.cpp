@@ -731,20 +731,69 @@ void drawDetectionOverlay() {
     }
 }
 
+// ── Dashed rectangle ───────────────────────────────────────────────────────
+//
+// ImGui's AddRect cannot draw a dash, so each edge is stroked as a sequence of
+// short AddLine calls with gaps between them. Cap by LENGTH, not by segment
+// count, so an edge that is not a whole number of dashes still ends on a clean
+// dash instead of a stub. (The section overlays keep their own private copy of
+// this — see sections/aim_section.cpp. These files deliberately do not share
+// one; the duplication is cheaper than the header.)
+void drawDashedRect(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
+                    ImU32 col, float thickness, float dashLen, float gapLen) {
+    auto dashEdge = [&](ImVec2 a, ImVec2 b) {
+        const float dx = b.x - a.x, dy = b.y - a.y;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        if (len < 0.001f) return;
+        const float ux = dx / len, uy = dy / len;
+        float pos = 0.0f;
+        while (pos < len) {
+            const float endPos = (pos + dashLen > len) ? len : (pos + dashLen);
+            dl->AddLine(ImVec2(a.x + ux * pos, a.y + uy * pos),
+                        ImVec2(a.x + ux * endPos, a.y + uy * endPos),
+                        col, thickness);
+            pos = endPos + gapLen;
+        }
+    };
+    dashEdge(ImVec2(mn.x, mn.y), ImVec2(mx.x, mn.y));   // top
+    dashEdge(ImVec2(mx.x, mn.y), ImVec2(mx.x, mx.y));   // right
+    dashEdge(ImVec2(mx.x, mx.y), ImVec2(mn.x, mx.y));   // bottom
+    dashEdge(ImVec2(mn.x, mx.y), ImVec2(mn.x, mn.y));   // left
+}
+
 // ── drawTrackingOverlay ────────────────────────────────────────────────────
 //
-// Blue boxes around the Kalman tracker's smoothed tracks. Distinct from the
-// red raw detection overlay (drawDetectionOverlay above) so the two can be
-// toggled independently:
-//   * showDetections off, showTracking on  -> only the smoothed track.
-//   * showDetections on,  showTracking off -> only the raw detector output.
-//   * both on                              -> both, useful for checking
-//                                             "does the box actually settle?"
+// The tracker's boxes, painted straight onto the surface. Two overlays answer two
+// different questions and each has its own switch (on different pages), so every
+// combination of them is legitimate:
 //
-// The label is just the track id. No score, no class — the point of this view
-// is to watch identity (does the id stay on one enemy?) and smoothing, not the
-// model's per-box confidence.
+//   showDetections (red)   — what the DETECTOR found, raw. The model's own
+//                            output: unsmoothed, unassociated, unpredicted.
+//   showTracking (blue)    — the TRACKS. Solid blue "#id" when the track has a
+//       / (amber)            fresh measurement this frame; dashed amber "P#id"
+//                            when its published centre is a CLAIM rather than an
+//                            observation — the Kalman forward-prediction for the
+//                            first `predictHoldFrames` misses, then a frozen
+//                            last-known position (kalman_tracker.cpp: predictAll).
+//
+// Round 18 merged the amber boxes into showTracking and deleted the separate
+// 显示预测框 row: the prediction is a detail OF the tracking view, not a view of
+// its own, and the extra switch only made the Settings page longer.
+//
+// The blue/amber split itself is not decoration. Two boxes looking identical while
+// one is measured and the other extrapolated is what made a real field report —
+// "准心一直锁在框旁边，框在左边" — cost a whole session: the AIMING point is a
+// third point again (the lead-shifted centre; see the round-17/18 note on
+// PageAim::deadzone and PageAim::aimDelayFrames), so with every box drawn the same
+// there was no way to see which of the two the crosshair was sitting on.
+//
+// The label is the track id and nothing else. No score, no class — the point of
+// this view is identity (does the id stay on one enemy?) and the
+// measured/predicted distinction, not the model's per-box confidence.
 void drawTrackingOverlay() {
+    // ONE switch (round 18): the predicted boxes are part of the tracking view
+    // and are not gated separately — see the showTracking note in
+    // settings_section.h.
     if (!sections::g_pageSettings.showTracking.value) return;
 
     const auto& tracks = tracking::tracker().tracks();
@@ -756,28 +805,42 @@ void drawTrackingOverlay() {
     constexpr float kRound     = 3.0f;
     constexpr float kPadX      = 6.0f;
     constexpr float kPadY      = 3.0f;
+    constexpr float kDash      = 10.0f;
+    constexpr float kGap       = 7.0f;
 
     for (const tracking::TrackedTarget& t : tracks) {
         if (!t.confirmed) continue;       // only show "real" tracks
         if (t.w <= 0.0f || t.h <= 0.0f) continue;
 
+        // `lost` means exactly "no measurement was matched to this track on the
+        // detector frame this render step is showing" — no heuristic on age,
+        // score or confidence. Round 18: it only selects the STYLE (dashed amber
+        // vs solid blue), because both kinds now live under the one switch.
+        const bool predicted = t.lost;
+
+        const ImU32 colBox   = predicted ? PredBox   : TrackBox;
+        const ImU32 colPlate = predicted ? PredPlate : TrackPlate;
+        const ImU32 colText  = predicted ? PredText  : TrackText;
+
         const float halfW = t.w * 0.5f;
         const float halfH = t.h * 0.5f;
         const ImVec2 mn(t.cx - halfW, t.cy - halfH);
         const ImVec2 mx(t.cx + halfW, t.cy + halfH);
-        dl->AddRect(mn, mx, TrackBox, kRound, 0, 2.0f);
+        if (predicted) drawDashedRect(dl, mn, mx, colBox, 2.0f, kDash, kGap);
+        else           dl->AddRect(mn, mx, colBox, kRound, 0, 2.0f);
 
         char label[32];
-        snprintf(label, sizeof(label), "#%d", t.id);
+        if (predicted) snprintf(label, sizeof(label), "P#%d", t.id);
+        else           snprintf(label, sizeof(label), "#%d", t.id);
 
         const ImVec2 ts = font->CalcTextSizeA(tsize(kLabelSize), FLT_MAX, 0.0f, label);
         ImVec2 lmn(mn.x, mn.y - ts.y - kPadY * 2.0f);
         if (lmn.y < 0.0f) lmn.y = mn.y + 1.0f;
         const ImVec2 lmx(lmn.x + ts.x + kPadX * 2.0f, lmn.y + ts.y + kPadY * 2.0f);
 
-        dl->AddRectFilled(lmn, lmx, TrackPlate, kRound);
+        dl->AddRectFilled(lmn, lmx, colPlate, kRound);
         dl->AddText(font, tsize(kLabelSize), ImVec2(lmn.x + kPadX, lmn.y + kPadY),
-                    TrackText, label);
+                    colText, label);
     }
 }
 

@@ -74,6 +74,19 @@ constexpr float kOverlayLabelSize = 38.0f;   // centre-label font size, surface 
 // position, per the user's spec ("偏移上下左右随机10px").
 constexpr float kAimPressJitterPx = 10.0f;
 
+// kLeadVelTauSec: the low-pass the LEAD's copy of the tracker velocity goes
+// through, in seconds. The tracker's velocity has a 1.4-render-frame time
+// constant, i.e. it is a differentiator of a noisy measurement whose signal also
+// contains the aim's own output; lead multiplies it by a frame count and folds
+// the product back into the point the loop converges to, which is a phase lead
+// in a delay loop that no gain row can bound (see the ROUND 19c note at the lead
+// itself). 65 ms is chosen to sit between the two bands: above the detector's
+// frame-to-frame ring, and far below the hundreds of milliseconds over which a
+// real target changes its own velocity. Lower it if a genuinely fast direction
+// change needs to be anticipated; raise it if the crosshair still sways with the
+// lead up.
+constexpr float kLeadVelTauSec = 0.065f;
+
 // Palette — same border/handle/fill triplet for both overlays so they read as
 // the same family. Accent-tinted fill + near-white border + white handles.
 constexpr ImU32 kOverlayBorder = IM_COL32(238, 240, 246, 215);
@@ -234,12 +247,22 @@ bool realFingerInTouchArea(int& outId, float& outX, float& outY) {
 // frame-rate-independent step and uploads the new position. Shared by both the
 // synthetic and the real-finger (fusion) paths so the aim math is identical.
 //
-// `deadzonePx` is the global PER-AXIS stop radius: X freezes when |target.x -
-// centre.x| <= deadzonePx and Y freezes when |target.y - centre.y| <= deadzonePx
-// (decoupled, not a single radial circle — see the deadzone note below). `yDzPx`
-// is the per-class Y-only stop band, a wider/narrower band than the global one:
-// once the crosshair is vertically within `yDzPx` of the target centre, Y freezes
-// and X keeps tracking on its own.
+// `dzXPx` / `dzYPx` are the global PER-AXIS stop radii — X freezes when
+// |raw.x - centre.x| <= dzXPx, Y when |raw.y - centre.y| <= dzYPx (decoupled per
+// axis, not one radial circle), each one a fraction of the target's OWN half
+// width / half height, with 1.0 landing exactly on the box edge. `yDzPx` is the
+// per-class Y-only band, a wider or narrower one: once the crosshair is
+// vertically within `yDzPx` of the box centre, Y freezes and X keeps tracking.
+//
+// ROUND 17: all three are measured against `rawTarget` — the box centre the HUD
+// draws — and NOT against `target`, which is the same point pushed along the
+// tracker's velocity by the 延迟补偿 lead. The distinction is the whole fix for
+// "准心一直锁在框旁边": with any lead the aim's OWN equilibrium sits v×lead off
+// the box, so a band centred on the lead point happily declares "on target" while
+// the crosshair is one box away from the enemy — and it stays there, because an
+// equilibrium is not a transient. The controller still gets the lead-shifted
+// error (`target`), so the lead still helps the approach; it just cannot decide
+// where the aim comes to rest any more.
 //
 // `physDeltaX/Y`: the player's physical finger movement this frame, in screen
 // px. Only the component that points the SAME WAY as the aim is added — the
@@ -254,10 +277,12 @@ bool realFingerInTouchArea(int& outId, float& outX, float& outY) {
 // because the tracker reports the box's SCREEN velocity, which the aim itself
 // nulls. The controller now returns the complete displacement for the step.
 static void driveAimToTarget(TouchAimState& st, int slot,
-                             const ImVec2& target, const ImVec2& screenCenter,
-                             const ImGuiIO& io, float deadzonePx, float yDzPx,
+                             const ImVec2& target, const ImVec2& rawTarget,
+                             const ImVec2& screenCenter,
+                             const ImGuiIO& io, float dzXPx, float dzYPx,
+                             float yDzPx,
                              float physDeltaX, float physDeltaY,
-                             bool targetChanged) {
+                             bool targetChanged, bool measurementCorrected) {
     // The control step, in seconds. This used to be discarded ((void)io) on the
     // grounds that the controller was "frame-rate independent" — it was not, it
     // was frame-rate DEPENDENT: the loop runs at 120 Hz while the panel is up or
@@ -281,11 +306,21 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     // circle even when Y is at rest, dragging X onto the target centre.  Per-axis
     // freezing holds whichever axis is already inside its band.  The reference is
     // the SCREEN CENTRE (the crosshair), not the live finger.
+    //
+    // ROUND 17: the error that DRIVES the controller and the error that DECIDES
+    // the freeze are now deliberately two different numbers. `dex/dey` are the
+    // lead-shifted error (what the loop is asked to null, and so what `e` on the
+    // log line means); `rdx/rdy` are measured from the RAW box centre — the box
+    // the HUD draws. Only the second one can answer "is the crosshair on the
+    // target", because with a lead the first is null exactly when the crosshair
+    // is v×lead OUTSIDE the box. See the round-17 note on the signature above.
     const float dex = target.x - screenCenter.x;
     const float dey = target.y - screenCenter.y;
-    const bool xInDz  = deadzonePx > 0.0f && dex * dex <= deadzonePx * deadzonePx;
-    const bool yInDz  = deadzonePx > 0.0f && dey * dey <= deadzonePx * deadzonePx;
-    const bool yInYFollow = yDzPx > 0.0f && dey * dey <= yDzPx * yDzPx;
+    const float rdx = rawTarget.x - screenCenter.x;
+    const float rdy = rawTarget.y - screenCenter.y;
+    const bool xInDz  = dzXPx > 0.0f && rdx * rdx <= dzXPx * dzXPx;
+    const bool yInDz  = dzYPx > 0.0f && rdy * rdy <= dzYPx * dzYPx;
+    const bool yInYFollow = yDzPx > 0.0f && rdy * rdy <= yDzPx * yDzPx;
 
     float pidX = 0.0f, pidY = 0.0f;
     // Controller takes the raw error (target - crosshair) and returns the finger
@@ -305,8 +340,15 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     // confirmed track", so it can land on a different enemy in one step, and
     // the controller has to be told rather than left to guess from the size of
     // the error jump. See TouchAimState::lastTargetId.
+    // `measurementCorrected` goes down with `targetChanged` and for the same
+    // reason: the caller knows something about the INPUT that the controller
+    // cannot recover from it. On a corrected step Δe is the tracker's model
+    // velocity plus the correction kick, and the kick grows with how far we
+    // rotated the view — so without this flag the reconstruction reads the
+    // loop's own handwriting as target motion, at gain kf through the
+    // feed-forward and at gain 1 through carry → the integrator.
     st.aim.step(dex, dey, dt, xInDz, (yInDz || yInYFollow), targetChanged,
-                pidX, pidY);
+                measurementCorrected, pidX, pidY);
 
     // ── Aim telemetry ──────────────────────────────────────────────────────
     // Deliberately at the aim's own rate rather than per frame: the numbers a
@@ -369,6 +411,16 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     //             selection pass already keeps) — the same px/s is a different
     //             physical motion on a distant box and one at contact range, so
     //             "it keeps up" is only meaningful at a stated box size.
+    //   stop  : 1 when the STOP DETECTOR (round 17) has that axis held at rest
+    //             — the measured carrier has read ~0 for 100 ms — and is
+    //             therefore bleeding the trim toward it. Read it as a GROUP of
+    //             three: `stop` engaged with `trim` falling toward `cr` is the
+    //             mechanism working (the shake a high ki leaves after a target
+    //             stops is being cleared); `stop` engaged with `trim` NOT falling
+    //             means the accumulation is outrunning the bleed; `stop` = 0
+    //             while the crosshair sits still means `cr` is not reading 0, so
+    //             the reconstruction is being fed a velocity the target does not
+    //             have — check `a` before touching ki.
     //   id      : the track being engaged. A value that changes several times a
     //             second is a selection/identity problem, not a control problem,
     //             and no gain will fix it — read the tracker line's id list.
@@ -379,15 +431,24 @@ static void driveAimToTarget(TouchAimState& st, int slot,
         if (++sTick >= 480) {
             LOGI("aim: id=%d mean e=(%.1f,%.1f) tot=(%.2f,%.2f) "
                  "ff=(%.1f,%.1f) cr=(%.1f,%.1f) d=(%.2f,%.2f) trim=(%.1f,%.1f) "
-                 "kf=%.2f a=%.2f%s lim=%.0f yard=%.0f dt=%.1fms",
+                 "kf=%.2f a=%.2f%s stop=(%d,%d) lim=%.0f yard=%.0f dt=%.1fms",
                  st.lastTargetId,
                  sSumX / sTick, sSumY / sTick, pidX, pidY,
                  st.aim.ffX(), st.aim.ffY(),
                  st.aim.carryX(), st.aim.carryY(),
                  st.aim.derivX(), st.aim.derivY(),
                  st.aim.trimX(), st.aim.trimY(),
+                 // ROUND 19: `kf` prints the strength ACTUALLY in force — the
+                 // slider's value once the guard is open — and the single
+                 // character after `a` says which state the plant-gain estimate is
+                 // in: `*` both fits agree and the cap is OFF, `!` the cap is
+                 // still ON, `?` no fit has ever succeeded (alpha_hat is still the
+                 // seed). Reading `kf` BELOW the slider together with `!` is the
+                 // guard working, not a fault; `*` on a moving target is the state
+                 // the whole round is trying to reach.
                  st.aim.ffGainValue(), st.aim.alphaHatValue(),
-                 st.aim.alphaValid() ? "" : "?",
+                 st.aim.alphaCorroborated() ? "*" : (st.aim.alphaValid() ? "!" : "?"),
+                 st.aim.stoppedX() ? 1 : 0, st.aim.stoppedY() ? 1 : 0,
                  st.aim.outLimitPx(),
                  st.lastTargetBox, dt * 1000.0f);
             sTick = 0; sSumX = 0.0f; sSumY = 0.0f;
@@ -789,9 +850,16 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     };
 
     // ── Controller parameters ───────────────────────────────────────────────
-    // All three gains are per control step now and share one unit system — see
-    // the class note in tracking/pid_controller.h for what each one does and the
-    // measured grid behind its default.
+    // All FOUR gains are per control step and share one unit system — see the
+    // class note in tracking/pid_controller.h for what each one does, and the
+    // note on PageAim for why the shipped set is what it is (Kp 0.04 / Ki 0.12 /
+    // Kd 0.15 / Kf 0.05).
+    //
+    // The order is deliberate and is the order they act in: Kp (proportional),
+    // Ki (the standing carrier), Kd (damping), Kf (the measured lead). Kf sits
+    // directly under Kd as of round 18 — it is the fourth gain, so it belongs
+    // beside the other three rather than after the two filter rows, and it is
+    // spelt with a capital K to match them.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kp,        "Kp",       2, es);
     y += rowSl + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ki,        "Ki",       2, es);
@@ -801,46 +869,71 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // few pixels). Two decimals match the 0.05 step.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kd,        "Kd",       2, es);
     y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.outSmooth, "输出平滑", 2, es);
-    y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.aimDelayFrames,        "延迟补偿",  2, es);
-    y += rowSl + gap;
-    // kf — the velocity feed-forward STRENGTH (0.00–0.50, step 0.01, default
-    // 0.05). The row is labelled "kf" and nothing else, because that is the
-    // number the user asked to be able to set precisely.
+    // Kf — the velocity feed-forward STRENGTH (0.00–0.50, step 0.01, default
+    // 0.05). It is NOT a calibration any more. Round 10 demanded kf = 1/alpha
+    // (the reciprocal of the game's sensitivity in view px per finger px), and
+    // that is what broke it: the number then did two jobs, and expanding the
+    // formula shows the second job was "add our own delayed command back into the
+    // input, with gain exactly 1". A pole at z = 1. It tracked and never settled
+    // and overshot when the target stopped, all from the same cause.
     //
-    // It is NOT a calibration any more. Round 10 demanded kf = 1/alpha (the
-    // reciprocal of the game's sensitivity in view px per finger px), and that is
-    // what broke it: the number then did two jobs, and expanding the formula
-    // shows the second job was "add our own delayed command back into the input,
-    // with gain exactly 1". A pole at z = 1. It tracked and never settled and
-    // overshot when the target stopped, all from the same cause.
+    // ROUND 15 — THE RANGE IS THE USER'S: 0.50 is the ceiling because the residual
+    // self-copy coefficient s = kf·(1 − alpha/alpha_hat) cannot leave the unit
+    // circle there even with the estimator off by 2×, so every position of the row
+    // is usable and none of them is a runway.
     //
-    // ROUND 15 — THE RANGE IS THE USER'S. He tuned the loop with kf at 0
-    // (kp 0.05 / ki 0.20 / kd 0.26) and it holds a moving target steadily, so the
-    // feed-forward is no longer the DC carrier in this build: the integral is,
-    // now that its leash is 150 and it unwinds at 6×. That makes kf a TRIM, and
-    // a trim belongs on a short, densely-stepped slider rather than on one that
-    // exists to reach a carrier. 0.50 is the ceiling for a reason that still
-    // holds from round 14 — the residual self-copy coefficient
-    // s = kf·(1 − alpha/alpha_hat) cannot leave the unit circle there even with
-    // the estimator off by 2× — so every position of the row is usable and none
-    // of them is a runway.
+    // HOW TO SET IT. 0 is a complete setting — the integral learns the target's
+    // velocity by itself and the feed-forward does nothing. Raise it to take
+    // high-frequency load OFF the integral (a strafe whose error keeps one sign
+    // and never quite closes), and stop as soon as the error stops showing a
+    // sign; past that all it does is pass the tracker's noise to the finger,
+    // amplified by kf/alpha_hat. The shipped 0.05 is a trim on top of the
+    // integral, and it is what lets the shipped Ki be as low as 0.12.
     //
-    // HOW TO SET IT, now that the integral carries the load. 0 is a complete
-    // setting: the aim follows, the integral learns the target's velocity and the
-    // feed-forward does nothing. Raise it only to take high-frequency load off
-    // the integral (a strafe whose error keeps one sign and never quite closes),
-    // and stop as soon as the error stops showing a sign — past that all it does
-    // is pass the tracker's noise to the finger, amplified by kf/alpha_hat.
-    //
-    // Its row was 速度前馈 once, feeding an estimator that was structurally a
-    // bare integrator (it measured its own output with no restoring term, so it
+    // Its row was 速度前馈 once, feeding an estimator that was structurally a bare
+    // integrator (it measured its own output with no restoring term, so it
     // oscillated — 1453 px peak-to-peak at alpha = 2.5), and it was briefly two
     // rows (this one plus 灵敏度补偿). Both are gone.
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ffGain,              "kf",  2, es);
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ffGain,    "Kf",       2, es);
     y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.trackPredictHoldFrames,"预测帧数",  0, es);
+    // 输出平滑 — EMA on the controller's OWN output. 0..1, where 1.0 is OFF.
+    //
+    // WHAT IT IS FOR: the finger command is a position delta per step, and every
+    // term in it carries the tracker's frame-to-frame noise — D most of all,
+    // because it differences a noisy signal, and F with it. This row is the last
+    // filter before that noise reaches the game as visible crosshair jitter. It
+    // does not change WHERE the loop settles, only how rough the ride there is.
+    //
+    // WHAT IT COSTS: an EMA is pure phase lag, and phase lag is the one thing a
+    // delay-limited loop cannot afford — it eats the phase margin Kd just bought.
+    // That is why it shipped at 1.0 (off) for years. 0.85 keeps a real cut of the
+    // step-to-step noise for a small, bounded lag: raise it toward 1.0 if the aim
+    // feels sluggish or overshoots, lower it if the crosshair visibly trembles.
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.outSmooth, "输出平滑", 2, es);
+    y += rowSl + gap;
+    // 延迟补偿 — the loop's ONLY lead term, in detector frames:
+    //     target += trackerVelocity × this
+    //
+    // WHAT IT IS FOR: the screenshot the detector saw is already a few frames old
+    // by the time a touch lands, so a target moving at v px/frame is v·(that
+    // delay) px further along than the box says. This term aims that far ahead, so
+    // the loop stops lagging a moving target. That is its whole job.
+    //
+    // WHAT IT COSTS: it enters the output through Kp — the same channel as Kf —
+    // and, more subtly, it used to MOVE THE POINT THE LOOP CONSIDERS "ARRIVED".
+    // A lead is a steady-state offset: while the target keeps moving, v is
+    // non-zero, so the aim could sit satisfied at box centre + v·this, which is
+    // outside the box. That is exactly the round-17 "准心一直锁在框旁边" report,
+    // and "移动一下屏幕就正常了" was its fingerprint (a re-association zeroes the
+    // track's velocity, so the offset collapses). Round 17's fix is that the
+    // deadzone and the error are measured against the RAW box centre — see
+    // rawTarget in syncAimPage — so this term shifts what the loop aims AT but
+    // never what counts as on-target.
+    //
+    // Range 0–5, step 0.05. Raise it if the crosshair trails a steadily moving
+    // target; lower it (or zero it) if it overshoots one that changes direction —
+    // a lead is a bet that the target keeps going.
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.aimDelayFrames, "延迟补偿", 2, es);
     y += rowSl + gap;
     // 输出限幅 used to be a row here, and it never was a tuning parameter: it is
     // the ceiling that stops a re-lock from flinging the finger across the panel.
@@ -1024,11 +1117,9 @@ void drawAimOverlays() {
 void syncAimPage() {
     PageAim& p = g_pageAim;
 
-    // Publish the predictHoldFrames slider (Aim page) into the global
-    // tracker config. syncSettingsPage() publishes trackIou/Confirm/Terminate;
-    // this is the Aim-page half of the tracker tuning. Cheap scalar write.
-    tracking::trackerConfig().predictHoldFrames =
-        static_cast<int>(p.trackPredictHoldFrames.value + 0.5f);
+    // 丢框预测帧数 (predictHoldFrames) used to be published here. It moved to the
+    // Settings page in round 18 — it is tracker behaviour, not a gain, and it
+    // belongs next to 丢失帧; syncSettingsPage() writes it now.
 
     // ── Pull the latest class list off the model every frame ──────────────
     // Cheap — `snapshot()` copies a small struct and a short vector. The
@@ -1085,8 +1176,18 @@ void syncAimPage() {
     // those, so the ripple comes out as finger shake. `detSeq` is bumped under
     // the same lock that swaps the list, so comparing it is exact.
     static uint64_t aimLastDetSeq = 0;
+    // Hoisted out of the `snap.active` block (round 20) because the aim loop
+    // below needs it too. It is the difference between the two laws the tracker's
+    // published centre follows: on a step with NO new detector result, predictAll
+    // advanced it by exactly its own (vx, vy); on a step WITH one, matchAndUpdate
+    // pulled it back onto a measurement that is already a render frame old. Only
+    // the first is a velocity, and the controller has to be told which step it is
+    // looking at — see the `measurementCorrected` parameter of
+    // AimController::update(). Default is the permissive one, so a frame with no
+    // tracker running can never gate anything off.
+    bool freshDetections = true;
     if (snap.active) {
-        const bool freshDetections = (snap.detSeq != aimLastDetSeq);
+        freshDetections = (snap.detSeq != aimLastDetSeq);
         aimLastDetSeq = snap.detSeq;
         // No timestep is passed. The tracker's motion model is one RENDER frame
         // per call and its velocity is px per render frame, so the rate is
@@ -1254,22 +1355,100 @@ void syncAimPage() {
     // an explicit bet that the target keeps going, so it is left to the user and
     // off by default; the feed-forward does the actual lag-killing, and it does
     // it without needing this signal at all.
+    // ── ROUND 17: keep the RAW centre alongside the lead-shifted one ──────────
+    // This pair is the fix for "准心一直锁在框旁边，框在左边". The lead point is
+    // where the loop is TOLD to converge, so it is also a genuine EQUILIBRIUM:
+    // with any lead at all the aim comes to rest at e ≈ 0 with the crosshair at
+    // boxCentre + v×lead — up to a whole box off the target — and it stays there
+    // for as long as the target keeps moving. The deadzone is therefore measured
+    // against `rawTarget` (the box the HUD draws, i.e. the box the user sees)
+    // while the controller still receives the lead-shifted error, so lead keeps
+    // buying the approach and no longer gets a vote on where the aim parks.
+    // That is also why "移动一下屏幕就正常了": a re-association zeroes the
+    // track's velocity, the v×lead offset collapses to 0, and the aim falls back
+    // onto the box. See the round-17 note on PageAim::deadzone.
+    const ImVec2 rawTarget = target;   // the box centre, before any lead
+    // ── ROUND 19c: the velocity the lead multiplies MUST be low-passed ────────
+    //
+    // This is the FOURTH copy of one mistake, and the only one still live. The
+    // note above lists the other three: `bestVel * 1/alpha`, the self-calibrating
+    // estimator, and the gate around it. All three were removed for the same
+    // reason — the tracker's velocity is the box's SCREEN velocity and the aim's
+    // own output is inside it, so anything that multiplies it feeds our own
+    // command back into the loop through a delay. The one that oscillated did so
+    // at 1453 px peak-to-peak at alpha = 2.5. The lead never got the same
+    // treatment because it is multiplied by a slider that defaults to 0, so it
+    // was assumed to be off; it is not off for a user who turns it up, and it
+    // is the same plant.
+    //
+    // WHY IT IS NOT BOUNDED BY ANY GAIN ROW. The velocity's own time constant is
+    // 1.4 render frames (K_vel = 0.422 — see the note above), i.e. it is a
+    // DIFFERENTIATOR, not an estimate. Lead multiplies that by a frame count and
+    // adds the product to the point the loop is told to converge to, so the loop
+    // sees tau x (d/dt of box position) — and the box's position contains
+    // alpha x u. A differentiator inside a delay loop is a phase LEAD, and the
+    // gain around it is tau x alpha x (how hard the aim is driving): kp, ki and
+    // kf only set how hard "how hard" is. That is why "kf 随便拉都震荡" was
+    // literally true, why ki = 0.01 did not help, and why the swing only appears
+    // while the crosshair is ON the target (that is when the loop is driving and
+    // when the deadzone stops absorbing the wobble). The user's own measurement
+    // is the cleanest evidence there is: at 延迟补偿 = 0.2 it "一直不停的抖根本
+    // 不平衡", at 0 it went smooth, and it "又好了" once turned back on after the
+    // loop had settled.
+    //
+    // THE FIX IS A SEPARATION OF BANDS, not a gain. The ring and the self-term
+    // both live at the detector's rate (they are frame-to-frame differences of a
+    // noisy measurement), while the thing the lead is trying to predict — where
+    // the enemy will be 0-5 render frames from now — is a target that changes
+    // direction over hundreds of milliseconds. One first-order low-pass on the
+    // LEAD'S OWN COPY separates them: the ring is attenuated by ~10x, the target's
+    // real motion passes nearly untouched, and nothing the controller consumes is
+    // changed — the track keeps its raw velocity for everything else.
+    //
+    // The filter is re-seeded on a track CHANGE (a new enemy has a different
+    // velocity and no history here is meaningful) and cleared when the lead is
+    // off, so switching the slider on starts from the measurement rather than
+    // from a stale value. This does NOT remove the self-term — alpha_hat being
+    // right is what does that, exactly as it does for the feed-forward — it
+    // removes the part of it that lives above the target's own bandwidth, which
+    // is where the oscillation is.
+    static float leadVelX = 0.0f;
+    static float leadVelY = 0.0f;
+    static int   leadVelId = -1;
     if (hasTarget && p.aimDelayFrames.value > 0.0f) {
-        target.x += bestVelX * p.aimDelayFrames.value;
-        target.y += bestVelY * p.aimDelayFrames.value;
+        const float dtl = std::clamp(io.DeltaTime, 1.0f / 2000.0f, 0.2f);
+        const float av  = dtl / (dtl + kLeadVelTauSec);
+        if (bestId != leadVelId) {          // new track: no history, take the sample
+            leadVelX  = bestVelX;
+            leadVelY  = bestVelY;
+            leadVelId = bestId;
+        } else {
+            leadVelX += (bestVelX - leadVelX) * av;
+            leadVelY += (bestVelY - leadVelY) * av;
+        }
+        target.x += leadVelX * p.aimDelayFrames.value;
+        target.y += leadVelY * p.aimDelayFrames.value;
+    } else {
+        leadVelId = -1;                     // lead off: do not carry a stale velocity in
     }
 
-    // ── Aim deadzone: 0.0 = move onto the target CENTRE; 1.0 = stop at the
-    // target EDGE. The stop radius is a fraction of the target box's half-size
-    // (min(w,h)/2), so it is resolution- and distance-independent: 0.1 still
-    // nudges well onto the target, 1.0 stops as soon as the target's nearest
-    // edge reaches the crosshair. 0.0 = converge to the exact centre.
+    // ── Aim deadzone: 0.0 = move onto the target CENTRE; 1.0 = stop with the
+    // crosshair anywhere inside the box. Distance- and resolution-independent,
+    // because the radius is a fraction of the TARGET'S OWN box.
+    //
+    // ROUND 17 — the radius is now PER AXIS (X: w/2, Y: h/2). It used to be
+    // `value * 0.5*min(w,h)` for BOTH axes, so on a tall box the X band was a
+    // third of the X half-width it claimed to be; "框内的百分比" is per axis or it
+    // is not a percentage of the box at all. The per-class Y band below was
+    // already h-based, which is why the two disagreed on anything but a square.
     const float targetHalf = std::min(targetW, targetH) > 0.0f
         ? 0.5f * std::min(targetW, targetH)
         : 0.02f * std::min(io.DisplaySize.x, io.DisplaySize.y);
-    const float deadzonePx = (hasTarget && p.deadzone.value > 0.0f)
-        ? p.deadzone.value * targetHalf
-        : 0.0f;
+    const float boxHalfW = targetW > 0.0f ? 0.5f * targetW : targetHalf;
+    const float boxHalfH = targetH > 0.0f ? 0.5f * targetH : targetHalf;
+    const bool  dzOn     = hasTarget && p.deadzone.value > 0.0f;
+    const float dzXPx    = dzOn ? p.deadzone.value * boxHalfW : 0.0f;
+    const float dzYPx    = dzOn ? p.deadzone.value * boxHalfH : 0.0f;
 
     // ── Per-class Y deadzone: stop band is v * box half-height ─────────────
     // v = 0 → band 0, Y chases the middle precisely (today's behaviour).
@@ -1278,9 +1457,7 @@ void syncAimPage() {
     float yFollowV = 0.0f;
     const auto yfIt = p.yFollow.find(bestCls);
     if (yfIt != p.yFollow.end()) yFollowV = std::clamp(yfIt->second.value, 0.0f, 1.0f);
-    const float yDzPx = (hasTarget && yFollowV > 0.0f)
-        ? yFollowV * (targetH > 0.0f ? targetH * 0.5f : targetHalf)
-        : 0.0f;
+    const float yDzPx = (hasTarget && yFollowV > 0.0f) ? yFollowV * boxHalfH : 0.0f;
 
     // ── Did the selection land on a DIFFERENT ENEMY this frame? ──────────────
     // The controller must be told, because it cannot tell a switch from the
@@ -1412,9 +1589,9 @@ void syncAimPage() {
                 // No assist on the takeover frame: the finger has not moved since
                 // the anchor was taken, and passing a delta here would double-count
                 // the very movement that put it inside the box.
-                driveAimToTarget(p.touchAim, slot, target, screenCenter, io,
-                                 deadzonePx, yDzPx, 0.0f, 0.0f,
-                                 targetChanged);
+                driveAimToTarget(p.touchAim, slot, target, rawTarget,
+                                 screenCenter, io, dzXPx, dzYPx, yDzPx,
+                                 0.0f, 0.0f, targetChanged, freshDetections);
                 return;
             }
             // Not available this frame: the finger is not mirrored yet (mirror
@@ -1469,16 +1646,16 @@ void syncAimPage() {
             p.touchAim.release();
             return;
         }
-        driveAimToTarget(p.touchAim, p.touchAim.slot, target, screenCenter, io,
-                         deadzonePx, yDzPx, physDeltaX, physDeltaY,
-                         targetChanged);
+        driveAimToTarget(p.touchAim, p.touchAim.slot, target, rawTarget,
+                         screenCenter, io, dzXPx, dzYPx, yDzPx,
+                         physDeltaX, physDeltaY, targetChanged, freshDetections);
         return;
     }
 
     // Synthetic finger path (fusion OFF, or fusion ON with no finger in the box).
-    driveAimToTarget(p.touchAim, p.touchAim.slot, target, screenCenter, io,
-                     deadzonePx, yDzPx, physDeltaX, physDeltaY,
-                     targetChanged);
+    driveAimToTarget(p.touchAim, p.touchAim.slot, target, rawTarget,
+                     screenCenter, io, dzXPx, dzYPx, yDzPx,
+                     physDeltaX, physDeltaY, targetChanged, freshDetections);
 
     // Drag safety (synthetic only): if the finger has travelled too far from its
     // press point, lift it. The next frame re-presses at the touch area, so the
