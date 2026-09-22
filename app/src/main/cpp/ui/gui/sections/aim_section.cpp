@@ -324,17 +324,20 @@ static void driveAimToTarget(TouchAimState& st, int slot,
 
     float pidX = 0.0f, pidY = 0.0f;
     // Controller takes the raw error (target - crosshair) and returns the finger
-    // displacement for this step, in px. The two deadzone flags gate that axis's
-    // integrator RATE, never its CONTRIBUTION: P and D stop driving (they are
-    // what amplify the detector's jitter — the band's real purpose), the trim
-    // stops accumulating and is bled toward the carrier the reconstruction
-    // measures the target to need (carry = ffVel/alpha_hat — 0 at rest, the
-    // standing carrier on a strafe), and it is STILL ADDED to the output. Round
-    // 15 suppressed the contribution as well, which turned the band into a
-    // bang-bang in a per-step DISPLACEMENT and read on the device as 乱甩乱晃;
-    // see the round-16 section of tracking/pid_controller.h. The raw error still
-    // reaches the derivative term so its state stays continuous; otherwise it
-    // spikes every time the target crosses the stop band.
+    // displacement for this step, in px. The two deadzone flags freeze that axis:
+    // P and D are zeroed, and the trim stops ACCUMULATING (its leak and its
+    // same-sign zeroing keep running). Everything else about the axis is left
+    // alone, and in particular the PREDICTION TERM IS NOT GATED — the band exists
+    // to stop the loop chasing the detector's box jitter, and the prediction term
+    // is not chasing anything, it is the command a moving target requires.
+    // ★ R23 removed the last piece of the old freeze: the trim no longer needs to
+    // be bled toward a measured carrier, because the carrier now lives in the
+    // prediction term, so "pause the accumulation" is the whole job.
+    // Round 15 dropped the trim's CONTRIBUTION instead of its rate, which turned
+    // the band into a bang-bang in a per-step DISPLACEMENT and read on the device
+    // as 乱甩乱晃; see the round-16 section of tracking/pid_controller.h. The raw
+    // error still reaches the derivative term so its state stays continuous;
+    // otherwise it spikes every time the target crosses the stop band.
     //
     // `targetChanged` is passed straight through: the selection is "nearest
     // confirmed track", so it can land on a different enemy in one step, and
@@ -345,8 +348,10 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     // cannot recover from it. On a corrected step Δe is the tracker's model
     // velocity plus the correction kick, and the kick grows with how far we
     // rotated the view — so without this flag the reconstruction reads the
-    // loop's own handwriting as target motion, at gain kf through the
-    // feed-forward and at gain 1 through carry → the integrator.
+    // loop's own handwriting as target motion, at gain `lookahead` through the
+    // prediction term. (R23: that reconstruction now feeds ONLY the prediction
+    // term. The trim used to read it as well, at gain 1, which is why this flag
+    // used to matter twice over.)
     st.aim.step(dex, dey, dt, xInDz, (yInDz || yInYFollow), targetChanged,
                 measurementCorrected, pidX, pidY);
 
@@ -399,62 +404,70 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     //             the target strafes means it is holding a steady offset → read
     //             `ff` next: if the feed-forward is idle, that is a 前馈增益
     //             problem, not a kp one.
-    //   tot     : the controller's total output this step, in finger px. On a
-    //             strafing target this should settle at about ΔT/alpha, i.e.
-    //             (v/120)·(1/alpha): 5 for 600 px/s at alpha = 1.0, 50 at
-    //             alpha = 0.1. A `tot` much smaller than that IS the "跟不上"
-    //             failure. Two different causes, and `ff`/`trim`/`lim` tell them
-    //             apart: `ff` near 0 with `trim` pinned means the feed-forward is
-    //             not running (raise 前馈增益); `tot` near `lim` means the finger
-    //             cannot travel further in one step — the game's sensitivity is
-    //             below what this ceiling can serve.
-    //   ff      : the velocity feed-forward's contribution, in px. THE number to
-    //             watch on a moving target — it should settle at about ΔT/alpha
-    //             and HOLD there. It is the term that removes the lag without
-    //             winding up, so if the aim still trails while `ff` sits near
-    //             zero, that is the whole problem and nothing about kp will fix
-    //             it: raise 前馈增益. At kf = 0 it is zero BY DESIGN — read `cr`.
-    //   cr      : the carrier the reconstruction MEASURES the target to need, in
-    //             finger px/step — the same units as `trim`, and not scaled by
-    //             kf. Read it against `trim`: on a strafe the two should converge
-    //             (they are the same quantity, one measured and one accumulated),
-    //             and at rest both should read 0. trim far above cr on a moving
-    //             target means the trim is carrying more than the measurement
-    //             asks for; trim near 0 while cr is large means the loop is not
-    //             being allowed to build the carrier at all. This field is also
-    //             what the DEADZONE bleeds the trim toward, so while standing
-    //             still with the crosshair on target, cr -> 0 IS the deadzone
-    //             working.
+    //   tot     : the controller's total output this step, in finger px. This is
+    //             the only field that needs the plant gain to interpret, and the
+    //             plant gain is not knowable here — so read it RELATIVELY. At a
+    //             steady lock the rest of the line is pinned to it: `ff` should be
+    //             about kf × tot, and `v` about 0.10 × tot (kSensFrozen × tot).
+    //             Those two ratios locate the fault without ever needing alpha.
+    //             `tot` near `lim` means the finger cannot travel further in one
+    //             step — the game's sensitivity is below what that ceiling can
+    //             serve, so raise the ceiling constant, not the gains.
+    //   ff      : the prediction term's contribution, in finger px. THE number to
+    //             watch on a moving target. At a steady lock it should settle at
+    //             about kf × tot (further scaled by `tr` and `og`) and HOLD there:
+    //             this is the term that removes the lag without winding up. If the
+    //             aim still trails while `ff` sits far BELOW kf × tot, the term is
+    //             being THROTTLED rather than mis-tuned — read `tr` and `vok`
+    //             before touching kf. At kf = 0 it is zero BY DESIGN.
+    //   v       : the reconstructed target speed, in SCREEN px/step. Read it
+    //             against `tot`, never against the target's real speed: at a
+    //             steady lock the reconstruction is kSensFrozen × our own command,
+    //             so `v ≈ 0.10 × tot` is the EXPECTED reading there. `v` far below
+    //             that while `tot` is large means the reconstruction is not seeing
+    //             our own output — check `vok` first, and only then the tracker.
+    //             `v` collapsing to ~0 within a few frames of the target stopping
+    //             IS the stop mechanism working (this replaced `cr`).
     //   d       : the damping term's contribution, in px. Pinned near 0 with
     //             kd > 0 means the damping term is dead; comparable to the
     //             feedback means kd is carrying the loop and kp has room.
-    //   trim    : the integrator — now the RESIDUAL cleaner, not the DC carrier
-    //             (the feed-forward does that). It should therefore stay SMALL.
-    //             A large `trim` together with a small `ff` on a moving target
-    //             means kf is wrong, by roughly the ratio between them.
-    //             Pinned at its ceiling means the requirement exceeds what the
-    //             loop may deliver even with the feed-forward: the aim is at its
-    //             physical limit. See kTrimLimitPx.
+    //   trim    : the integrator — the RESIDUAL cleaner, not the DC carrier (the
+    //             prediction term does that). It should therefore stay SMALL. A
+    //             large `trim` together with a small `ff` on a moving target means
+    //             kf is wrong, by roughly the ratio between them. Pinned at its
+    //             ceiling means the requirement exceeds what the loop may deliver
+    //             even with the feed-forward: the aim is at its physical limit.
+    //             See kAimTrimLimitPx.
+    //   p       : the prediction term's raw contribution, in finger px — `ff`
+    //             BEFORE the trust gate and the lookahead scaling. A healthy `p`
+    //             with a suppressed `ff` points at the gate, not at the estimate.
     //   kf / lim
-    //           : 前馈增益 in force, and the output ceiling it works against
-    //             (finger px/step, a constant 180). Read them together with `ff`:
-    //             a strafing target whose `ff` stays near 0 while `mean e` holds
-    //             one sign is the whole "跟不上" failure, and the answer is a
-    //             larger kf, not a larger kp. `yard` is the target's size (half
-    //             its longer side, the "how far away is it" yardstick the
-    //             selection pass already keeps) — the same px/s is a different
-    //             physical motion on a distant box and one at contact range, so
-    //             "it keeps up" is only meaningful at a stated box size.
-    //   stop  : 1 when the STOP DETECTOR (round 17) has that axis held at rest
-    //             — the measured carrier has read ~0 for 100 ms — and is
-    //             therefore bleeding the trim toward it. Read it as a GROUP of
-    //             three: `stop` engaged with `trim` falling toward `cr` is the
-    //             mechanism working (the shake a high ki leaves after a target
-    //             stops is being cleared); `stop` engaged with `trim` NOT falling
-    //             means the accumulation is outrunning the bleed; `stop` = 0
-    //             while the crosshair sits still means `cr` is not reading 0, so
-    //             the reconstruction is being fed a velocity the target does not
-    //             have — check `a` before touching ki.
+    //           : 前馈增益 in force (0.00–0.80 — the prediction term's share of the
+    //             carrier, and the < 1 is the stability margin, not a taste) and
+    //             the output ceiling it works against, in finger px/step. Read
+    //             them together with `ff`: a strafing target whose `ff` stays near
+    //             0 while `mean e` holds one sign is the whole "跟不上" failure,
+    //             and the answer is a larger kf, not a larger kp. `yard` is the
+    //             target's size (half its longer side, the "how far away is it"
+    //             yardstick the selection pass already keeps) — the same px/s is a
+    //             different physical motion on a distant box and one at contact
+    //             range, so "it keeps up" is only meaningful at a stated box size.
+    //   tr      : TRUST in the velocity estimate, 0..1 per axis — the gate on the
+    //             prediction term. On an ordinary strafe it should read 0.85+.
+    //             Persistently below ~0.5 while the target moves smoothly means the
+    //             gate is mis-scaled (kTrustVelScale) and is taxing the carrier:
+    //             the symptom is "能跟枪但总差一口气", never a shake. This replaced
+    //             the old `stop`/`a` group — there is no stop detector to read now,
+    //             because `v` going to 0 IS the stop.
+    //   og      : the output gain, 0.35–1.0. It falls when the error is large, so a
+    //             LOW `og` is expected just after a re-lock and during a jump. If it
+    //             stays low while `mean e` is small, something is scaling the output
+    //             that should not be.
+    //   vok     : 1 when the reconstruction was refreshed this step, 0 when the
+    //             step REUSED the previous estimate because the tracker had just
+    //             re-anchored onto a detector result. A long run of 0 on a moving
+    //             target means the estimate is starved and the prediction term has
+    //             nothing to build from — a tracker-side problem, not a gain.
     //   id      : the track being engaged. A value that changes several times a
     //             second is a selection/identity problem, not a control problem,
     //             and no gain will fix it — read the tracker line's id list.
@@ -490,14 +503,19 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     }
 
     // The per-axis freeze has ALREADY been applied inside the controller, and it
-    // is not a plain "zero this axis" and not a "drop the integral" either: P and
-    // D stop driving, the trim is bled toward the measured carrier — and bled, not
-    // removed — and the FEED-FORWARD is added as always. So the caller must NOT
-    // zero the axis here; that would throw away the one term that is legitimately
-    // still acting and turn the band into "the axis stops dead". Round 15 dropped
-    // the integral's contribution inside the band instead, and with kf = 0 that
-    // zeroed the axis completely: see the round-16 section of
-    // tracking/pid_controller.h and PPID::update()'s `frozen` note.
+    // is not a plain "zero this axis": P and D are zeroed and the trim stops
+    // accumulating, but the trim is still ADDED (its leak keeps running, so a
+    // charge left over from before the band decays rather than being cut) and the
+    // PREDICTION TERM is added as always. So the caller must NOT zero the axis
+    // here — that would throw away the one term that is legitimately still acting
+    // and turn the band into "the axis stops dead". Round 15 dropped the integral's
+    // contribution inside the band instead, and with kf = 0 that zeroed the axis
+    // completely: see the round-16 section of tracking/pid_controller.h and
+    // PPID::update()'s `frozen` note.
+    // ★ R23: the carrier moved out of the trim and into the prediction term, which
+    // is what makes "freeze = pause the accumulation" sufficient. Under the old
+    // controller the freeze also had to bleed the trim toward a measured carrier,
+    // because the trim WAS the carrier and freezing it would have cost the track.
     float moveX = pidX;
     float moveY = pidY;
 
@@ -1440,9 +1458,11 @@ void syncAimPage() {
     // The filter is re-seeded on a track CHANGE (a new enemy has a different
     // velocity and no history here is meaningful) and cleared when the lead is
     // off, so switching the slider on starts from the measurement rather than
-    // from a stale value. This does NOT remove the self-term — alpha_hat being
-    // right is what does that, exactly as it does for the feed-forward — it
-    // removes the part of it that lives above the target's own bandwidth, which
+    // from a stale value. This does NOT remove the self-term — under R23 its size
+    // is set by lookahead x (1 - alpha_true/kSensFrozen), i.e. by a slider that is
+    // bounded below 1 and a FROZEN constant, so it is bounded by design instead of
+    // by an estimate that could be wrong in either direction. What this filter
+    // removes is the part of it that lives above the target's own bandwidth, which
     // is where the oscillation is.
     static float leadVelX = 0.0f;
     static float leadVelY = 0.0f;
