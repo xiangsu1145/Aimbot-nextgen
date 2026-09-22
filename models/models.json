@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "updatedAt": "2026-09-21",
+  "version": 2,
+  "updatedAt": "2026-09-22",
   "models": [
     {
       "modelId": "tflite-wa-yolov8n-256-int8",
@@ -27,7 +27,7 @@
       "description": "三角洲行动 YOLOv8s INT8量化，256x256，三角洲行动，支持NPU推理",
       "resolution": "256x256",
       "quantize": "INT8",
-      "classCount": 1
+      "classCount": 4
     },
     {
       "modelId": "tflite-delta-0121-v11s-256-int8",
@@ -36,7 +36,7 @@
       "description": "三角洲行动 YOLOv11s INT8量化，256x256，三角洲行动，支持NPU推理",
       "resolution": "256x256",
       "quantize": "INT8",
-      "classCount": 1
+      "classCount": 7
     },
     {
       "modelId": "tflite-valorant-mobile-v11s-256-int8",
@@ -45,7 +45,7 @@
       "description": "无畏契约 YOLOv11s INT8量化，256x256，手部高精度，支持NPU推理",
       "resolution": "256x256",
       "quantize": "INT8",
-      "classCount": 1
+      "classCount": 3
     }
   ]
 }
