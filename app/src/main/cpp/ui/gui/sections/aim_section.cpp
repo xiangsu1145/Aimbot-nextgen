@@ -506,19 +506,18 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     }
 
     // The per-axis freeze has ALREADY been applied inside the controller, and it
-    // is not a plain "zero this axis": P and D are zeroed and the trim stops
-    // accumulating, but the trim is still ADDED (its leak keeps running, so a
-    // charge left over from before the band decays rather than being cut) and the
-    // PREDICTION TERM is added as always. So the caller must NOT zero the axis
-    // here — that would throw away the one term that is legitimately still acting
-    // and turn the band into "the axis stops dead". Round 15 dropped the integral's
-    // contribution inside the band instead, and with kf = 0 that zeroed the axis
-    // completely: see the round-16 section of tracking/pid_controller.h and
-    // PPID::update()'s `frozen` note.
-    // ★ R23: the carrier moved out of the trim and into the prediction term, which
-    // is what makes "freeze = pause the accumulation" sufficient. Under the old
-    // controller the freeze also had to bleed the trim toward a measured carrier,
-    // because the trim WAS the carrier and freezing it would have cost the track.
+    // is not a plain "zero this axis": P and D are zeroed, the trim is HELD (not
+    // accumulated and not leaked — see the three-state integral in
+    // predictive_pid.h), and the prediction term is added as always. So the caller
+    // must NOT zero the axis here — that would throw away the one term that is
+    // legitimately still acting and turn the band into "the axis stops dead".
+    // Round 15 dropped the integral's contribution inside the band instead, and
+    // with kf = 0 that zeroed the axis completely: see the round-16 section of
+    // tracking/pid_controller.h and PPID::update()'s `frozen` note.
+    // ★ R23: the carrier is SPLIT between the prediction term (前馈's share) and the
+    // trim (the rest), so "hold the trim" is what keeps the standing command alive
+    // through the band. Freezing only the accumulation (the first R23 build) let
+    // the trim's share leak away and read on the device as "准心到头上了就立马松手".
     float moveX = pidX;
     float moveY = pidY;
 
