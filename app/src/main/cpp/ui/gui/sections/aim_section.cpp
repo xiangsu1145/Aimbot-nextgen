@@ -921,7 +921,7 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // Kd as of round 18.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kp,        "Kp",       2, es);
     y += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ki,        "Ki",       2, es);
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ki,        "Ki",       3, es);
     y += rowSl + gap;
     // Kd is PER STEP and dimensionless now (it used to be per-second, which made
     // its real weight kd*120 and put the useful part of the slider in its first
@@ -998,10 +998,13 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     y += rowSl + gap;
     // 输出限幅 used to be a row here, and it never was a tuning parameter: it is
     // the ceiling that stops a re-lock from flinging the finger across the panel.
-    // It is the constant tracking::kOutLimitPx (180 finger px/step, tanh), with a
-    // separate, smaller leash on the integral (kTrimLimitPx, 150 since round 14 —
-    // at 90 the leash was a hard ceiling on how fast a target the integral could
-    // hold at all, not a safety rail). Neither is scaled by anything.
+    // It is the constant tracking::kAimOutLimitPx (180 finger px/step, tanh), with
+    // a separate, smaller leash on the integral (tracking::kAimTrimLimitPx, 150
+    // since round 14 — at 90 the leash was a hard ceiling on how fast a target
+    // the integral could hold at all, not a safety rail). Neither is scaled by
+    // anything. The other two constants this row depends on are the integral's
+    // leak (tracking::kIntegralLeakPerFrame, 0.95 since round 23 — see the Ki
+    // row in aim_section.h for why it is not 0.985) and the output deadband.
 
     // ── Aim deadzone ────────────────────────────────────────────────────────
     // 0.0 = move onto the target CENTRE; 1.0 = stop at the target EDGE. The stop

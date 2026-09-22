@@ -408,7 +408,7 @@ void apply(const json& j) {
             // here as an unexplained oscillator and look like the new code being
             // broken again.
             a.kp.value = 0.05f;
-            a.ki.value = 0.10f;
+            a.ki.value = 0.01f;
             a.kd.value = 0.15f;
             a.ffGain.value = tracking::kLookaheadDefault;
             a.outSmooth.value = 1.0f;

@@ -505,10 +505,16 @@ struct PageAim {
     ///
     /// 输出限幅 used to live here as a slider. It was never a tuning parameter —
     /// it is the ceiling that stops a re-lock from flinging the finger across
-    /// the panel — so it is the constant tracking::kOutLimitPx (180 px/step,
+    /// the panel — so it is the constant tracking::kAimOutLimitPx (180 px/step,
     /// tanh) and the page draws no row for it. The integral's leash is the
-    /// constant tracking::kTrimLimitPx (150). Neither is scaled by anything:
+    /// constant tracking::kAimTrimLimitPx (150). Neither is scaled by anything:
     /// kf is the only place the plant gain enters, and it lives in its own row.
+    ///
+    /// ⚠⚠ ROUND 14/15/18 NOTES BELOW ARE HISTORY — kept only for the
+    /// discharge-rate arithmetic (the last of the three old paragraphs), which
+    /// still describes the code. From round 23 the integral is NOT the carrier
+    /// (the prediction term is), "kf" is 前馈, and kp/ki/kd are no longer read
+    /// unconditionally from a file of another schema. Read them as history.
     ///
     /// ── ROUND 14: Ki IS A CARRIER, AND THE LEASH WAS STRANGLING IT ───────────
     ///
@@ -520,7 +526,8 @@ struct PageAim {
     /// pins against the clamp and P has to make up the difference out of the
     /// remaining error — hundreds of px of it. That, not the gain values, is why
     /// a low-sensitivity game could not keep up once the feed-forward was small.
-    /// The leash is now 150, and the proximity schedule no longer throttles ki.
+    /// The leash is now 150 (tracking::kAimTrimLimitPx), and the proximity
+    /// schedule no longer throttles ki.
     ///
     /// The other half of the same bug is DISCHARGE RATE. The integral used to
     /// come back at exactly the rate it went out — ki·e·dt — so a 50 px trim
@@ -530,35 +537,51 @@ struct PageAim {
     /// kIntReleaseGain (6x) faster whenever the error is already pulling it back
     /// toward zero (see PPID::update).
     ///
-    /// Range 0–4, step 0.01, shown to TWO decimals. Step alone was never the
-    /// problem — with a one-decimal readout a 0.01 move is invisible, which is
-    /// what made it look like the step was still 0.1.
+    /// ── ROUND 23: WHAT THIS ROW IS NOW, AND WHY THE RANGE IS 0.04 ───────────
     ///
-    /// How much ki you need depends on how much carrier kf is not supplying.
-    /// Round 15's reading was "with the shipped kf (0.05) the INTEGRAL is the
-    /// carrier, and the user's own working pair is ki 0.20 with kf = 0". Round 18
-    /// ships ki 0.12 with kf 0.05 and kp 0.04 — the same rule read at a different
-    /// point: kf takes the fast part of the carrier, so the integral comes down.
-    /// With no feed-forward at all (kf = 0) the integral carries the whole DC
-    /// command and 0.2–1.0 is the useful band.
-    /// ROUND 18 — THE SHIPPED SET IS THE USER'S CONVERGED ONE, and it is a
-    /// DIFFERENT BALANCE from round 15's, not a nudge: kp 0.04 / ki 0.12 /
-    /// kd 0.15 / kf 0.05, where round 15 shipped 0.10 / 0.5 / 0.20 with kf 0.05.
-    /// kf is no longer ~0, and that is what moved the other three: the
-    /// feed-forward takes the high-frequency load off the integral, so ki can
-    /// come down to a fifth, and a smaller kp with a smaller kd then holds the
-    /// phase margin. The two sets are not comparable number-for-number — read
-    /// the Kp/Ki note above for why "how much ki you need" is a function of "how
-    /// much carrier kf is not supplying".
+    /// The carrier is the PREDICTION TERM's job (ff = 前馈 · v̂ · kfEff). The
+    /// integral supplies the residual (1 − 前馈) of it, and a leaky integrator
+    /// can only supply a carrier by standing on an error, because its charge IS
+    /// ki·e/(1 − leak). So this slider sets the loop's remaining steady-state
+    /// lag; 前馈 sets most of it, and ki buys back what is left.
+    ///
+    /// ★ THE RANGE IS SMALL BECAUSE THE USEFUL BAND IS NARROW, and the reason is
+    /// the leak: tracking::kIntegralLeakPerFrame is 0.95 (a 19-frame time
+    /// constant) now, deliberately close to the loop's own ~8-frame dead time,
+    /// because a much slower integrator stops trimming the loop and starts
+    /// resonating with it — that was the sawtooth the user reported as "一会能跟
+    /// 上，一会突然慢一点". With the leak where it belongs the integrator's DC
+    /// gain is 1/(1 − leak) = 20 per unit error, and the useful band is
+    /// ki ≈ 0.01 … 0.03:
+    ///
+    ///     0.010  trails ~3.9 px on a 600 px/s strafe, smooth — the shipped value
+    ///     0.015  ~0.8 px
+    ///     0.020  ~ −0.8 px (a hair ahead), still clean if α is near the assumed 1
+    ///     0.030  clean at α ≈ 0.5 only
+    ///     0.050+ limit-cycles at every α
+    ///
+    /// The swing ceiling moves with α (view px per finger px), which is NOT
+    /// measurable on the device without reverse-engineering: roughly 0.03 at
+    /// α 0.5, 0.02 at α 1.0, 0.01 at α 2.0. A 0–1.00 range would be 30x past the
+    /// end of the band, and 0.01 steps would leave three usable positions.
+    ///
+    /// ★ READ IT AS A LADDER: 0.010 → 0.015 → 0.020 → 0.025, stopping as soon as
+    /// the trailing is gone. Too far is unmistakable in the telemetry — the
+    /// `mean e=` column starts changing sign every few seconds instead of
+    /// settling on one value — and it is not damageable, so one step back is the
+    /// whole recovery. Step 0.001 and THREE decimals (two was unusable: the
+    /// entire band is 0.01…0.03, which at two decimals is three stops).
     ///
     /// ⚠ NOTE ON HOW THESE REACH A DEVICE. kp/ki/kd/outSmooth/delay are read from
-    /// config.json UNCONDITIONALLY (see apply() in config_manager.cpp), so an
-    /// existing install keeps the tuning it already stored — a new default is
-    /// only observable on a fresh config file. That is deliberate (a stored
-    /// tuning is never silently overwritten), and it also means "I changed the
-    /// default" is not something you can verify without deleting config.json.
+    /// config.json ONLY from a file whose `ctl` equals kCtlSchema (round 22/v14
+    /// — see apply() in config_manager.cpp); across a schema change the whole
+    /// gain block is re-seeded, because the loop those numbers were tuned
+    /// against no longer exists. Within one schema a stored tuning is never
+    /// overwritten — deliberate — so "I changed the default" is not observable
+    /// on an existing install without deleting config.json. The leak itself is a
+    /// COMPILE-TIME constant, so it needs no config migration at all.
     widgets::SliderState kp{0.05f, 0.0f, 1.00f, 0.01f};
-    widgets::SliderState ki{0.10f, 0.0f, 1.00f, 0.01f};
+    widgets::SliderState ki{0.01f, 0.0f, 0.04f, 0.001f};
     widgets::SliderState kd{0.15f, 0.0f, 1.00f, 0.01f};
     /// 输出平滑 — EMA on the controller's output, 0..1, 1.0 = OFF. Shipped at
     /// 0.85: it trades a small, bounded amount of phase lag for a real cut in the

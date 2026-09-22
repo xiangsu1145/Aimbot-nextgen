@@ -403,9 +403,60 @@ constexpr float kIntegralTrustCut   = 0.65f;
 
 // ── The integral ───────────────────────────────────────────────────────────
 
-/// Per-frame leak. At 120 Hz this is a 0.66 s time constant, so a charge that
-/// is no longer justified decays on its own — no detector required.
-constexpr float kIntegralLeakPerFrame = 0.985f;
+/// Per-frame leak. At 120 Hz this is a **0.16 s** time constant (19 frames), so
+/// a charge that is no longer justified decays on its own — no detector
+/// required. It is ALSO the integrator's DC gain — a charge of `ki·e/(1−leak)`
+/// is what holds the command — so this one number decides both how fast a
+/// charge releases and how much steady-state error is needed to hold a given
+/// carrier. That is why it cannot be tuned as "just a release rate".
+///
+/// ⚠⚠ IT WAS 0.985 (0.55 s, 66 frames), AND THAT WAS THE "一会能跟上，一会突然
+/// 慢一点" FAULT. A leaky integrator is a POLE, and its time constant has to
+/// stay short compared with the loop's dead time; at 66 frames against a ~8
+/// frame dead time (2 detector frames + the 6-tap velocity FIR) it had stopped
+/// being a trim on the loop and become a second plant, able to resonate with
+/// the first. Measured on the model at the user's own gains (kp 0.06, kd 0.24,
+/// 前馈 0.74, 600 px/s strafe): the error limit-cycled between −6.6 and +8.3 px
+/// with a 3.2 s period, and the telemetry's `trim` column showed the mechanism
+/// outright — the charge was put to 0.00 at every zero crossing of the error
+/// and needed ~250 frames to rebuild, so for two or three frames at a time the
+/// crosshair genuinely was not being driven. Not "跟不上": intermittent.
+///
+/// The knee is SHARP and it MOVES with the plant gain, so the shipped value is
+/// deliberately several steps below it rather than on it. Peak-to-peak error of
+/// the settled strafe response, same gains, sweeping only the leak:
+///
+///     leak    tau      pp @α=1.0    pp @α=2.0
+///     0.985   551 ms     14.90        10.9      ← was shipped
+///     0.980   412 ms     14.41        11.7
+///     0.975   329 ms      0.4         13.0      ← knee at the far end
+///     0.970   274 ms      0.3          1.9      ← clean, but no ki left
+///     0.960   204 ms      0.2          2.1
+///     0.950   162 ms      0.19         2.3      ← shipped
+///     0.940   135 ms      0.2          2.5
+///
+/// Two entries in that table decided the value. First, the knee sits at a LOWER
+/// leak the larger the plant gain — at α_true = 2.0 the last quiet value is
+/// 0.970, at α_true = 1.0 it is 0.975 — so shipping 0.970, which tracks a
+/// little better, would park the loop on the edge for a game twice as sensitive
+/// as assumed, with the user's own next tweak pushing it over. α is unknown on
+/// the device (no game-side measurement is available), so the margin has to be
+/// taken against its worst measured case; 0.950 is four steps clear of it.
+/// Second, and less obvious: what pays for that margin is NOT the tracking.
+/// The integral's lag is bought back with `ki`, which is a slider the user can
+/// see and move, instead of with a constant nobody can observe. 0.970 has
+/// almost no range at all (at ki = 0.02 it is already oscillating, pp 14.2,
+/// while 0.950 holds pp 1.3 at the same ki), whereas 0.950 keeps ki ≈ 0.01…0.03
+/// usable — which is the "can be conservative AND aggressive" property this
+/// page is supposed to have.
+///
+/// Reference implementations of this loop ship 0.985 and are not wrong THERE:
+/// theirs is a library whose caller passes gains an order of magnitude larger
+/// (kp into the hundreds), so their integral is a small correction on top of a
+/// large proportional path. Here the proportional path is 0.05–0.10 and the
+/// integral holds a real share of the carrier, so its charge is genuinely able
+/// to move the loop. Same number, different regime.
+constexpr float kIntegralLeakPerFrame = 0.95f;
 
 /// The adaptive integral gain. It starts at ZERO and rises toward
 /// 1 − |e|/threshold while the error is small, i.e. it only gains authority
@@ -1001,9 +1052,14 @@ private:
         //
         //     u = lookahead·u(k−L) + I      ⇒      u → I/(1 − lookahead)
         //
-        // which holds only while I holds. Leak I at 0.985/frame and the whole sum
-        // decays with it (~0.5 s), so the stop band turns into "the aim stops
-        // following" — the slower twin of the same symptom.
+        // which holds only while I holds. Leak I while on target and the whole
+        // sum decays with the leak — ~0.55 s at the old 0.985, ~0.16 s at the
+        // shipped 0.95 — so the stop band turns into "the aim stops following":
+        // the slower twin of the same symptom. (Round 23 made the leak FAST
+        // precisely because a slow one is a pole that resonates with the loop's
+        // dead time; fast enough to be safe is still far too fast to hold a
+        // standing carrier through the band, which is why the hold exists at all
+        // and is not an optimisation.)
         //
         // Holding is safe in a way that accumulating is not: with no error there
         // is nothing to wind up, so the charge equals the carrier and nothing
@@ -1026,7 +1082,7 @@ private:
     // Placeholders for the frame between construction and the first setParams();
     // they mirror the page's shipped defaults so the two cannot disagree.
     float kp_        = 0.05f;
-    float ki_        = 0.10f;
+    float ki_        = 0.01f;
     float kd_        = 0.15f;
     float outSmooth_ = 1.0f;
     float lookahead_ = kLookaheadDefault;
