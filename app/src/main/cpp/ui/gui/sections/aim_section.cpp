@@ -408,7 +408,8 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     //             the only field that needs the plant gain to interpret, and the
     //             plant gain is not knowable here — so read it RELATIVELY. At a
     //             steady lock the rest of the line is pinned to it: `ff` should be
-    //             about kf × tot, and `v` about 0.10 × tot (kSensFrozen × tot).
+    //             about kf × tot, and `v` about tot (the reconstruction returns
+    //             kSensFrozen × our own command, and kSensFrozen is 1.0).
     //             Those two ratios locate the fault without ever needing alpha.
     //             `tot` near `lim` means the finger cannot travel further in one
     //             step — the game's sensitivity is below what that ceiling can
@@ -423,7 +424,9 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     //   v       : the reconstructed target speed, in SCREEN px/step. Read it
     //             against `tot`, never against the target's real speed: at a
     //             steady lock the reconstruction is kSensFrozen × our own command,
-    //             so `v ≈ 0.10 × tot` is the EXPECTED reading there. `v` far below
+    //             so `v ≈ tot` is the EXPECTED reading there (kSensFrozen is 1.0;
+    //             it was 0.10 in the first build of this controller, which is one
+    //             of the reasons `v` is worth watching). `v` far below
     //             that while `tot` is large means the reconstruction is not seeing
     //             our own output — check `vok` first, and only then the tracker.
     //             `v` collapsing to ~0 within a few frames of the target stopping
@@ -942,7 +945,18 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
     // true any more — there is no estimator in the loop at all. The history is
     // kept in the PageAim note above the row's own declaration; what matters at
     // the row is the sentence before this one.
-    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ffGain,    "Kf",       2, es);
+    // ⚠ LABEL RENAMED "Kf" → "前馈". The row keeps its place and its 0.00–0.80
+    // range, but "Kf" was actively misleading: it is the name of a knob the user
+    // has years of muscle memory for, in a loop where that name meant something
+    // else, and the first thing that happened with this controller was exactly the
+    // predictable thing — 前馈 was left at 0.16, a perfectly reasonable OLD kf, at
+    // which the integral has to supply 84 % of the carrier. That number is not a
+    // small mistake in the new architecture, it is most of the command, so the row
+    // announces what it now is.
+    //
+    // NOTE the comment above this line still refers to it as Kf in places; the
+    // name change is the labels' business, not the notes'.
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ffGain,    "前馈",     2, es);
     y += rowSl + gap;
     // 输出平滑 — EMA on the controller's OWN output. 0..1, where 1.0 is OFF.
     //

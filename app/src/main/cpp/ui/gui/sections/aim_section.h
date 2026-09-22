@@ -249,11 +249,12 @@ struct AimController {
     float derivY() const { return pidY.dValue(); }
 
     /// Trust in the velocity estimate, 0…1. Collapsing toward 0 means the
-    /// estimate is ringing, and the controller's answer is to remove its own
-    /// excitation — this gate is the negative feedback on the controller's own
-    /// fault, the mechanism the old loop never had. It can cut the prediction
-    /// term to tracking::kFfTrustFloor (0.25) and no further, so the carrier is
-    /// never lost entirely.
+    /// estimate is ringing; it BOOSTS the restoring gains (kpScale/kdScale) and
+    /// the prediction scale, and it ATTENUATES the integral's authority. ★ It does
+    /// NOT gate the prediction term — an earlier version cut that term to a floor
+    /// of 0.25 whenever trust dipped, and trust dips hardest exactly when the
+    /// aim arrives (|Δv̂| is large on arrival), so the gate removed the command at
+    /// the worst possible moment. See the note inside predictive_pid.h.
     float trustX() const { return pidX.trustValue(); }
     float trustY() const { return pidY.trustValue(); }
 
@@ -556,9 +557,9 @@ struct PageAim {
     /// only observable on a fresh config file. That is deliberate (a stored
     /// tuning is never silently overwritten), and it also means "I changed the
     /// default" is not something you can verify without deleting config.json.
-    widgets::SliderState kp{0.40f, 0.0f, 2.0f, 0.01f};
-    widgets::SliderState ki{0.20f, 0.0f, 4.0f, 0.01f};
-    widgets::SliderState kd{0.60f, 0.0f, 3.0f, 0.01f};
+    widgets::SliderState kp{0.05f, 0.0f, 1.00f, 0.01f};
+    widgets::SliderState ki{0.10f, 0.0f, 1.00f, 0.01f};
+    widgets::SliderState kd{0.15f, 0.0f, 1.00f, 0.01f};
     /// 输出平滑 — EMA on the controller's output, 0..1, 1.0 = OFF. Shipped at
     /// 0.85: it trades a small, bounded amount of phase lag for a real cut in the
     /// finger-command noise. See the row's note in drawAimSection().
@@ -597,7 +598,18 @@ struct PageAim {
     /// Range 0–5, step 0.05. Raise it if the crosshair trails a steadily moving
     /// target; lower it (or zero it) if the crosshair overshoots one that changes
     /// direction — a lead is a bet that the target keeps going.
-    widgets::SliderState aimDelayFrames{0.20f, 0.0f, 5.0f, 0.05f};
+    ///
+    /// ★ DEFAULT 0.20 → 0.00 (round 23). The lead is a THIRD self-referential
+    /// path — `setpoint += boxVelocity · τ`, and the box's screen velocity
+    /// contains our own output — and the reference controller has no lead at all:
+    /// the lookahead that a moving target needs is the prediction term's job now,
+    /// and doing it twice is how the round-17 "sits beside the box" fault and the
+    /// round-19c "only shakes while actually driving" fault were produced. It
+    /// also shifts what the loop calls "arrived", which is the last thing that
+    /// should be in play while a "the aim stops driving when it gets there"
+    /// report is being chased. Off by default; the slider is still there for
+    /// anyone who measures a benefit.
+    widgets::SliderState aimDelayFrames{0.0f, 0.0f, 5.0f, 0.05f};
 
     // 丢框预测帧数 (trackPredictHoldFrames) MOVED TO THE SETTINGS PAGE in round
     // 18 — see settings_section.h, which now owns the slider and the note. It is

@@ -163,7 +163,7 @@ constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 // 0.80 as the working value. Everything the old file stored about the loop is
 // therefore not merely mistuned, it is about a different loop, which is exactly
 // the case this constant exists for.
-constexpr int kCtlSchema = 13;
+constexpr int kCtlSchema = 14;
 
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
@@ -391,23 +391,34 @@ void apply(const json& j) {
             getSlider(o, "kp", a.kp);
             getSlider(o, "ki", a.ki);
             getSlider(o, "kd", a.kd);
-        }
-        if (!sameSchema) {
-            // The v13 defaults, written here rather than read back off the
+            getSlider(o, "outSmooth", a.outSmooth);
+            getSlider(o, "delay", a.aimDelayFrames);
+        } else {
+            // The v14 defaults, written here rather than read back off the
             // sliders, so that the values re-seeded are the shipped ones and not
             // whatever a partially-applied file left behind.
-            a.kp.value = 0.40f;
-            a.ki.value = 0.20f;
-            a.kd.value = 0.60f;
+            //
+            // 输出平滑 and 延迟补偿 moved INTO this block in v14, where they used
+            // to be read unconditionally. They belong to the loop, and a value
+            // tuned for the old loop is not a value for this one: 延迟补偿 in
+            // particular is a third self-referential path (setpoint += box
+            // velocity x τ, and the box's screen velocity contains our own
+            // output) that the new controller does not want on by default, so a
+            // stored 0.90 — found by trial against the old loop — would arrive
+            // here as an unexplained oscillator and look like the new code being
+            // broken again.
+            a.kp.value = 0.05f;
+            a.ki.value = 0.10f;
+            a.kd.value = 0.15f;
             a.ffGain.value = tracking::kLookaheadDefault;
+            a.outSmooth.value = 1.0f;
+            a.aimDelayFrames.value = 0.0f;
             LOGI("config: controller schema %d (file had %d) — the loop was "
                  "replaced, so the whole gain block is re-seeded: "
-                 "kp/ki/kd/前馈 = %.2f/%.2f/%.2f/%.2f",
+                 "kp/ki/kd/前馈/输出平滑/延迟补偿 = %.2f/%.2f/%.2f/%.2f/%.2f/%.2f",
                  kCtlSchema, storedCtl, a.kp.value, a.ki.value, a.kd.value,
-                 a.ffGain.value);
+                 a.ffGain.value, a.outSmooth.value, a.aimDelayFrames.value);
         }
-        getSlider(o, "outSmooth", a.outSmooth);
-        getSlider(o, "delay", a.aimDelayFrames);
         // kf is read only from a same-schema file, because its range and its
         // working value have moved at almost every revision (v7 scaled it by
         // 灵敏度补偿, v8 made it 1/alpha, v9 stopped its range at 0.20, v10 let it

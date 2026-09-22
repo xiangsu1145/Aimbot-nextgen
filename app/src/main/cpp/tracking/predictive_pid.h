@@ -48,31 +48,49 @@
 //  The stability rule this buys, stated plainly and worth remembering because
 //  it needs no model of the game at all: **the feed-forward is a delayed copy
 //  of our own output with coefficient `lookahead`, so `lookahead < 1` is the
-//  margin.** 0.80 is 20 % inside it, with the two velocity filters and the
-//  trust gate below adding margin on top.
+//  margin.** The default is 0.60 — safe for a plant gain anywhere in
+//  (0, 2.67) — and the slider stops at 0.80.
 //
 //  WHERE THE CARRIER LIVES, which is the structural change. The old loop asked
-//  the INTEGRAL to hold the standing command u_ss = w/alpha and treated the
-//  feed-forward as a trim — which is why the integral could never be cleared
-//  (clearing it removed the carrier) and why the charge left over when a target
-//  stopped had nowhere to go but out through the aim. Here the PREDICTION TERM
-//  is the carrier (`ff = lookahead·v̂/sens`) and the integral is only a
-//  residual cleaner, small by construction and free to be thrown away:
+//  the INTEGRAL to hold the entire standing command u_ss = w/alpha and treated
+//  the feed-forward as a trim, which is why the integral could never be cleared.
+//  Here the standing command is SPLIT:
 //
-//    * the error is snapped to 0 within kErrorEpsPx, and then
-//    * `!sameSign(error, integral) ⇒ integral = 0` — with the error at zero,
-//      the charge is dropped outright. That single line is what removes the
-//      "target stopped ⇒ the aim sways" fault: at rest there is no charge left
-//      to overshoot with, and no oscillator to keep feeding;
-//    * the integral leaks kIntegralLeakPerFrame per frame regardless;
+//      ff = lookahead · u_ss        (the prediction term's share)
+//      I  = (1 − lookahead) · u_ss  (the integral's share)
+//
+//  so the integral is no longer *the* carrier and can be made disposable when a
+//  target stops — but it is not a formality either, and the first version of this
+//  file got that wrong in a way that showed up on the device immediately. See the
+//  two starred notes in updateIntegral(); the short version is that the integral
+//  must be HELD while the aim is on target, because the prediction term is a copy
+//  of our own output and cannot bootstrap its share without it:
+//
+//      u = lookahead·u(k−L) + I   ⇒   u → I/(1 − lookahead)
+//
+//  Three states, and only the first is "free":
+//    * off target — leak kIntegralLeakPerFrame per frame and accumulate e·ki;
+//    * ON TARGET (error snapped to 0 within kErrorEpsPx, or inside the caller's
+//      deadzone) — HOLD. Neither accumulate nor leak: the charge equals the
+//      carrier and there is no error behind it to wind anything up with;
+//    * ERROR REVERSED — `integral = 0` outright. That is the release that makes
+//      a stop quiet: at rest the target stops, the aim over-runs, the error
+//      reverses, and the charge is gone in one step instead of overshooting
+//      twice. ⚠ A ZERO error is NOT a reversal, however — sameSign(0, x) is
+//      false, so a zero error reads as an opposing one and the carrier gets
+//      wiped whenever the aim settles (and on every crossing);
 //    * its adaptive gain iGain rises from 0, so a fresh engagement starts with
-//      no integral authority at all.
+//      little integral authority.
 //
 //  UNITS. The caller's error is in SCREEN px and the returned output is in
 //  FINGER px, exactly as the page has always wired it, so kp/ki/kd keep the
-//  meaning the user already knows and his stored tuning stays readable. alpha_f
-//  is the only bridge, and it appears in exactly two places: the reconstruction
-//  above and the jump thresholds below.
+//  meaning the user already knows and his stored tuning stays readable.
+//  kSensFrozen is the bridge, and it now equals 1.0 — the reference's own value
+//  (`rawVelocity = Δe + lastOutput_`, unscaled). It appears in the reconstruction
+//  and in the jump thresholds. At a steady lock it CANCELS out of the carrier
+//  share, so tracking speed does not depend on it; what it does set is the noise
+//  gain (lookahead/kSensFrozen) and the scale of v̂, which is why the trust gate's
+//  thresholds are quoted against kSensFrozen and must be re-derived if it moves.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -85,35 +103,62 @@ namespace tracking {
 
 // ── The bridge to the plant, and the loop's own limits ──────────────────────
 
-/// View px per finger px. FROZEN — never estimated, never adapted. See the
-/// header note: nothing the loop's behaviour depends on is a function of this
-/// value; it only scales the reconstruction's transient term. Low is safe
-/// (the self-copy coefficient shrinks), high is the risk (it grows), so this
-/// sits at the low end of a touch game's plausible range.
+/// View px per finger px. FROZEN — never estimated, never adapted. It is the
+/// constant in the reconstruction `r = Δe + kSensFrozen·u(k−L)`: it says "how
+/// much of the error's frame-to-frame change is OUR OWN previous command".
 ///
-/// A symptom that this is too HIGH: the aim kicks sideways the instant the
-/// target reverses, or sways on a standing target with the feed-forward up.
-/// Lower it. Never raise it to "make the aim faster" — raise 前馈 for that.
-constexpr float kSensFrozen = 0.10f;
+/// ★★ THE SAFE DIRECTION IS AN OVER-ESTIMATE, NOT AN UNDER-ESTIMATE. This file
+/// previously claimed the opposite ("Low is safe") and that was backwards.
+/// Writing α for the game's true value, the self-copy coefficient is
+///
+///     s = lookahead · (1 − α / kSensFrozen)
+///
+/// so kSensFrozen → 0 sends |s| → ∞ — the loop amplifies its own delayed output
+/// without bound — while kSensFrozen → ∞ sends s → lookahead, which is bounded by
+/// 1 for every setting of the slider. UNDER-estimating is the dangerous side.
+///
+/// ★★ AND IT SETS THE NOISE GAIN, WHICH IS WHY IT IS 1.0 AND NOT SMALLER. The
+/// prediction term is ff = (lookahead/kSensFrozen)·v̂, so the detector's
+/// frame-to-frame jitter reaches the COMMAND with gain lookahead/kSensFrozen. At
+/// 0.10 that is 10× what the reference controller has. The reference adds its own
+/// previous output to Δe UNSCALED — `rawVelocity = normalizedErrorDiff +
+/// lastOutput_;`, pid_chirs.cpp:447 — and that one number, not any gain, is why
+/// the first build of this controller read as "默认参数直接飞" on the device while
+/// the vendor's controller is smooth on the same phone with the same sliders.
+/// 1.0 is also the value with the smallest |s| for a game near α = 1, which is the
+/// only kind of game the reference can serve at all.
+///
+/// Do not tune this, and do not read it as a performance knob: with 1.0 the DC
+/// carrier share is still exactly `lookahead` (α cancels there), so nothing about
+/// tracking speed is given up by being right. If the aim jitters, lower 前馈.
+constexpr float kSensFrozen = 1.0f;
 
 /// The output ceiling, finger px/step, applied as a tanh knee so the command
 /// stays linear where it works and saturates where a re-lock would otherwise
-/// fling the finger across the panel. 260 finger px/step at 120 Hz is
-/// 31200 finger px/s, i.e. kSensFrozen·260·120 = 3120 view px/s reachable.
+/// fling the finger across the panel. 180 finger px/step at 120 Hz is
+/// 21600 finger px/s, i.e. α·180·120 ≈ 21600 view px/s at α = 1 — two orders of
+/// magnitude above anything a target can do.
 ///
-/// Raised 180 → 260 after the simulation showed the ceiling clipping a 1200
-/// px/s target's carrier (the loop was told to run out of command before the
-/// target ran out of speed, which reads on screen as "跟不上"). The tanh knee
-/// is unchanged — κ ≈ 0.55 across the whole working range either way, so the
-/// only thing this number decides is where saturation starts.
-constexpr float kAimOutLimitPx = 260.0f;
+/// ⚠ 180 → 260 → BACK TO 180. The raise was justified with "0.10·180·120 = 2160
+/// view px/s cannot serve a 1200 px/s target", and that arithmetic was an artifact
+/// of kSensFrozen being wrong by 10×: it silently assumed the loop reaches only
+/// kSensFrozen of each finger px, which is not what that constant means. With 1.0
+/// the same ceiling serves 21600 px/s. Same class of mistake as kTrustVelScale —
+/// see the note there.
+constexpr float kAimOutLimitPx = 180.0f;
 
 /// The integral's leash, finger px. NOT a safety rail in the old sense: the
-/// integral here is a residual cleaner whose steady state is
-/// kIntegralLeak-driven (≈ 66 × e × ki), and this only bounds it. It is set
-/// well above anything a cleaner needs so it can never be the thing that
-/// limits tracking — the feed-forward is what carries a moving target.
-constexpr float kAimTrimLimitPx = 400.0f;
+/// integral here is a residual cleaner whose steady state is leak-driven
+/// (≈ 66 × e × ki while it is free to accumulate), and this only bounds it.
+///
+/// 400 → 150, back to this project's own proven value and roughly to the
+/// reference's own integral ceiling, which is atan2-compressed at
+/// (π/2)·(baseLimit − kiLimit) = (π/2)·90 ≈ 141 finger px for baseLimit 180.
+/// 400 was chosen while kSensFrozen was 10× low, i.e. while a "finger px" in this
+/// file was implicitly worth a tenth of one on the device; in real units 400 is a
+/// quarter of the whole panel per step, and a charge that big is exactly the
+/// energy the old controller's creep-snap limit cycle ran on.
+constexpr float kAimTrimLimitPx = 150.0f;
 
 /// The feed-forward's own hard clamp, finger px/step. A rail against a wrong
 /// kSensFrozen and nothing else: at the shipped lookahead the term settles
@@ -141,7 +186,16 @@ constexpr float kFfLimitPx = 120.0f;
 /// is deliberately named the same way on the page. What changed is that the
 /// share no longer runs through a 1/alpha_hat.
 constexpr float kLookaheadMax     = 0.80f;
-constexpr float kLookaheadDefault = 0.80f;
+
+/// 0.80 → 0.60, and the reason is which failure it is allowed to have. The
+/// stability condition is |s| < 1 with s = lookahead·(1 − α); 0.80 is safe for
+/// α ∈ (0, 2.25) and 0.60 is safe for α ∈ (0, 2.67), so the lower default simply
+/// tolerates a wider range of games while still handing the prediction term more
+/// than half the carrier. It costs the integral a bigger share — with the in-band
+/// hold (see updateIntegral) that is no longer a way to lose the track, which is
+/// what makes the conservative default affordable now and did not before.
+/// The slider still reaches 0.80 for anyone who measures a quiet 0.80.
+constexpr float kLookaheadDefault = 0.60f;
 
 // ── Timing ─────────────────────────────────────────────────────────────────
 
@@ -161,9 +215,22 @@ constexpr float kFrameScaleMax = 2.50f;
 constexpr float kErrorEpsPx = 0.30f;
 
 /// |iTotal| below this is not added at all, and |predictionTerm| below half of
-/// it is dropped: output units (finger px), and the last line of defence
-/// against sub-pixel chatter.
-constexpr float kOutDeadbandPx = 0.30f;
+/// it is dropped. Output units (finger px) — sub-pixel chatter only.
+///
+/// ⚠ 0.30 → 0.05. The comment this replaces said the deadband exists "on the two
+/// terms whose steady state is zero", and that premise is FALSE in this
+/// architecture: the prediction term's steady state is `lookahead · u_ss` and the
+/// integral's is `(1 − lookahead) · u_ss`, i.e. together they ARE the carrier.
+/// A deadband of 0.30 finger px is not small next to a residual cleaner whose
+/// whole output can be a couple of px, so on a close approach the two terms were
+/// being nulled one after the other while P and D were simultaneously gated by
+/// the aim deadzone — leaving the axes at EXACTLY zero on target. That is
+/// discrete, not gradual, and it reads on screen as "准心到头上了就立马松手":
+/// the command had to grow back past 0.30 before anything moved again, and the
+/// grow-back is what makes the error reappear.
+/// 0.05 is small enough that the only thing it can suppress is a term that is
+/// already doing nothing.
+constexpr float kOutDeadbandPx = 0.05f;
 
 /// OneEuroFilter tuning for the error. Low cutoff (this is a POSITION being
 /// denoised, not a control signal), beta scales the cutoff with the filtered
@@ -266,36 +333,58 @@ constexpr float kIntegralMemBleedMax      = 0.95f;
 /// feed-forward, so the loop's response to its own instability is to remove its
 /// own excitation — the one mechanism the old controller never had, because
 /// there the same fault was AMPLIFIED (carry → the integral) instead.
-/// `kTrustVelScale` must be the scale of a TYPICAL per-frame speed, not of a
-/// fast one. It is the knee of speedFactor = 1 − exp(−|v|/this), i.e. the
-/// speed at which the gate opens to 63%. At 8.0 a 600 px/s target (5 px/frame)
-/// only buys speedFactor = 0.47 — the gate dutifully threw away half the
-/// carrier on a perfectly ordinary strafe, which the simulation measured as a
-/// 8.8 px lag. At 0.8 the same strafe gets 0.998 and the lag is 2.5 px.
-/// "Gate the uncertainty, not the motion" — a target moving at all is
-/// evidence FOR the estimate, so the gate should be open by then.
-constexpr float kTrustVelScale      = 0.8f;    // speedFactor = 1 − exp(−|v|/this)
+/// ⚠ 8.0 → 0.8 → BACK TO 8.0. These three constants were "corrected" during the
+/// simulation round on the strength of a measurement — "a 600 px/s strafe only
+/// earns speedFactor 0.47 at 8.0, so half the carrier is thrown away" — that was
+/// true and still is. What the measurement could not see is that |v̂| is
+/// proportional to kSensFrozen: the reconstruction returns kSensFrozen·u at a
+/// steady lock, so while kSensFrozen was 0.10 every velocity in this file was
+/// 10× smaller than it is now, and 0.8 was the right knee for a world in which
+/// this file's "px/frame" meant a tenth of a real one. Restoring kSensFrozen to
+/// 1.0 restores the scale, and with the scale back, the reference's own 8.0 is
+/// the matched value again: a 600 px/s strafe at α = 1 is 5 px/frame → 0.47, and
+/// at α = 0.3 it is 16.7 px/frame → 0.88. ★ kTrustVelScale and kSensFrozen are a
+/// MATCHED PAIR; changing either alone silently re-tunes this gate by the same
+/// factor. Same for kVelZeroPx and kDirChangeVelPx, which are thresholds on the
+/// same quantity.
+constexpr float kTrustVelScale      = 8.0f;    // speedFactor = 1 − exp(−|v|/this)
 constexpr float kTrustAccelScale    = 6.0f;    // stableVelocity = exp(−|Δv|/this)
-/// The distance factor is the OTHER half of the same mistake. 0.42 meant a
-/// dead-on lock (|e| = 0) still had 42% of its carrier withheld, and 22.0 px
-/// meant it took a nearly-framed target to earn it back — so a tight lock sat
-/// at ~0.6 trust and paid a permanent 40% carrier tax. 0.70 / 10.0 puts an
-/// ordinary 2 px lock at 0.94. The floor stays deliberately below 1 because a
-/// perfectly centred estimate really is the one case with no independent
-/// evidence behind it.
-constexpr float kTrustDistFloor     = 0.70f;   // trust floor at zero error
-constexpr float kTrustDistErrScale  = 10.0f;   // …and how fast it rises with |e|
+/// The distance factor is the one member of this set that is NOT coupled to
+/// kSensFrozen, because it reads the ERROR (view px) rather than the velocity —
+/// so the simulation's argument for 0.70 / 10.0 stands on its own merits. It is
+/// still reverted to the reference's 0.42 / 22.0 for now, on a different and
+/// simpler principle: every other number in the gate is the vendor's, this is not
+/// the failure the user is reporting, and changing a tuned set in one place
+/// without being able to test the result is how the last round went wrong. What
+/// it costs is a ~0.6 trust ceiling on a dead-on lock, i.e. the floor taxes the
+/// carrier a little; what it buys is that the gate behaves as its author verified
+/// it. Revisit with device data, not with a simulation.
+constexpr float kTrustDistFloor     = 0.42f;   // trust floor at zero error
+constexpr float kTrustDistErrScale  = 22.0f;   // …and how fast it rises with |e|
 constexpr float kTrustRiseRate      = 0.32f;
 constexpr float kTrustFallRate      = 0.72f;   // falls faster than it rises
 
-/// OUR DELIBERATE DEVIATION from the reference. The reference lets the trust
-/// gate take the feed-forward to zero, and with the carrier living in the
-/// feed-forward a zero gate means "no carrier at all" — the aim would stop
-/// following whenever the target moved erratically, which is the user's own
-/// complaint restated. So trust can cut the carrier to this floor and no
-/// further. 0.25 keeps 25 % of the carrier through the worst transient, which
-/// is enough for P/I to work against.
-constexpr float kFfTrustFloor = 0.25f;
+/// ★ NO TRUST GATE ON THE PREDICTION TERM — `kFfTrustFloor` is gone.
+///
+/// An earlier version of this file gated the prediction term with
+/// `floor + (1 − floor)·trust`. It was described as a deviation from the
+/// reference "so the carrier cannot be switched off", and that description was
+/// half right: a floor keeps the carrier alive, but the gate still moves it by
+/// up to 4× on a signal that swings fastest exactly when the target arrives or
+/// stops. `stableVelocity = exp(−|Δv̂|/6)` collapses whenever v̂ changes — which
+/// is the definition of arriving — so on arrival this gate dropped the command
+/// to 25 % and let it back up afterwards. That is one of the two mechanisms
+/// behind "准心到头上了就立马松手，然后又去跟枪".
+///
+/// Checked against pid_chirs.cpp: the reference does NOT gate its prediction term
+/// at all. Its trust feeds only (a) kpScale/kdScale boosts, (b) predictionScale,
+/// which is a BOOST, and (c) the integral, where trust ATTENUATES — the exact
+/// opposite allocation to the one this file had. Trust is evidence about the
+/// ESTIMATE, so what it is allowed to do is stop the residual cleaner from
+/// fighting a good estimate; it is not allowed to modulate the carrier.
+/// (The reference does have one trust-gated feed-forward, but it is a second,
+/// separate term — `feedForwardTerm = v̂ · feedForwardGain · trust` — and its
+/// default gain is 0.0, i.e. off.)
 
 /// Adaptive gain on P and D while the estimate is trusted. A small boost only;
 /// the point is that near-target damping rises when the error is small and the
@@ -590,16 +679,17 @@ public:
 
         // The prediction term, in FINGER px:
         //   (lookahead · v̂ [screen px/frame]) / kSensFrozen = finger px.
-        // predictionScale is the trusted-lookahead boost and the trust gate;
-        // the floor in kFfTrustFloor is what keeps the carrier alive through a
-        // transient. See kFfTrustFloor.
-        const float ffGate = kFfTrustFloor + (1.0f - kFfTrustFloor) * ad.trust;
-        float ff = (lookahead_ * predGain_ * ad.predScale / kSensFrozen) * vel * ffGate;
+        // With kSensFrozen = 1.0 this is the reference's own expression
+        // (v̂ · lookaheadFrames · predictionGain) with the lookahead expressed as
+        // a carrier share instead of as a frame count.
+        // predictionScale is a BOOST that grows with trust. There is no trust gate
+        // on this term — see the note where kFfTrustFloor used to be.
+        float ff = (lookahead_ * predGain_ * ad.predScale / kSensFrozen) * vel;
         ff = clampRange(ff, -kFfLimitPx, kFfLimitPx);
 
-        // Deadbands on the two terms whose steady state is zero. P and D are
-        // deliberately exempt — they are the loop's restoring force, and gating
-        // them is the bang-bang the page's own history already paid for once.
+        // Sub-pixel chatter only. NOT the "terms whose steady state is zero"
+        // deadband this used to be — neither of these terms has a zero steady
+        // state, they are the carrier between them. See kOutDeadbandPx.
         if (std::fabs(iOut) <= kOutDeadbandPx)          iOut = 0.0f;
         if (std::fabs(ff)   <= kOutDeadbandPx * 0.5f)   ff   = 0.0f;
 
@@ -843,38 +933,101 @@ private:
 
     // ── The integral ──────────────────────────────────────────────────────
 
-    /// `frozen` (the caller's stop band) pauses ACCUMULATION only. The leak, the
-    /// sign test and the clamp all still run: the band means "stop adding to a
-    /// charge", never "keep the charge forever".
+    /// Three states, and the middle one is the one that was wrong.
+    ///
+    ///   off target (error != 0, outside the band) — normal: leak, accumulate
+    ///   ON TARGET  (error snapped to 0, or inside the band) — HOLD: neither
+    ///   reversal (error of the opposite sign) — DROP the charge outright
+    ///
+    /// `frozen` is the caller's stop band. It is only one of the two ways to be
+    /// "on target"; the other is the error snap itself, and relying on the
+    /// caller's deadzone to define this state meant a user who set 死区 = 0 got
+    /// no hold at all.
     float updateIntegral(float e, bool frozen, float dtScale) {
         if (ki_ <= kEps) { integral_ = 0.0f; return 0.0f; }
 
-        // THE LINE THAT REMOVES THE SWAY. The error is zero at rest (see
-        // kErrorEpsPx), and a charge with no error behind it is dropped
-        // outright — not bled toward some measured target, DROPPED. The old
-        // controller could not do this because its integral was the carrier and
-        // clearing it removed the loop's ability to follow; here the carrier is
-        // the prediction term, so the integral is free to be thrown away, and
-        // throwing it away is exactly what makes a stop quiet.
-        if (integral_ != 0.0f && !sameSign(e, integral_)) {
+        // ── THE RELEASE ───────────────────────────────────────────────────
+        // A genuine sign REVERSAL means we have crossed the target: the charge
+        // is now pushing the aim away from it, so it is dropped in one step
+        // rather than bled. This is what makes a stop quiet — the target stops,
+        // the aim over-runs, the error reverses, and the charge that caused the
+        // over-run is gone before it can overshoot twice.
+        //
+        // ⚠⚠ `e == 0.0` IS NOT A REVERSAL, and sameSign() cannot tell the
+        // difference: sameSign(a, b) is `a*b > 0`, so sameSign(0.0f, I) is FALSE
+        // and a zero error reads as "the error is opposing the charge".
+        //
+        // `e` reaches exactly 0.0f by two routes, and both are the loop being
+        // SUCCESSFUL rather than wrong:
+        //   * the snap is applied to `raw` before the filter, and near zero
+        //     rawBlend is 0, so `e = round2(filtered)` — the OneEuro output. Its
+        //     per-frame decay is ~0.947 at the 1.05 Hz cutoff, and round2 keeps
+        //     two decimals, so `e` becomes exactly 0.0f within about a second of
+        //     the error last leaving the snap zone;
+        //   * `blend` can be non-zero on a fast approach, and then `e = raw`
+        //     exactly, which is 0.0f wherever the snap fired.
+        // And in between, every genuine zero crossing of the filtered error fires
+        // the test as well — which during a close approach is every time the aim
+        // passes the box centre.
+        //
+        // So the test below used to fire on arrival, on every crossing, and again
+        // about a second after settling — always to wipe the integral and reset
+        // its authority (`iGain_ = 0`, ~40 frames at kIntegralGainRate to climb
+        // back), always at the moment the loop most needed to keep driving.
+        //
+        // The comment that used to sit here called the integral "free to be
+        // thrown away" because "the carrier is the prediction term". That is only
+        // true at 前馈 ≈ 1. At the shipped 0.60 the integral is 40% of the
+        // carrier, and at the 0.16 the user had actually set it is 84% — so the
+        // wipe removed most or all of the command, and the loop could only
+        // rebuild it by lagging behind again. The aim arrives, the drive
+        // vanishes, the target leaves the deadzone, the integral slowly rebuilds,
+        // the aim arrives again. That is the reported cycle, exactly. A reversal
+        // worth releasing on is a change of sign in an error that is actually
+        // there.
+        if (integral_ != 0.0f && e != 0.0f && !sameSign(e, integral_)) {
             integral_ = 0.0f;
             iGain_    = 0.0f;
         }
 
-        if (integral_ != 0.0f) {
-            integral_ *= std::pow(kIntegralLeakPerFrame, clampRange(dtScale, kFrameScaleMin,
-                                                                   kFrameScaleMax));
+        // ── THE HOLD ──────────────────────────────────────────────────────
+        // On target the charge is FROZEN — not accumulated and not leaked.
+        //
+        // It is not a leftover to be disposed of: the prediction term supplies
+        // `lookahead·u_ss` and the integral supplies the other
+        // `(1 − lookahead)·u_ss`, so together they ARE the standing command. And
+        // the prediction term cannot bootstrap its share on its own, because it
+        // is a delayed copy of our own output:
+        //
+        //     u = lookahead·u(k−L) + I      ⇒      u → I/(1 − lookahead)
+        //
+        // which holds only while I holds. Leak I at 0.985/frame and the whole sum
+        // decays with it (~0.5 s), so the stop band turns into "the aim stops
+        // following" — the slower twin of the same symptom.
+        //
+        // Holding is safe in a way that accumulating is not: with no error there
+        // is nothing to wind up, so the charge equals the carrier and nothing
+        // else. The moment the target moves, |e| leaves the snap's neighbourhood
+        // and normal accumulation resumes without any transition.
+        const bool onTarget = frozen || (e == 0.0f);
+        if (!onTarget) {
+            if (integral_ != 0.0f) {
+                integral_ *= std::pow(kIntegralLeakPerFrame,
+                                      clampRange(dtScale, kFrameScaleMin, kFrameScaleMax));
+            }
+            integral_ += e * ki_ * iGain_ * dtScale;
         }
-        if (!frozen) integral_ += e * ki_ * iGain_ * dtScale;
 
         integral_ = clampRange(integral_, -kAimTrimLimitPx, kAimTrimLimitPx);
         return integral_;
     }
 
     // ── Parameters ────────────────────────────────────────────────────────
-    float kp_        = 0.30f;
-    float ki_        = 0.20f;
-    float kd_        = 0.25f;
+    // Placeholders for the frame between construction and the first setParams();
+    // they mirror the page's shipped defaults so the two cannot disagree.
+    float kp_        = 0.05f;
+    float ki_        = 0.10f;
+    float kd_        = 0.15f;
     float outSmooth_ = 1.0f;
     float lookahead_ = kLookaheadDefault;
     float boxPx_     = 0.0f;
