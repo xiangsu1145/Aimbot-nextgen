@@ -80,19 +80,27 @@ _crop_head.png
 _shot_verify.png
 dis.txt
 
-# ── Model files: only the official cloud set is committed ────────────
-# models/models.json + the two models/tflite files ARE the cloud source
-# the app downloads from (via GitHub proxy); every other model binary
-# stays device-local and must never be committed.
+# ── Model files: the cloud set is committed ──────────────────────────
+# models/tflite/ and models/onnx/ ARE the cloud source the app downloads
+# from (via GitHub proxy): every model listed in models/models.json has to
+# be present here, or its download 404s for everyone regardless of network.
+# Any other model binary stays device-local and must never be committed.
+#
+# This list used to name the files one by one, and it silently went stale
+# the moment models were added to the manifest — three models ended up
+# advertised but never committed. The rule is now "everything in the cloud
+# directories", so adding a file to models.json is enough.
 *.tflite
 *.onnx
 *.part
 /models/*
 !/models/models.json
 !/models/tflite/
+!/models/onnx/
 /models/tflite/*
-!/models/tflite/WA_YOLOV8n_256_3_int8.tflite
-!/models/tflite/valorant_256_v26n.tflite
+/models/onnx/*
+!/models/tflite/*.tflite
+!/models/onnx/*.onnx
 
 # ── Local test-run artifacts ─────────────────────────────────────────
 scripts/test_report.txt
