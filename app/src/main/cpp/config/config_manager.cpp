@@ -155,7 +155,15 @@ constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 // load as 0.50 — a value he never chose — so the row is re-seeded rather than
 // clamped into place. kp/ki/kd are NOT touched: they have meant the same thing in
 // every schema, and re-seeding them would throw away his tuning.
-constexpr int kCtlSchema = 12;
+// v13 (round 22): the controller was REPLACED, not retuned — see the header of
+// tracking/predictive_pid.h. kp/ki/kd are re-seeded for the first time, and 前馈
+// (still stored under the "kf" key, still the row in the same place) changes
+// meaning from "a strength on a feed-forward scaled by 1/alpha_hat" to "the
+// fraction of the carrier the prediction term supplies", range 0.00–0.80 with
+// 0.80 as the working value. Everything the old file stored about the loop is
+// therefore not merely mistuned, it is about a different loop, which is exactly
+// the case this constant exists for.
+constexpr int kCtlSchema = 13;
 
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
@@ -362,26 +370,41 @@ void apply(const json& j) {
         const int  storedCtl = (ctlIt != o.end() && ctlIt->is_number())
                                    ? static_cast<int>(ctlIt->get<double>())
                                    : 0;
-        // kp/ki/kd are read UNCONDITIONALLY (round 14). They are px of output
-        // per px of error per step, they have meant that in every schema, and
-        // re-seeding them across a version bump silently discards tuning the user
-        // did himself — which is the thing that makes him distrust the numbers.
-        getSlider(o, "kp", a.kp);
-        getSlider(o, "ki", a.ki);
-        getSlider(o, "kd", a.kd);
-        if (storedCtl != kCtlSchema) {
-            // kf is the one gain whose meaning HAS moved: v8 stored a reciprocal
-            // of the plant gain (the user's was 0.05), v9 a strength on a range
-            // that could not exceed 0.20 (his 0.08), v10 a strength that reached
-            // 1.00, v11 narrowed the range to 1.20 around 0.80, and v12 makes the
-            // range his own — 0.50 with 0.05 as the working value. A stored 0.80
-            // is above that ceiling, so it is re-seeded rather than clamped: 0.50
-            // is a value he never chose and would have to discover.
-            a.ffGain.value = 0.05f;
-            LOGI("config: kf re-seeded for controller schema %d (file had %d): "
-                 "kf=%.2f — kp/ki/kd kept at %.2f/%.2f/%.2f",
-                 kCtlSchema, storedCtl, a.ffGain.value,
-                 a.kp.value, a.ki.value, a.kd.value);
+        // kp/ki/kd were read UNCONDITIONALLY from round 14 to round 21, on the
+        // grounds that they had meant the same thing in every schema and that
+        // re-seeding them discards tuning the user did himself. ROUND 22 IS THE
+        // EXCEPTION, and it is worth being precise about why, because the rule
+        // is a good one and this is not a licence to break it casually:
+        //
+        // their UNITS did not change (px of output per px of error, per second,
+        // per step), but the LOOP THEY WERE TUNED AGAINST no longer exists. The
+        // controller was replaced wholesale — the integral stopped being the
+        // carrier, a prediction term took over 80 % of it, and nothing is
+        // estimated on-line any more. A stored 0.04 was arrived at by balancing
+        // kp against an integral that had to hold the whole standing command;
+        // against a loop where the prediction term holds it, 0.04 is simply too
+        // soft, and it would read as "跟枪跟不上" on the first engagement and
+        // look like a fault in the new controller. Re-seeding is the lesser
+        // evil, and it happens once.
+        const bool sameSchema = (storedCtl == kCtlSchema);
+        if (sameSchema) {
+            getSlider(o, "kp", a.kp);
+            getSlider(o, "ki", a.ki);
+            getSlider(o, "kd", a.kd);
+        }
+        if (!sameSchema) {
+            // The v13 defaults, written here rather than read back off the
+            // sliders, so that the values re-seeded are the shipped ones and not
+            // whatever a partially-applied file left behind.
+            a.kp.value = 0.40f;
+            a.ki.value = 0.20f;
+            a.kd.value = 0.60f;
+            a.ffGain.value = tracking::kLookaheadDefault;
+            LOGI("config: controller schema %d (file had %d) — the loop was "
+                 "replaced, so the whole gain block is re-seeded: "
+                 "kp/ki/kd/前馈 = %.2f/%.2f/%.2f/%.2f",
+                 kCtlSchema, storedCtl, a.kp.value, a.ki.value, a.kd.value,
+                 a.ffGain.value);
         }
         getSlider(o, "outSmooth", a.outSmooth);
         getSlider(o, "delay", a.aimDelayFrames);

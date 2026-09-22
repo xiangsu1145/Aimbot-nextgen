@@ -26,7 +26,10 @@
 #include <vector>
 
 #include "ui/gui/widgets.h"
-#include "tracking/pid_controller.h"
+// ROUND 22: the PIDF of rounds 1–21 is replaced by the predictive controller.
+// The old header is still on disk (tracking/pid_controller.h) and is no longer
+// included by anything, so reverting this one line reverts the whole round.
+#include "tracking/predictive_pid.h"
 
 namespace aimbotng {
 namespace ui {
@@ -111,103 +114,70 @@ struct AimCategoryState {
     bool hasAnySelected() const { return sel.mask != 0; }
 };
 
-// ── Aim controller — two per-step position controllers, one per axis ────────
+// ── Aim controller — two predictive controllers, one per axis ───────────────
 //
-// The output of PPID::update() is the FINGER DISPLACEMENT for one control step,
-// in px — not a velocity, and nothing divides by a nominal frame rate. The step
-// time is real and is passed in as `dt`; the loop genuinely runs at 120 Hz
-// while aiming and drops to 60 Hz in the detector tier.
+// ROUND 22 — WHAT THIS IS NOW. Two `tracking::PredictivePid` objects, and the
+// page is a thin adapter over them. Everything the old AimController carried
+// besides the two PIDs is gone, and each removal is worth naming because each
+// one was a source of the faults the user reported:
 //
-// Deadzone and per-class Y band are applied AFTER the control step, so the
-// controller always sees the raw error. The output ceiling and the derivative
-// filter are constants inside PPID (see tracking/pid_controller.h), not sliders.
+//   * `alphaEst` / `slopeEst` / `alphaTrusted_` — the on-line plant-gain fits.
+//     The plant gain no longer appears in any denominator anywhere in the loop
+//     (see the header of tracking/predictive_pid.h), so there is nothing for a
+//     fit to feed. Removing them removes the TIME-VARYING GAIN, which is a
+//     jitter source that cannot be tuned away.
+//   * `kfEff_` and the kf guard — the guard existed only because kf was a gain
+//     on an echo whose size depended on the (untrusted) estimate. The
+//     equivalent knob now has a provable margin of its own (lookahead < 1), so
+//     it needs no guard and cannot be pushed into an unstable region.
+//   * `carry` / the stop detector / the deadzone bleed — all three were
+//     mechanisms for moving the INTEGRAL toward a measured target. The
+//     integral is no longer the carrier (the prediction term is), so it does
+//     not need to be steered; it needs to be droppable, and it is.
+//
+// The output of update() is still the FINGER DISPLACEMENT for one control step,
+// in px, and the step time is still the real `dt`.
+//
+// Deadzone and per-class Y band are still applied by the caller, and still reach
+// the controller as the per-axis `frozen` flags — where they suppress P and D
+// and pause the integral's accumulation, and NEVER touch the prediction term.
 struct AimController {
-    tracking::PPID pidX;
-    tracking::PPID pidY;
+    tracking::PredictivePid pidX;
+    tracking::PredictivePid pidY;
 
     // Drag safety: lift+repress if finger travels further than this from press point.
     float maxDragDist = 400.0f;  // px
 
     /// Push slider values into both axes. PURE ASSIGNMENT — it must never reset
     /// anything. It is called once per render frame, so a version that cleared
-    /// state (this used to be `init()`, which ended in reset()) would wipe the
-    /// integrator and the derivative history 120 times a second. A genuinely
-    /// new engagement calls reset() instead.
+    /// state would wipe the integrator and the velocity memory 120 times a
+    /// second. A genuinely new engagement calls reset() instead.
     ///
-    /// There is NO sensitivity compensation here any more and no scaling of the
-    /// gains or of the ceilings: kp, ki, kd and kf go in as they are.
+    /// kp / ki / kd keep the units the page has always used — px of output per
+    /// px of error, per second, and per step — so a value arrived at by tuning
+    /// is still that value here.
     ///
-    /// `kf` is the feed-forward STRENGTH, 0…0.50 (round 15) — it is NOT the plant
-    /// gain. The reconstruction constant is derived on-line (see `alphaEst`) and
-    /// pushed into both axes. Round 11 capped it at 0.20 and that cap — not the
-    /// user's tuning — is why the aim could not keep up then; round 15 fixed the
-    /// other end, because the user's own tuning (kf 0, kp 0.05, ki 0.20, kd 0.26)
-    /// tracks perfectly with the integral as the carrier, which makes the
-    /// feed-forward a trim rather than a carrier. See the round-15 section of
-    /// tracking/pid_controller.h.
-    void setGains(float kp, float ki, float kd, float outSmooth, float kf) {
-        // The SLIDER's value, kept exactly as asked. This is what the config
-        // stores and what the user sees on the row — the knob is his.
-        this->ffGain = std::max(0.0f, kf);
-
-        // ROUND 19: what actually reaches the axes is GUARDED. kf is a gain on
-        // the echo of our own delayed command (s = kf·(1 − alpha/alpha_hat)), so
-        // a large kf is only safe while alpha_hat is RIGHT — and the seed is a
-        // guess. See kFfGuardStrengthMax for the measurements behind that.
-        //
-        // The guard is a CAP and not a working point. It applies only while no
-        // fit has corroborated alpha_hat and lifts to whatever the slider says
-        // once two independent fits agree, so 激进/保守 stays the user's own
-        // knob; the guard only makes the first second safe instead of audible.
-        const float want = alphaTrusted()
-                               ? this->ffGain
-                               : std::min(this->ffGain, tracking::kFfGuardStrengthMax);
-
-        // Moved as a RATE, never as a step. A jump in kf is a jump in the DC
-        // carrier's split between the two channels, i.e. a velocity step — the
-        // same class of fault as round 15's "乱甩乱晃" — so it obeys the same
-        // rule as every other gate in the controller. This runs once per render
-        // frame, so the rate below is per-frame by construction.
-        kfEff_ += (want - kfEff_) * tracking::kFfGuardRate;
-        if (!std::isfinite(kfEff_)) kfEff_ = want;
-
-        pidX.setGains(kp, ki, kd, outSmooth, kfEff_);
-        pidY.setGains(kp, ki, kd, outSmooth, kfEff_);
+    /// The fifth argument is 前馈 (lookahead). Its TYPE of quantity changed in
+    /// round 22 even though the row kept its name and its place: it was a
+    /// dimensionless strength on a feed-forward whose other factor was
+    /// 1/alpha_hat, and it is now the FRACTION OF THE CARRIER the prediction
+    /// term supplies — a number with a hard meaning and a hard ceiling
+    /// (tracking::kLookaheadMax, 0.80), because the feed-forward is a delayed
+    /// copy of our own output with coefficient exactly `lookahead`, so
+    /// `lookahead < 1` IS the stability margin. See the header of
+    /// tracking/predictive_pid.h.
+    ///
+    /// No guard, no rate limit, no latch: with the ceiling at 0.80 every
+    /// position of this slider is safe, so the knob goes straight through.
+    void setGains(float kp, float ki, float kd, float outSmooth, float ff) {
+        pidX.setParams(kp, ki, kd, outSmooth, ff);
+        pidY.setParams(kp, ki, kd, outSmooth, ff);
     }
 
-    /// True once the plant gain has been CORROBORATED — both fits have an answer
-    /// and the two agree. This is the gate the kf cap opens on, and it is the
-    /// whole reason there are two estimators.
-    ///
-    /// Neither fit is trusted alone. One works on the cumulative command and the
-    /// other on its differences, over different windows, sharing no arithmetic;
-    /// landing on the same alpha is therefore evidence rather than a restatement.
-    /// A single fit can satisfy its own normal equations while describing
-    /// nothing, and the price of believing such a fit is a full-strength kf on a
-    /// wrong alpha_hat, which is a ring on the device.
-    ///
-    /// The band is wide on purpose (0.6…1.7). Both values carry kAlphaBias, so a
-    /// correct pair sits near 1.0, and the width is there to absorb the ±30 %
-    /// each fit is known to carry — not to make the test easy.
-    ///
-    /// It latches: once corroborated, the cap stays open for the session. alpha
-    /// belongs to the GAME, not to the engagement, so lifting and re-pressing the
-    /// finger must not re-arm the guard. Nothing on the target-changed path
-    /// touches it for the same reason.
-    bool alphaTrusted() {
-        if (alphaTrusted_) return true;
-        if (!alphaEst.valid() || !slopeEst.valid()) return false;
-        const float a = alphaEst.value(), s = slopeEst.value();
-        if (!(a > 0.0f) || !(s > 0.0f)) return false;
-        const float r = s / a;
-        if (r > 0.6f && r < 1.7f) alphaTrusted_ = true;
-        return alphaTrusted_;
-    }
-
-    /// The engaged target's box width in screen px. Feeds the GATE — the
-    /// reference PID's trick of expressing "far off" in target widths rather than
-    /// pixels, so the same number means the same thing at every range. Call once
-    /// per frame before step(); the controller holds it until it changes.
+    /// The engaged target's box width in screen px. Feeds the jump thresholds,
+    /// which are expressed as a fraction of a target rather than as a fixed
+    /// number of pixels so a distant 20 px box and a contact-range 300 px box
+    /// are judged the same way. Call once per frame before step().
     void setTargetBoxPx(float px) {
         pidX.setTargetBoxPx(px);
         pidY.setTargetBoxPx(px);
@@ -217,165 +187,99 @@ struct AimController {
     /// step. The caller only has to add the player's own fusion assist on top.
     ///
     /// `dt` is the real step time in seconds and it is used, not decorative: the
-    /// integral and derivative terms are both scaled by it, and the control loop
-    /// genuinely changes rate (120 Hz while aiming, 60 Hz in the detector tier).
+    /// loop genuinely changes rate (120 Hz while aiming, 60 Hz in the detector
+    /// tier) and the derivative, the reconstruction and the integral are all
+    /// normalised by it.
     ///
     /// `freezeX` / `freezeY` are the caller's per-axis deadzone decisions, and
-    /// the caller must NOT zero the returned value afterwards. The band gates the
-    /// integrator's RATE, never its CONTRIBUTION: inside it P and D stop driving
-    /// and the trim stops accumulating, being bled toward the carrier the
-    /// reconstruction measures the target to need (carry = ffVel/alpha_hat, i.e.
-    /// zero at rest and the standing carrier on a strafe) — while still being
-    /// ADDED to the output. Round 15 dropped it from the output as well, and with
-    /// kf = 0 that zeroed the axis outright and read as 乱甩乱晃; see the round-16
-    /// section of tracking/pid_controller.h.
+    /// the caller must NOT zero the returned value afterwards: inside the band
+    /// the prediction term is STILL ADDED, which is the one term that follows a
+    /// moving target. Round 15 suppressed the integral inside the band instead
+    /// and with kf = 0 that zeroed the axis outright, which read on the device
+    /// as 乱甩乱晃.
     ///
     /// `targetChanged` says the caller picked a DIFFERENT track this step. The
     /// caller knows (it has the track id); the controller cannot tell a switch
-    /// from fast motion by looking at the error alone, and guessing wrong cost
-    /// the integral that damps a large swing. Both axes are resynced together —
-    /// a switch changes both.
-    /// `measurementCorrected` is the caller's knowledge that the TRACKER
-    /// re-associated this step — it pulled the published centre back onto a
-    /// detector result one render frame old instead of letting the model advance
-    /// it by its own velocity. The controller must be told, and cannot infer it:
-    /// the artifact it has to reject is proportional to our own output, so from
-    /// the error alone it is indistinguishable from a genuinely fast target. See
-    /// the parameter of the same name on AimController::update().
+    /// from fast motion by looking at the error alone.
+    ///
+    /// `measurementCorrected` says the TRACKER re-associated this step — it
+    /// pulled the published centre back onto a detector result one render frame
+    /// old instead of letting the model advance it by its own velocity. The
+    /// controller must be told and cannot infer it: the artifact is
+    /// proportional to our own output, so from the error alone it is
+    /// indistinguishable from a genuinely fast target. The controller responds
+    /// by HOLDING its velocity estimate for one frame rather than updating it
+    /// from a difference that is not a velocity.
     void step(float errX, float errY, float dt, bool freezeX, bool freezeY,
               bool targetChanged, bool measurementCorrected,
               float& outX, float& outY) {
-        // The delay-aligned command must be read BEFORE update() shifts the ring:
-        // it is the u(k−L) that produced the error we are about to act on, and it
-        // is the regressor's increment in the plant-gain fit.
-        const float uDelayed = pidX.delayedCommand();
-
         outX = pidX.update(errX, dt, freezeX, targetChanged, measurementCorrected);
         outY = pidY.update(errY, dt, freezeY, targetChanged, measurementCorrected);
-
-        // The plant gain is a property of the game, not of an axis, so one fit on
-        // X serves both. Pushed UNCONDITIONALLY, not only while valid(): the
-        // estimator's value() starts at kAlphaHatSeed (0.10, the SAFE side) and
-        // is never unset, and pushing it only on `valid()` is what left the
-        // controller on its 1.0 default until the first successful fit — an
-        // OVER-estimate of a touch game's ~0.1 plant gain, i.e. +0.9·kf of
-        // positive feedback and the crosshair leaving the screen. `valid()` is
-        // now for the log's `?` marker only.
-        alphaEst.push(errX, uDelayed);
-        // ROUND 19: the SECOND, independent fit — differences against the delayed
-        // command instead of cumulative positions against it. Same inputs, an
-        // entirely different piece of arithmetic, which is what makes agreement
-        // between the two mean something (see alphaTrusted()).
-        slopeEst.push(errX, uDelayed);
-
-        // Where both have an answer they are AVERAGED rather than chosen between:
-        // each carries ±30 % of its own and the errors are of different kinds (one
-        // detrends quadratically over a longer window, the other linearly over a
-        // short one), so the mean is better than either. Where only one has an
-        // answer, that one is used — a surviving fit is still a measurement, and
-        // the seed is a guess.
-        const bool  pv = alphaEst.valid(), sv = slopeEst.valid();
-        const float a  = (pv && sv)
-                             ? 0.5f * (alphaEst.value() + slopeEst.value())
-                             : (pv ? alphaEst.value()
-                                   : (sv ? slopeEst.value() : alphaEst.value()));
-        pidX.setAlphaHat(a);
-        pidY.setAlphaHat(a);
     }
 
-    /// The estimated plant gain in force (alpha_hat), for the log. Compare it
-    /// against the box size and the reachable view speed to sanity-check the
-    /// gains: the P-loop's useful ceiling is kp·alpha < 0.285 at this delay.
-    float alphaHatValue() const { return pidX.alphaHatValue(); }
-    /// True once the plant-gain fit has ever converged. For the log.
-    bool  alphaValid() const { return alphaEst.valid(); }
+    /// The reconstructed target velocity each axis is working from, in SCREEN
+    /// px per frame. THE number to watch: it should settle at the target's own
+    /// speed and hold there, track sign changes cleanly, and read ~0 when the
+    /// target is standing. A value that keeps flipping sign while the crosshair
+    /// sways means the prediction term is chasing its own echo — read it with
+    /// `trust` (below) and lower 前馈.
+    float velX() const { return pidX.velValue(); }
+    float velY() const { return pidY.velValue(); }
 
-    /// Trim of each axis, for the diagnostic log. Read it AGAINST carryX/Y, not
-    /// against a fixed idea of "small": the trim is the DC carrier whenever kf is
-    /// small (the user's own tuning runs kf = 0), so |trim| ≈ |carry| is the
-    /// healthy state on a moving target, and trim pinned at its leash means the
-    /// requirement is beyond what the loop may deliver. At rest both should be 0.
-    float trimX() const { return pidX.integralValue(); }
-    float trimY() const { return pidY.integralValue(); }
-
-    /// The feed-forward's contribution to each axis, in px. THE number to watch
-    /// on a moving target: it should settle at kf·ΔT/alpha and hold there. Near
-    /// zero while the error trails the target means the feed-forward is not
-    /// running (kf = 0, or every frame reports targetChanged) — and at kf = 0 it
-    /// is zero BY DESIGN, which is why `carry` below exists.
+    /// The prediction term's contribution to each axis's output, in finger px.
+    /// It should settle at `lookahead × u_ss` on a moving target and hold, which
+    /// at the shipped 0.80 is most of the command. Near zero on a strafing
+    /// target while the velocity above is large means the trust gate has closed
+    /// (see below) or 前馈 is too low.
     float ffX() const { return pidX.ffValue(); }
     float ffY() const { return pidY.ffValue(); }
 
-    /// The carrier each axis is measured to NEED, in finger px/step — the trim's
-    /// own units, and the value the deadzone bleeds the trim toward. Unlike `ff`
-    /// this is NOT scaled by kf, so it is the number that stays meaningful at
-    /// kf = 0. On a strafe read it against `trim`: the two should converge. At
-    /// rest it should read 0, and trim should follow it there.
-    float carryX() const { return pidX.carryPx(); }
-    float carryY() const { return pidY.carryPx(); }
+    /// The residual cleaner's contribution, finger px — the term that USED to be
+    /// the carrier and is now a small mop-up value. Large and growing on a
+    /// moving target means 前馈 is not supplying the carrier; a value that
+    /// survives the target stopping means the error never read 0, so check `e`
+    /// before touching ki.
+    float trimX() const { return pidX.integralValue(); }
+    float trimY() const { return pidY.integralValue(); }
 
-    /// True while the STOP DETECTOR (round 17) has that axis at rest — the
-    /// measured carrier has read ~0 for kStopHoldSteps in a row — and is
-    /// therefore bleeding the trim toward it. This is the mechanism that removes
-    /// the shake a large ki leaves behind when a moving target STOPS, and it is
-    /// the one case the deadzone's own trigger cannot reach, because the
-    /// oscillation itself holds |e| outside the band. Read it with trimX/Y and
-    /// carryX/Y; see PPID::stoppedNow() for what each combination means.
-    bool stoppedX() const { return pidX.stoppedNow(); }
-    bool stoppedY() const { return pidY.stoppedNow(); }
+    /// The P and D contributions, finger px.
+    float propX() const { return pidX.pValue(); }
+    float propY() const { return pidY.pValue(); }
+    float derivX() const { return pidX.dValue(); }
+    float derivY() const { return pidY.dValue(); }
 
-    /// The damping term's contribution to each axis's output, in px, for the
-    /// diagnostic log. A D contribution that is always ~0 while the target
-    /// strafes means kd is not doing anything; one that is comparable to the
-    /// trim means it is carrying the loop and kp can be raised.
-    float derivX() const { return pidX.derivPx(); }
-    float derivY() const { return pidY.derivPx(); }
+    /// Trust in the velocity estimate, 0…1. Collapsing toward 0 means the
+    /// estimate is ringing, and the controller's answer is to remove its own
+    /// excitation — this gate is the negative feedback on the controller's own
+    /// fault, the mechanism the old loop never had. It can cut the prediction
+    /// term to tracking::kFfTrustFloor (0.25) and no further, so the carrier is
+    /// never lost entirely.
+    float trustX() const { return pidX.trustValue(); }
+    float trustY() const { return pidY.trustValue(); }
+
+    /// The output gain in force, 0.35…1.0. A re-lock starts soft (0.45–0.70)
+    /// and tightens as the error closes; it is 1.0 at a steady lock, so it costs
+    /// nothing when the aim is already on target.
+    float outGainX() const { return pidX.outGain(); }
+    float outGainY() const { return pidY.outGain(); }
+
+    /// True once enough consecutive velocity samples have agreed on a direction
+    /// for a velocity to be published at all. While false the prediction term is
+    /// zero — the first few frames of an engagement, by design.
+    bool  velReadyX() const { return pidX.velocityReady(); }
+    bool  velReadyY() const { return pidY.velocityReady(); }
 
     void reset() {
         pidX.reset();
         pidY.reset();
-        // NOT alphaEst: the plant gain belongs to the game, not to the engagement.
-        // Wiping it here would throw away a converged fit every time the finger is
-        // lifted, and the FF would spend the next 0.75 s back at the 1.0 default.
     }
 
-    /// The feed-forward strength ACTUALLY in force, for the log — the slider's
-    /// value once the guard is open, the guarded value before that. Print THIS
-    /// one: `ffGainSlider()` below is the knob, and the two differ exactly when
-    /// the round-19 guard is doing something.
-    float ffGainValue() const { return kfEff_; }
-    /// The kf slider's own value, unguarded. The knob, not the working point.
-    float ffGainSlider() const { return ffGain; }
-    /// True once both fits have agreed on the plant gain. For the log: while it
-    /// is false the kf row is CAPPED, which is the intended state for the first
-    /// fraction of a second of a session and not a fault.
-    bool alphaCorroborated() const { return alphaTrusted_; }
     /// The output ceiling in force (finger px/step). A constant.
     float outLimitPx() const { return pidX.outLimitPx(); }
+    /// 前馈 in force — the slider's value, unchanged (there is no guard any more).
+    float ffGainValue() const { return pidX.lookaheadValue(); }
 
 private:
-    /// Mirrors the kf row. 0.05 is the round-15 default: the integral carries
-    /// the DC command and the feed-forward trims it. ROUND 19 keeps that default
-    /// and widens the row to kFfStrengthMax (0.80) — the working point is still
-    /// the user's to pick, and 0.05 remains the shipped one.
-    float ffGain = 0.05f;
-    /// The strength in force after the guard, rate-limited toward `ffGain`. It
-    /// starts at ZERO rather than at the slider's value: on the first frame
-    /// nobody has corroborated alpha_hat, and starting with the guard already
-    /// satisfied is the one thing that would make the guard useless. Rising from
-    /// zero costs nothing — the integral carries the DC command regardless of kf
-    /// — and, being a rate, it cannot step.
-    float kfEff_ = 0.0f;
-    /// One plant-gain fit, shared by both axes (alpha is the game's sensitivity,
-    /// not an axis property).
-    tracking::AlphaEstimator alphaEst;
-    /// ROUND 19: a SECOND, independent fit on the same plant gain — a straight
-    /// line through (Δe, u(k−L)) instead of a quadratic through (e, U(k)). Its
-    /// whole purpose is to be something the first fit can be checked against;
-    /// see alphaTrusted().
-    tracking::SlopeAlphaEstimator slopeEst;
-    /// Latched by alphaTrusted(): true once both fits have agreed at least once.
-    bool alphaTrusted_ = false;
 };
 
 // ── Aim-touch state machine ───────────────────────────────────────────────
@@ -517,6 +421,34 @@ struct PageAim {
 
     /// ── Controller parameters ─────────────────────────────────────────────
     ///
+    /// ⚠ ROUND 22 — READ THIS BEFORE THE LONG NOTES BELOW.
+    ///
+    /// The controller was replaced wholesale (see the header of
+    /// tracking/predictive_pid.h). The rows kept their names and their units —
+    /// kp/ki/kd are still px of output per px of error, per second and per step
+    /// — but the BALANCE they sit in changed completely, so the prose under
+    /// each row below describes the OLD loop and is kept only as the record of
+    /// how these numbers were arrived at. Where it disagrees with this banner,
+    /// this banner wins.
+    ///
+    /// What changed, in one line each:
+    ///   * 前馈 is now the FRACTION OF THE CARRIER the prediction term supplies
+    ///     (the same idea as before, but with a real ceiling of 0.80 and no
+    ///     1/alpha_hat under it). It carries 80 % of a moving target's command.
+    ///   * The INTEGRAL is no longer the carrier. It is a residual cleaner that
+    ///     is dropped outright whenever the error reads zero — which is what
+    ///     removes "the target stopped and the aim sways".
+    ///   * kp can therefore be larger than the old ultra-conservative 0.04: the
+    ///     contractive loop gain is still kp·alpha, and with the frozen plant
+    ///     model at 0.10 the bound kp·alpha < 0.30 (at L ≈ 6) puts the shipped
+    ///     0.40 about 7× inside it.
+    ///   * nothing is estimated on-line any more, so none of these values is
+    ///     fighting a moving target of its own.
+    ///
+    /// The gain block is re-seeded once by the schema change (kCtlSchema 13) —
+    /// the only revision where that was done for kp/ki/kd as well as for 前馈,
+    /// because the loop they were tuned against no longer exists.
+    ///
     /// All three gains are in ONE consistent unit system — per control step —
     /// and the defaults below were chosen by sweeping the loop over the two
     /// quantities nobody knows: alpha (the game's sensitivity, view px per
@@ -624,13 +556,13 @@ struct PageAim {
     /// only observable on a fresh config file. That is deliberate (a stored
     /// tuning is never silently overwritten), and it also means "I changed the
     /// default" is not something you can verify without deleting config.json.
-    widgets::SliderState kp{0.04f, 0.0f, 0.6f, 0.01f};
-    widgets::SliderState ki{0.12f, 0.0f, 4.0f, 0.01f};
-    widgets::SliderState kd{0.15f, 0.0f, 2.0f, 0.01f};
+    widgets::SliderState kp{0.40f, 0.0f, 2.0f, 0.01f};
+    widgets::SliderState ki{0.20f, 0.0f, 4.0f, 0.01f};
+    widgets::SliderState kd{0.60f, 0.0f, 3.0f, 0.01f};
     /// 输出平滑 — EMA on the controller's output, 0..1, 1.0 = OFF. Shipped at
     /// 0.85: it trades a small, bounded amount of phase lag for a real cut in the
     /// finger-command noise. See the row's note in drawAimSection().
-    widgets::SliderState outSmooth{0.85f, 0.0f, 1.0f, 0.05f};
+    widgets::SliderState outSmooth{1.0f, 0.0f, 1.0f, 0.05f};
 
     /// Lead, in detector frames: how far ahead of its tracked centre the aim
     /// places the target, to pay for the delay between the screenshot the
@@ -671,8 +603,35 @@ struct PageAim {
     // 18 — see settings_section.h, which now owns the slider and the note. It is
     // tracker behaviour and it belongs next to 丢失帧, not next to the gains.
 
-    /// kf — the velocity feed-forward STRENGTH. NOT the plant gain any more.
+    /// 前馈 — the prediction term's share of the carrier. ROUND 22: same row,
+    /// same place, same "how much of the standing command does the feed-forward
+    /// supply" reading as the kf row always had, but the quantity under it is
+    /// now a plain fraction with a PROVABLE ceiling instead of a strength on a
+    /// 1/alpha_hat:
     ///
+    ///     ff [finger px] = 前馈 · v̂ [screen px/frame] / tracking::kSensFrozen
+    ///
+    /// and at a steady lock v̂ = kSensFrozen·u, so the term settles at
+    /// `前馈 · u_ss` — exactly the carrier share, whatever the game's real
+    /// sensitivity turns out to be. The reconstruction subtracts our own delayed
+    /// command to find v̂, so the term is a delayed copy of our own output with
+    /// coefficient exactly `前馈`, and **前馈 < 1 is the whole stability
+    /// margin**. That is why the row stops at tracking::kLookaheadMax (0.80) and
+    /// why there is no guard and no rate limit on it any more: every position of
+    /// this slider is safe, so the knob goes straight through to the controller.
+    ///
+    /// SET IT HIGH. 0.80 is the shipped value and the useful band is 0.60…0.80.
+    /// Below about 0.5 the integral has to make up the difference, which is the
+    /// old arrangement and brings the old behaviour with it. At 0 the term is
+    /// off exactly and the integral carries everything — legal, and it is what
+    /// the old default did, but it is no longer the recommended working point.
+    ///
+    /// ⚠ WHAT THE OLD NOTE BELOW DESCRIBES. Everything from here to the slider
+    /// line is the history of the kf row under the PIDF — the 1/alpha_hat
+    /// formula, the guard, the self-copy stability window. It is kept because it
+    /// is how the current understanding was reached, and it is NOT a description
+    /// of what this row does now.
+    /// 
     /// ROUND 10 WAS WRONG, and the way it was wrong is worth keeping. It asked
     /// for kf = 1/alpha, where alpha is the game's sensitivity in view px per
     /// finger px. That is algebraically right and practically a trap, because the
@@ -785,7 +744,7 @@ struct PageAim {
     // stopped at 0.50 while the header's own log line described a working point
     // of 1.0), and a range that disagrees with the derivation is worse than a
     // narrow one. 0.80 is the last value the self-copy window calls safe.
-    widgets::SliderState ffGain{0.05f, 0.0f, tracking::kFfStrengthMax, 0.01f};
+    widgets::SliderState ffGain{tracking::kLookaheadDefault, 0.0f, tracking::kLookaheadMax, 0.01f};
 
 
     /// Aim deadzone (0.0–1.0, step 0.05, two decimals): ports the old project's

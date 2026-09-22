@@ -351,6 +351,40 @@ static void driveAimToTarget(TouchAimState& st, int slot,
                 measurementCorrected, pidX, pidY);
 
     // ── Aim telemetry ──────────────────────────────────────────────────────
+    //
+    // ⚠ ROUND 22 — THE FIELD LIST BELOW IS THE OLD LINE'S and is kept as the
+    // record of how the old loop was read. The line now printed is:
+    //
+    //   mean e  : unchanged — the error the controller saw (SCREEN px). It should
+    //             hover within a pixel of zero on a moving target (the prediction
+    //             term carries the command and the integral cleans up the rest)
+    //             and go to zero outright when the target stops.
+    //   tot     : unchanged — the total command this step, finger px.
+    //   ff      : the prediction term's contribution, finger px. THE number to
+    //             watch: it should settle at 前馈·u_ss and HOLD. On a 600 px/s
+    //             strafe at 前馈 0.80 that is 0.8·(600/120)/0.10 = 40 finger px.
+    //   v       : the reconstructed target velocity, SCREEN px/frame — the input
+    //             the prediction term is built from, and the number this whole
+    //             design exists to get. It should read the target's own speed,
+    //             change sign cleanly at a reversal, and read 0 at rest. A `v`
+    //             that keeps flipping sign while the crosshair sways is the
+    //             prediction term chasing its own echo.
+    //   tr      : TRUST in that velocity, 0…1. The controller's own detector for
+    //             the fault above: it collapses when `v` is unstable, and it
+    //             gates the prediction term down to 25 % when it does. Read it
+    //             WITH `v` and `ff` — `tr` low and `ff` low means the loop has
+    //             withdrawn its own excitation, which is the mechanism working,
+    //             not a bug.
+    //   og      : the output gain in force, 0.35…1.0. 1.0 at a steady lock; soft
+    //             during a re-lock, which is what stops a target switch flinging.
+    //   vok     : 1 once the velocity has been published at all (it needs six
+    //             samples and two agreeing on a direction). 0 for the first few
+    //             frames of an engagement is by design.
+    //   trim/p/d: unchanged in kind — the residual cleaner, the proportional and
+    //             the damping contributions, finger px.
+    //
+    // The rest is the old text.
+    //
     // Deliberately at the aim's own rate rather than per frame: the numbers a
     // diagnosis needs are the ERROR and what the controller did about it, and
     // reading them at 120 Hz from logcat is neither possible nor useful. Four
@@ -430,25 +464,25 @@ static void driveAimToTarget(TouchAimState& st, int slot,
         sSumX += dex; sSumY += dey;
         if (++sTick >= 480) {
             LOGI("aim: id=%d mean e=(%.1f,%.1f) tot=(%.2f,%.2f) "
-                 "ff=(%.1f,%.1f) cr=(%.1f,%.1f) d=(%.2f,%.2f) trim=(%.1f,%.1f) "
-                 "kf=%.2f a=%.2f%s stop=(%d,%d) lim=%.0f yard=%.0f dt=%.1fms",
+                 "ff=(%.1f,%.1f) v=(%.1f,%.1f) d=(%.2f,%.2f) trim=(%.1f,%.1f) "
+                 "p=(%.1f,%.1f) kf=%.2f tr=(%.2f,%.2f) og=(%.2f,%.2f) "
+                 "vok=(%d,%d) lim=%.0f yard=%.0f dt=%.1fms",
                  st.lastTargetId,
                  sSumX / sTick, sSumY / sTick, pidX, pidY,
                  st.aim.ffX(), st.aim.ffY(),
-                 st.aim.carryX(), st.aim.carryY(),
+                 st.aim.velX(), st.aim.velY(),
                  st.aim.derivX(), st.aim.derivY(),
                  st.aim.trimX(), st.aim.trimY(),
-                 // ROUND 19: `kf` prints the strength ACTUALLY in force — the
-                 // slider's value once the guard is open — and the single
-                 // character after `a` says which state the plant-gain estimate is
-                 // in: `*` both fits agree and the cap is OFF, `!` the cap is
-                 // still ON, `?` no fit has ever succeeded (alpha_hat is still the
-                 // seed). Reading `kf` BELOW the slider together with `!` is the
-                 // guard working, not a fault; `*` on a moving target is the state
-                 // the whole round is trying to reach.
-                 st.aim.ffGainValue(), st.aim.alphaHatValue(),
-                 st.aim.alphaCorroborated() ? "*" : (st.aim.alphaValid() ? "!" : "?"),
-                 st.aim.stoppedX() ? 1 : 0, st.aim.stoppedY() ? 1 : 0,
+                 st.aim.propX(), st.aim.propY(),
+                 // ROUND 22: 前馈 prints the slider's value unchanged (there is
+                 // no guard) and the two characters after it are gone — they
+                 // described the plant-gain estimator, which no longer exists.
+                 // What replaced them is `tr`, trust in the velocity estimate,
+                 // and `v`, the estimate itself.
+                 st.aim.ffGainValue(),
+                 st.aim.trustX(), st.aim.trustY(),
+                 st.aim.outGainX(), st.aim.outGainY(),
+                 st.aim.velReadyX() ? 1 : 0, st.aim.velReadyY() ? 1 : 0,
                  st.aim.outLimitPx(),
                  st.lastTargetBox, dt * 1000.0f);
             sTick = 0; sSumX = 0.0f; sSumY = 0.0f;
@@ -851,49 +885,45 @@ void drawAimSection(ImDrawList* dl, float x, float& y, float w,
 
     // ── Controller parameters ───────────────────────────────────────────────
     // All FOUR gains are per control step and share one unit system — see the
-    // class note in tracking/pid_controller.h for what each one does, and the
-    // note on PageAim for why the shipped set is what it is (Kp 0.04 / Ki 0.12 /
-    // Kd 0.15 / Kf 0.05).
+    // class note in tracking/predictive_pid.h for what each one does now, and the
+    // note on PageAim for why the shipped set is what it is (Kp 0.40 / Ki 0.20 /
+    // Kd 0.60 / Kf 0.80).
     //
-    // The order is deliberate and is the order they act in: Kp (proportional),
-    // Ki (the standing carrier), Kd (damping), Kf (the measured lead). Kf sits
-    // directly under Kd as of round 18 — it is the fourth gain, so it belongs
-    // beside the other three rather than after the two filter rows, and it is
-    // spelt with a capital K to match them.
+    // ROUND 22: the labels did not change and the ORDER did not change, but two
+    // of the four changed what they mean. Kf is now 前馈 — the fraction of the
+    // standing command the prediction term supplies, capped at 0.80 — and Ki is
+    // no longer the carrier. Both changes are the point of the round: the
+    // integral could not be cleared while it was the carrier, and not being able
+    // to clear it is what left the aim swaying after a target stopped.
+    //
+    // The order is still the order they act in: Kp (proportional), Ki (the
+    // residual cleaner), Kd (damping), Kf (the carrier), with Kf directly under
+    // Kd as of round 18.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kp,        "Kp",       2, es);
     y += rowSl + gap;
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ki,        "Ki",       2, es);
     y += rowSl + gap;
     // Kd is PER STEP and dimensionless now (it used to be per-second, which made
     // its real weight kd*120 and put the useful part of the slider in its first
-    // few pixels). Two decimals match the 0.05 step.
+    // few pixels). Two decimals match the 0.01 step.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.kd,        "Kd",       2, es);
     y += rowSl + gap;
-    // Kf — the velocity feed-forward STRENGTH (0.00–0.50, step 0.01, default
-    // 0.05). It is NOT a calibration any more. Round 10 demanded kf = 1/alpha
-    // (the reciprocal of the game's sensitivity in view px per finger px), and
-    // that is what broke it: the number then did two jobs, and expanding the
-    // formula shows the second job was "add our own delayed command back into the
-    // input, with gain exactly 1". A pole at z = 1. It tracked and never settled
-    // and overshot when the target stopped, all from the same cause.
+    // Kf — 前馈, the prediction term's share of the carrier. 0.00–0.80, step 0.01,
+    // default 0.80, and the ceiling is a hard stability limit rather than a
+    // preference: the term is a delayed copy of our own output with coefficient
+    // exactly this value, so `Kf < 1` is the margin and 0.80 is 20 % inside it.
     //
-    // ROUND 15 — THE RANGE IS THE USER'S: 0.50 is the ceiling because the residual
-    // self-copy coefficient s = kf·(1 − alpha/alpha_hat) cannot leave the unit
-    // circle there even with the estimator off by 2×, so every position of the row
-    // is usable and none of them is a runway.
+    // SET IT HIGH. This is now the term that follows a moving target; Ki only
+    // cleans up what is left over. Below about 0.5 the integral has to make up
+    // the difference — which is the old arrangement, and brings the old
+    // behaviour (a charge that cannot be dropped at rest) with it.
     //
-    // HOW TO SET IT. 0 is a complete setting — the integral learns the target's
-    // velocity by itself and the feed-forward does nothing. Raise it to take
-    // high-frequency load OFF the integral (a strafe whose error keeps one sign
-    // and never quite closes), and stop as soon as the error stops showing a
-    // sign; past that all it does is pass the tracker's noise to the finger,
-    // amplified by kf/alpha_hat. The shipped 0.05 is a trim on top of the
-    // integral, and it is what lets the shipped Ki be as low as 0.12.
-    //
-    // Its row was 速度前馈 once, feeding an estimator that was structurally a bare
-    // integrator (it measured its own output with no restoring term, so it
-    // oscillated — 1453 px peak-to-peak at alpha = 2.5), and it was briefly two
-    // rows (this one plus 灵敏度补偿). Both are gone.
+    // ⚠ The long note this row used to carry described kf as a strength on a
+    // feed-forward scaled by 1/alpha_hat, with an on-line estimator under it and
+    // a stability window derived from the estimator's error. None of that is
+    // true any more — there is no estimator in the loop at all. The history is
+    // kept in the PageAim note above the row's own declaration; what matters at
+    // the row is the sentence before this one.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl), g_pageAim.ffGain,    "Kf",       2, es);
     y += rowSl + gap;
     // 输出平滑 — EMA on the controller's OWN output. 0..1, where 1.0 is OFF.
@@ -1203,18 +1233,20 @@ void syncAimPage() {
     // This must be a PURE assignment. It used to run through init(), which ended
     // in reset(), so the integrator and the derivative history were wiped once
     // per render frame — see AimController::setGains() in the header and the root
-    // cause note at the top of tracking/pid_controller.h. Applying gains and
+    // cause note at the top of tracking/predictive_pid.h. Applying gains and
     // clearing state are now separate operations, and only a new engagement (or
     // a re-anchor-free press) calls reset().
     //
-    // Four gains and the output EMA: that is the whole parameter set. There is no
-    // sensitivity compensation argument any more and nothing is scaled — the
-    // fifth argument is kf, the feed-forward STRENGTH. It is not the plant gain:
-    // the reconstruction constant is estimated on-line inside the controller, so
-    // kf is a plain multiplier whose correct value is the constant ≈1.0. The
-    // output ceiling and the derivative's filter constant are loop constants:
-    // tracking::kOutLimitPx / kTrimLimitPx / kDerivTauSec. See
-    // AimController::setGains().
+    // Four gains and the output EMA, as before; the fifth argument is 前馈, whose
+    // MEANING changed in round 22 while its row kept its name and its place. It
+    // was a strength on a feed-forward whose other factor was 1/alpha_hat (an
+    // on-line estimate, and the source of most of rounds 1–21); it is now the
+    // FRACTION OF THE CARRIER the prediction term supplies, with a hard ceiling
+    // of tracking::kLookaheadMax because the term is a delayed copy of our own
+    // output and `前馈 < 1` is the stability margin. Everything else the old code
+    // needed here — the estimator, the guard, the rate limit on kf — is gone
+    // with the controller. The remaining loop constants are
+    // tracking::kAimOutLimitPx / kAimTrimLimitPx / kFfLimitPx.
     p.touchAim.aim.setGains(
         p.kp.value, p.ki.value, p.kd.value, p.outSmooth.value,
         p.ffGain.value);
