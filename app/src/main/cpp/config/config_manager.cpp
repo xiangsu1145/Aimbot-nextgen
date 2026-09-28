@@ -164,7 +164,7 @@ constexpr const char* kPath = "/data/local/tmp/aimbotng/config.json";
 // 0.80 as the working value. Everything the old file stored about the loop is
 // therefore not merely mistuned, it is about a different loop, which is exactly
 // the case this constant exists for.
-constexpr int kCtlSchema = 16;
+constexpr int kCtlSchema = 17;
 
 // ── Widget helpers: store/restore `.value` only ─────────────────────────────
 
@@ -479,12 +479,12 @@ void apply(const json& j) {
             // stored 0.90 — found by trial against the old loop — would arrive
             // here as an unexplained oscillator and look like the new code being
             // broken again.
-            a.kp.value = 0.055f;
-            a.ki.value = 0.005f;
-            a.kd.value = 0.030f;
-            a.ffGain.value = 0.65f;
+            a.kp.value = 0.06f;
+            a.ki.value = 0.01f;
+            a.kd.value = 0.15f;
+            a.ffGain.value = tracking::kLookaheadDefault;
             a.outSmooth.value = 1.0f;
-            a.aimDelayFrames.value = 0.40f;
+            a.aimDelayFrames.value = 0.0f;
             LOGI("config: controller schema %d (file had %d) — the loop was "
                  "replaced, so the whole gain block is re-seeded: "
                  "kp/ki/kd/前馈/输出平滑/延迟补偿 = %.2f/%.2f/%.2f/%.2f/%.2f/%.2f",

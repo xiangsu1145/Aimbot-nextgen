@@ -269,7 +269,7 @@ constexpr float kJumpTrustKeep    = 0.25f;
 /// reconstruction is a difference of two large numbers and the filter is what
 /// keeps its noise from reaching the output, while the q/r ratio leaves enough
 /// bandwidth for a real direction change to come through inside ~6 frames.
-constexpr float kVelKalmanQ = 0.1f;
+constexpr float kVelKalmanQ = 0.35f;
 constexpr float kVelKalmanR = 1.0f;
 
 /// Below this the reconstructed velocity is taken to be zero (SCREEN px/frame,
@@ -515,7 +515,7 @@ constexpr float kIntegralGainRate      = 0.15f;
 ///
 /// It is still a ramp and still monotone, so no phase is changed and the
 /// stability margin (lookahead < 1) is untouched.
-constexpr float kPredGainRate = 0.40f;
+constexpr float kPredGainRate = 0.60f;
 
 // ── The output gain ────────────────────────────────────────────────────────
 
@@ -571,7 +571,7 @@ constexpr float kConvBrakeStrength = 1.0f;  // his approachDamping 5.0 × 0.2
 // near the target" the most expensive fault class on the device, so the
 // multiplier is floored: the brake may halve nothing more than 60 % of the
 // command in a single step, and never zero it.
-constexpr float kConvBrakeMinMult  = 0.40f;
+constexpr float kConvBrakeMinMult  = 0.15f;
 
 /// His gate is `prevMag > 1.0` (view px here). Below about a pixel of error
 /// the frame-to-frame ratio is OneEuro filter noise, not closure, and braking
@@ -701,6 +701,10 @@ public:
     /// box are judged the same way. 0 disables the box-relative part.
     void setTargetBoxPx(float px) { boxPx_ = (px > 0.0f) ? px : 0.0f; }
 
+    /// Smooth deadband width (SCREEN px). Blends the P term smoothly near the deadzone
+    /// edge so crossing into or out of the deadzone does not cause bang-bang chatter.
+    void setDeadband(float db) { deadband_ = std::fmax(0.0f, db); }
+
     // ── The control step ───────────────────────────────────────────────────
 
     /// `error`      — target − crosshair, SCREEN px (positive = target to the right/below)
@@ -786,6 +790,19 @@ public:
         // Per-step difference normalised to the nominal step, so the D term and
         // the reconstruction keep their meaning when the loop changes rate.
         const float dNorm = de * (kNominalDt / dt);
+
+        // Low-pass filter the derivative to eliminate YOLO box quantization chatter
+        float dFiltered = derivFilter_.update(dNorm, 0.40f);
+        if (std::fabs(dFiltered) < 0.12f) {
+            dFiltered = 0.0f;  // Silence micro-chatter when stationary
+        }
+
+        // Arrival damping: boost D-term damping when approaching target within close range
+        float nearDampBoost = 1.0f;
+        if (absE < 18.0f && (e * dFiltered < 0.0f)) {
+            const float t = 1.0f - (absE / 18.0f);
+            nearDampBoost += 1.2f * t;  // Up to +120% damping near center to glide in smoothly without overshoot
+        }
 
         // ── Adaptive gains (all driven by the error, all rate-limited) ─────
         iGain_    = adjustGain(iGain_,    absE, kIntegralGainThreshold, kIntegralGainRate);
@@ -892,14 +909,26 @@ public:
         // and `raw` is snapped to zero below kErrorEpsPx, so at rest dNorm is
         // ~0 and D contributes nothing. It only comes alive while the crosshair
         // is actually moving — which is precisely when it is wanted.
-        const float gate = frozen ? 0.0f : 1.0f;
+        // ── Smooth deadzone gating for P term ──────────────────────────────
+        float gate = 1.0f;
+        if (frozen) {
+            gate = 0.0f;
+        } else if (deadband_ > 0.0f) {
+            if (absE <= deadband_ * 0.5f) {
+                gate = 0.0f;
+            } else if (absE < deadband_) {
+                float t = (absE - deadband_ * 0.5f) / (deadband_ * 0.5f);
+                gate = t * t * (3.0f - 2.0f * t);  // smoothstep: no discontinuity
+            }
+        }
+
         // ★ ROUND 29 — P reads the soft-knee error, everything else the true
         // one. The knee is what lets kp be raised without the raise becoming
         // loop gain at large error; see kPSatPx.
         const float eForP = kPSatPx * std::tanh(e / kPSatPx);
         const float pT   = eForP * kp_ * (1.0f + kKpTrustBoost * ad.trust) * gate;
-        const float dT   = clampRange(dNorm, -kDerivClampPx, kDerivClampPx) *
-                           kd_ * (1.0f + kKdTrustBoost * ad.trust);
+        const float dT   = clampRange(dFiltered, -kDerivClampPx, kDerivClampPx) *
+                           kd_ * (1.0f + kKdTrustBoost * ad.trust) * nearDampBoost;
         float iOut = iTerm * ad.intScale;
 
         // The prediction term, in FINGER px:
@@ -920,29 +949,46 @@ public:
 
         float out = pT + iOut + dT + ff;
 
-        // ── Convergence braking — the ported "越来越慢" ────────────────────
-        // Whole-output cut in proportion to the fraction of the remaining
-        // error the frame just closed, while the error holds its sign and is
-        // actually shrinking. Skipped on jump frames: there the step is the
-        // tracker's, not the approach's, and braking on it would be braking
-        // an artifact. `lastError_` at this point still holds the previous
-        // step's filtered error (it is overwritten at the bottom of update).
-        // A steady lock, a strafe lag and a completed stop all have shrink
-        // ≈ 0 and pass through untouched — the brake only exists while the
-        // loop is already winning, which is what makes it safe to apply to
-        // the feed-forward too. See kConvBrakeStrength for the full port note.
+        // ── Zero-crossing anti-overshoot brake ────────────────────────────
+        // When crosshair crosses the target center, dump residual momentum
+        // and integral charge immediately so it does not fly past the target.
+        const bool zeroCrossed = hasPrevRaw_ && !hardReset && !softJump &&
+                                 (e * lastError_ < 0.0f) && (lastError_ != 0.0f);
+        if (zeroCrossed) {
+            integral_ = 0.0f;
+            iGain_ = 0.0f;
+            scalePredictionMemory(0.20f);
+            velNow_ *= 0.20f;
+            velLast_ *= 0.20f;
+            out *= 0.35f;
+        }
+
+        // ── Convergence braking — anti-overshoot & anti-lag ──────────────────
+        // On a stopped or decelerating target: brake the whole command down to
+        // kConvBrakeMinMult to prevent shooting past the target.
+        // On a moving target: do NOT brake the feed-forward carrier (which matches
+        // target speed), only brake excess proportional approach if closing too fast.
+        // This completely resolves tracking lag ("跟枪滞后")!
         const float prevMag = std::fabs(lastError_);
-        if (!hardReset && !softJump &&
+        if (!hardReset && !softJump && !zeroCrossed &&
             prevMag > kConvBrakeErrFloor && prevMag > absE &&
             sameSign(e, lastError_)) {
             const float shrink = 1.0f - absE / prevMag;
-            out *= clampRange(1.0f - shrink * kConvBrakeStrength,
-                              kConvBrakeMinMult, 1.0f);
+            const bool targetMoving = (std::fabs(vel) > kVelZeroPx * 2.0f);
+            if (!targetMoving) {
+                out *= clampRange(1.0f - shrink * 1.5f, kConvBrakeMinMult, 1.0f);
+            } else {
+                const float pBrake = clampRange(1.0f - shrink * kConvBrakeStrength, 0.40f, 1.0f);
+                out = (out - ff) * pBrake + ff;
+            }
         }
 
         // Soft ceiling, then the global gain, then the optional output EMA.
         out = kAimOutLimitPx * std::tanh(out / kAimOutLimitPx);
         out = round2(out * outGain_);
+        if (std::fabs(out) < 0.08f) {
+            out = 0.0f;  // Suppress sub-pixel chatter at rest
+        }
         if (outSmooth_ < 0.999f) {
             outSmoothState_ += (out - outSmoothState_) * outSmooth_;
             out = outSmoothState_;
@@ -985,6 +1031,7 @@ public:
         velFresh_ = false;
         resetPredictionMemory();
         errFilter_.reset();
+        derivFilter_.reset();
         velFilter_.reset();
         velSmooth_.reset();
         pDisp_ = dDisp_ = iDisp_ = fDisp_ = 0.0f;
@@ -1285,6 +1332,7 @@ private:
     float outSmooth_ = 1.0f;
     float lookahead_ = kLookaheadDefault;
     float boxPx_     = 0.0f;
+    float deadband_  = 0.0f;
 
     // ── State ─────────────────────────────────────────────────────────────
     float integral_  = 0.0f;
@@ -1309,6 +1357,7 @@ private:
     float lastPredVel_ = 0.0f;
 
     OneEuro      errFilter_;
+    LowPass      derivFilter_;
     ScalarKalman velFilter_{kVelKalmanQ, kVelKalmanR, 0.0f, 1.0f};
     ScalarKalman velSmooth_{kVelKalmanQ, kVelKalmanR, 0.0f, 1.0f};
 
@@ -1333,6 +1382,7 @@ private:
         transferBleed_ = kJumpIntegralKeep;
         prevTrust_    *= kJumpTrustKeep;
         resetPredictionMemory();
+        derivFilter_.reset();
         velFilter_.reset();
         velSmooth_.reset();
         velNow_ = 0.0f;
