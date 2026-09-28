@@ -1679,6 +1679,7 @@ static void syncAimPageInner() {
     p.touchAim.aim.setGains(
         p.kp.value, p.ki.value, p.kd.value, p.outSmooth.value,
         p.ffGain.value);
+    p.touchAim.aim.setDeadband(p.deadzone.value > 0.0f ? (p.deadzone.value * 2.0f) : 0.3f);
 
     // ── Decide whether the aim loop may fire ────────────────────────────────
     //   * master switch on

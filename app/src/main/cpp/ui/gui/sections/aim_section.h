@@ -26,10 +26,7 @@
 #include <vector>
 
 #include "ui/gui/widgets.h"
-// ROUND 22: the PIDF of rounds 1–21 is replaced by the predictive controller.
-// The old header is still on disk (tracking/pid_controller.h) and is no longer
-// included by anything, so reverting this one line reverts the whole round.
-#include "tracking/predictive_pid.h"
+#include "tracking/lock_controller.h"
 
 namespace aimbotng {
 namespace ui {
@@ -181,6 +178,11 @@ struct AimController {
     void setTargetBoxPx(float px) {
         pidX.setTargetBoxPx(px);
         pidY.setTargetBoxPx(px);
+    }
+
+    void setDeadband(float db) {
+        pidX.setDeadband(db);
+        pidY.setDeadband(db);
     }
 
     /// Drive both axes, return the total displacement in px for THIS control
@@ -636,9 +638,9 @@ struct PageAim {
     /// overwritten — deliberate — so "I changed the default" is not observable
     /// on an existing install without deleting config.json. The leak itself is a
     /// COMPILE-TIME constant, so it needs no config migration at all.
-    widgets::SliderState kp{0.05f, 0.0f, 1.00f, 0.01f};
-    widgets::SliderState ki{0.01f, 0.0f, 0.04f, 0.001f};
-    widgets::SliderState kd{0.15f, 0.0f, 1.00f, 0.01f};
+    widgets::SliderState kp{0.15f, 0.0f, 1.00f, 0.01f};
+    widgets::SliderState ki{0.025f, 0.0f, 0.05f, 0.001f};
+    widgets::SliderState kd{0.25f, 0.0f, 1.00f, 0.01f};
     /// 输出平滑 — EMA on the controller's output, 0..1, 1.0 = OFF. Shipped at
     /// 0.85: it trades a small, bounded amount of phase lag for a real cut in the
     /// finger-command noise. See the row's note in drawAimSection().
