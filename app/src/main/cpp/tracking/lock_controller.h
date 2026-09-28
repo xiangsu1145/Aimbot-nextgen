@@ -25,18 +25,20 @@ public:
     LockController() = default;
 
     void setParams(float kp, float ki, float kd, float outSmooth, float lookahead) {
-        // Slider kp (e.g. 0.15) maps to P_PID kp (15.0) via * 100.0
+        // Slider kp (e.g. 0.05) maps to P_PID kp (5.0) via * 100.0
         kp_ = static_cast<double>(kp) * 100.0;
-        // Slider kd (e.g. 0.25) maps to P_PID kd (25.0) via * 100.0
+        // Slider kd (e.g. 0.03) maps to P_PID kd (3.0) via * 100.0
         kd_ = static_cast<double>(kd) * 100.0;
-        // Slider lookahead (前馈, e.g. 1.5) maps to predict
-        predict_ = (lookahead <= 1.0f && lookahead > 0.0f)
-                       ? (static_cast<double>(lookahead) * 3.0)
-                       : static_cast<double>(lookahead);
+        // Slider lookahead (前馈, e.g. 0.8) maps to predict directly
+        predict_ = static_cast<double>(lookahead);
         // Smooth parameter: 9900.0 default, bandwidth=10000.0
         smooth_ = 9000.0 + std::clamp(static_cast<double>(outSmooth), 0.0, 1.0) * 900.0;
         // Integral gain adaptation rate (reference uses 0.025)
         integral_gain_rate_ = (ki > 0.0f) ? static_cast<double>(ki) : 0.025;
+    }
+
+    void setSensitivity(double s) {
+        if (s > 0.1) sens_ = s;
     }
 
     void setTargetBoxPx(float px) {
@@ -84,17 +86,17 @@ public:
         kp_integral(error);
 
         double error_diff = error - last_error_;
-        double target_velocity = error_diff + last_u_;
+        double target_velocity = error_diff + last_u_ * sens_;
         target_velocity = update_velocity_filter(target_velocity);
 
         double raw_velocity_input = target_velocity;
         if (std::abs(error) < 1.0 && std::abs(error_diff) < 0.1) {
-            raw_velocity_input = error_diff + last_u_ * 0.5;
+            raw_velocity_input = error_diff + last_u_ * (sens_ * 0.5);
         }
 
         double ki_raw = raw_velocity_input;
         ki_raw = (std::abs(ki_raw) > 0.5) ? ki_raw : 0.0;
-        ki_raw = (ki_raw * predict_) * integral_gain_;
+        ki_raw = ((ki_raw / sens_) * predict_) * integral_gain_;
         ki_raw = update_integral_filter(ki_raw);
 
         double K_p = kp_ * error;
@@ -201,11 +203,12 @@ private:
         return integral_filter_x_;
     }
 
-    double kp_ = 15.0;
-    double kd_ = 25.0;
+    double kp_ = 6.0;
+    double kd_ = 4.0;
+    double sens_ = 1.85;
     double bandwidth_ = PID_BANDWIDTH;
     double smooth_ = 9900.0;
-    double predict_ = 1.5;
+    double predict_ = 0.8;
     double ki_deadband_ = 0.5;
     double deadband_ = 0.3;
 
@@ -238,8 +241,8 @@ private:
 // Aliased as PredictivePid so existing references compile directly
 using PredictivePid = LockController;
 
-constexpr float kLookaheadDefault = 1.5f;
-constexpr float kLookaheadMax     = 3.0f;
+constexpr float kLookaheadDefault = 0.65f;
+constexpr float kLookaheadMax     = 1.50f;
 
 } // namespace tracking
 } // namespace aimbotng

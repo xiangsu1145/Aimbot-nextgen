@@ -638,9 +638,9 @@ struct PageAim {
     /// overwritten — deliberate — so "I changed the default" is not observable
     /// on an existing install without deleting config.json. The leak itself is a
     /// COMPILE-TIME constant, so it needs no config migration at all.
-    widgets::SliderState kp{0.15f, 0.0f, 1.00f, 0.01f};
-    widgets::SliderState ki{0.025f, 0.0f, 0.05f, 0.001f};
-    widgets::SliderState kd{0.25f, 0.0f, 1.00f, 0.01f};
+    widgets::SliderState kp{0.055f, 0.0f, 1.00f, 0.01f};
+    widgets::SliderState ki{0.005f, 0.0f, 0.05f, 0.001f};
+    widgets::SliderState kd{0.030f, 0.0f, 1.00f, 0.01f};
     /// 输出平滑 — EMA on the controller's output, 0..1, 1.0 = OFF. Shipped at
     /// 0.85: it trades a small, bounded amount of phase lag for a real cut in the
     /// finger-command noise. See the row's note in drawAimSection().
@@ -690,7 +690,7 @@ struct PageAim {
     /// should be in play while a "the aim stops driving when it gets there"
     /// report is being chased. Off by default; the slider is still there for
     /// anyone who measures a benefit.
-    widgets::SliderState aimDelayFrames{0.0f, 0.0f, 5.0f, 0.05f};
+    widgets::SliderState aimDelayFrames{0.40f, 0.0f, 5.0f, 0.05f};
 
     // 丢框预测帧数 (trackPredictHoldFrames) MOVED TO THE SETTINGS PAGE in round
     // 18 — see settings_section.h, which now owns the slider and the note. It is
