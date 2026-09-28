@@ -4,9 +4,6 @@ import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
-import android.os.Handler
-import android.os.HandlerThread
-import android.os.Process
 import android.util.Log
 
 /**
@@ -86,7 +83,7 @@ object ScreenCapture {
 
     @Volatile private var virtualDisplay: VirtualDisplay? = null
     @Volatile private var reader: ImageReader? = null
-    @Volatile private var pump: HandlerThread? = null
+    @Volatile private var pump: Thread? = null
     @Volatile private var running = false
 
     @Volatile private var crop = Crop(0, 0, 0)
@@ -173,16 +170,10 @@ object ScreenCapture {
         crop = centredCrop(side, geom.width, geom.height)
         ShellNative.captureSetRunning(true)
 
-        // The frame thread is event-driven: ImageReader wakes it the moment a
-        // buffer lands. A poll loop here used to sleep 4 ms whenever the queue
-        // came up empty, which put an average 2 ms / worst 4 ms of pure queueing
-        // between "SurfaceFlinger finished composing this frame" and "anyone
-        // saw it" — latency paid on every frame for nothing.
-        val t = HandlerThread("aimbot-capture")
-        t.start()
-        Process.setThreadPriority(t.threadId, Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        val t = Thread({ pump(reader) }, "aimbot-capture")
+        t.isDaemon = true
         pump = t
-        reader.setOnImageAvailableListener({ r -> pumpOnce(r) }, Handler(t.looper))
+        t.start()
 
         val display = try {
             dm.createVirtualDisplay(
@@ -237,21 +228,18 @@ object ScreenCapture {
 
         val t = pump
         pump = null
+        t?.interrupt()
 
         runCatching { virtualDisplay?.release() }
             .onFailure { Log.w(TAG, "release failed", it) }
         virtualDisplay = null
 
-        // Detach the listener first, then close the reader: a callback already
-        // queued on the handler must not land on a closed reader. Closing the
-        // reader is also what surfaces as IllegalStateException inside any
-        // in-flight pumpOnce, which that path treats as "shutting down".
-        runCatching { reader?.setOnImageAvailableListener(null, null) }
+        // Closing the reader is what unblocks a thread parked in
+        // acquireLatestImage(); it comes back as IllegalStateException, which
+        // the pump treats as "shutting down" rather than an error.
         runCatching { reader?.close() }
             .onFailure { Log.w(TAG, "reader close failed", it) }
         reader = null
-
-        t?.quitSafely()
 
         Log.i(TAG, "capture stopped")
     }
@@ -265,40 +253,51 @@ object ScreenCapture {
     // ── Frame pump ───────────────────────────────────────────────────────────
 
     /**
-     * Hands the newest frame's centre crop to native. Runs on the capture
-     * HandlerThread, once per delivered buffer — the listener fires when a
-     * frame is ready, so there is nothing to wait for and no queue to drain:
-     * [ImageReader.acquireLatestImage] still discards any frame that piled up
-     * behind an un-delivered one, which is the behaviour wanted here — a stale
-     * frame is worth less than a fresh one.
+     * Pulls the newest frame and hands its centre crop to native.
+     *
+     * `acquireLatestImage` blocks until a frame is ready and discards any that
+     * piled up behind it, which is the behaviour wanted here: a stale frame is
+     * worth less than a fresh one, and the menu is showing the capture, not
+     * recording it.
      *
      * The crop is re-read every pass so a slider drag takes effect on the next
      * frame without a rebuild.
      */
-    private fun pumpOnce(reader: ImageReader) {
-        val image = try {
-            reader.acquireLatestImage()
-        } catch (t: Throwable) {
-            // Closing the reader surfaces here as IllegalStateException while
-            // shutting down; that is "stopping", not an error.
-            if (running) Log.e(TAG, "acquireLatestImage failed", t)
-            return
-        } ?: return   // listener only fires with a frame pending, but be safe
-
-        try {
-            val c = crop
-            if (c.side > 0) {
-                val plane = image.planes[0]
-                ShellNative.capturePushFrame(
-                    plane.buffer, image.width, image.height, plane.rowStride,
-                    c.x, c.y, c.side, image.timestamp
-                )
+    private fun pump(reader: ImageReader) {
+        Log.i(TAG, "frame pump running")
+        while (running && !Thread.currentThread().isInterrupted) {
+            val image = try {
+                reader.acquireLatestImage()
+            } catch (t: Throwable) {
+                if (running) Log.e(TAG, "acquireLatestImage failed", t)
+                break
             }
-        } catch (t: Throwable) {
-            Log.e(TAG, "frame push failed", t)
-        } finally {
-            runCatching { image.close() }
+
+            if (image == null) {
+                try {
+                    Thread.sleep(4)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                continue
+            }
+
+            try {
+                val c = crop
+                if (c.side > 0) {
+                    val plane = image.planes[0]
+                    ShellNative.capturePushFrame(
+                        plane.buffer, image.width, image.height, plane.rowStride,
+                        c.x, c.y, c.side, image.timestamp
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "frame push failed", t)
+            } finally {
+                runCatching { image.close() }
+            }
         }
+        Log.i(TAG, "frame pump exited")
     }
 
     // ── Display geometry ─────────────────────────────────────────────────────
