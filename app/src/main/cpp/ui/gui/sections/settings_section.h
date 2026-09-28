@@ -72,7 +72,7 @@ struct PageSettings {
     /// Raise it only if two different enemies get merged into one track.
     widgets::SliderState trackIou{0.15f, 0.05f, 0.6f, 0.05f};         // min association score
     widgets::SliderState trackConfirm{1.0f, 1.0f, 10.0f, 1.0f};      // frames to confirm a track
-    widgets::SliderState trackTerminate{5.0f, 1.0f, 10.0f, 1.0f};    // missed frames before drop
+    widgets::SliderState trackTerminate{5.0f, 0.0f, 20.0f, 1.0f};    // missed frames before drop
 
     /// 丢框预测帧数 — the Kalman forward-prediction window (round 18: moved here
     /// from the Aim page, because it is pure tracker behaviour: it is the window

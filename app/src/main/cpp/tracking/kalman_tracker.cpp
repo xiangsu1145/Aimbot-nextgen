@@ -195,14 +195,13 @@ TrackerConfig& trackerConfig() {
     return c;
 }
 
-// A track has to outlive its own prediction window, otherwise the
-// predictHoldFrames slider is capped in secret by terminateFrames: the track is
-// erased while it is still supposed to be extrapolating, and the slider looks
-// broken for every value above terminateFrames. That cap was hit in practice —
-// the default terminateFrames=5 silently made anything past "predict 4 frames"
-// a no-op. The +1 is the frame on which the count reaches zero.
+// The track's lifetime is governed by terminateFrames (丢失帧数).
+// If terminateFrames <= 0, missed tracks drop immediately with zero hold and no phantom prediction.
+// When terminateFrames > 0, the track survives for terminateFrames misses (predicting during the first
+// predictHoldFrames, and freezing at last_valid for the remainder).
 int MultiTracker::liveFrames() const {
-    return std::max(cfg_.terminateFrames, cfg_.predictHoldFrames + 1);
+    if (cfg_.terminateFrames <= 0) return 0;
+    return cfg_.terminateFrames;
 }
 
 // Monotonic, never recycled — see the note on `nextId_` in the header. The
@@ -250,6 +249,21 @@ void MultiTracker::predictAll(bool countMiss) {
             if (cfg_.predictHoldFrames > 0 && t.lost_frames <= cfg_.predictHoldFrames) {
                 t.x = A * t.x;
                 t.P = A * t.P * At + Q;
+                // Velocity damping: smoothly decay velocity during blind prediction to prevent drifting
+                t.x.at(4, 0) *= 0.80f;
+                t.x.at(5, 0) *= 0.80f;
+                // Bounded displacement: do not stray further than 1.5x box size from last_valid
+                const float maxDisp = 1.5f * std::max(t.last_valid.at(2, 0), t.last_valid.at(3, 0));
+                if (maxDisp > 10.0f) {
+                    const float dx = t.x.at(0, 0) - t.last_valid.at(0, 0);
+                    const float dy = t.x.at(1, 0) - t.last_valid.at(1, 0);
+                    const float d = std::sqrt(dx * dx + dy * dy);
+                    if (d > maxDisp) {
+                        const float s = maxDisp / d;
+                        t.x.at(0, 0) = t.last_valid.at(0, 0) + dx * s;
+                        t.x.at(1, 0) = t.last_valid.at(1, 0) + dy * s;
+                    }
+                }
             } else {
                 t.x = t.last_valid;
                 t.x.at(4, 0) = 0.0f;
@@ -359,11 +373,13 @@ void MultiTracker::matchAndUpdate(const std::vector<infer::Box>& dets) {
         auto& t = tracks_[bestT];
         Mat y = z - H * t.x;  // 4x1 innovation
         const float innov = std::sqrt(y.at(0, 0) * y.at(0, 0) + y.at(1, 0) * y.at(1, 0));
-        if (innov > cfg_.innovThresh) {
-            // Outlier (camera moved / box jump): snap to measurement.
+        // Adaptive outlier threshold based on box scale (minimum 50px)
+        const float gatePx = std::max(50.0f, std::max(cfg_.innovThresh, 0.6f * (d.w() + d.h())));
+        if (innov > gatePx) {
+            // Outlier (camera moved / box jump): snap to measurement, decay velocity rather than zeroing
             t.x.at(0, 0) = z.at(0, 0); t.x.at(1, 0) = z.at(1, 0);
             t.x.at(2, 0) = z.at(2, 0); t.x.at(3, 0) = z.at(3, 0);
-            t.x.at(4, 0) = 0.0f;       t.x.at(5, 0) = 0.0f;
+            t.x.at(4, 0) *= 0.3f;       t.x.at(5, 0) *= 0.3f;
         } else {
             Mat S = H * t.P * Ht + R;          // 4x4
             Mat K = t.P * Ht * S.inverse();    // 6x4

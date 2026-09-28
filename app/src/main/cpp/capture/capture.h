@@ -41,6 +41,11 @@ struct Frame {
     int height = 0;
     int stride = 0;  // bytes per row — always width * 4, padded rows are unpacked
     uint64_t id = 0; // bumps on every frame, so a consumer can skip stale ones
+    // CLOCK_MONOTONIC ns, the moment the producer (SurfaceFlinger) finished
+    // compositing this frame. Only meaningful when nonzero; a producer that
+    // cannot supply one leaves it at 0 and consumers must then treat the age
+    // as unknown rather than zero.
+    uint64_t tsNs = 0;
 };
 
 // ── Frame thread -> renderer ─────────────────────────────────────────────────
@@ -60,8 +65,12 @@ struct Frame {
 /// Out-of-range arguments are ignored rather than clamped: a crop that does not
 /// fit its source means the two sides disagree about the screen shape, and
 /// showing a garbage frame would hide that.
+/// `tsNs` is the frame's composition timestamp (Image.getTimestamp,
+/// CLOCK_MONOTONIC ns, 0 when the producer has none). Stored alongside the
+/// pixels so a consumer can answer "how old is what I am looking at" — the
+/// one number the whole sensing chain never had.
 void pushFrame(const void* rgba, int srcWidth, int srcHeight, int stride,
-               int cropX, int cropY, int side);
+               int cropX, int cropY, int side, uint64_t tsNs = 0);
 
 /// Dimensions of the newest frame, or false when none has arrived yet. Lets the
 /// caller size its destination before asking for the pixels.
@@ -84,7 +93,8 @@ void invalidateFrames();
 
 /// Copies the newest frame into `dst` if it is newer than the id in `lastId`
 /// (which is updated in place). Returns false when there is nothing new, or when
-/// `dstBytes` is too small for it.
+/// `dstBytes` is too small for it. `outTsNs`, when not null, receives the
+/// frame's composition timestamp — the same one pushFrame() stored.
 ///
 /// The copy happens *inside* the lock, into memory the caller owns. Lending a
 /// pointer out instead — which is what this used to do — left the render thread
@@ -93,7 +103,7 @@ void invalidateFrames();
 /// extra: the bytes had to reach the caller's buffer either way, and this way
 /// the lock is held for a memcpy instead of for a Vulkan submit.
 bool copyLatestInto(void* dst, size_t dstBytes, int& outW, int& outH,
-                    uint64_t& lastId);
+                    uint64_t& lastId, uint64_t* outTsNs = nullptr);
 
 /// How many frames per second the producer is actually delivering, or 0 when it
 /// has gone quiet. Measured over a rolling window rather than since start-up, so

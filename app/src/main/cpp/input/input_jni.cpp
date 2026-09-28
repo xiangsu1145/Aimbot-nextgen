@@ -356,16 +356,19 @@ PREFIX(uiRegions)(JNIEnv* env, jobject) {
 /// Hands one RGBA frame over. `buffer` is the ImageReader plane's direct
 /// ByteBuffer; `rowStride` is in bytes, and may exceed `srcWidth * 4`. The
 /// buffer holds the whole screen — the square the menu asked for is cut out of
-/// it natively (see capture::pushFrame).
+/// it natively (see capture::pushFrame). `tsNs` is the frame's composition
+/// timestamp (Image.getTimestamp, CLOCK_MONOTONIC ns) and rides along so the
+/// pipeline can age-stamp every result derived from these pixels.
 JNIEXPORT void JNICALL
 PREFIX(capturePushFrame)(JNIEnv* env, jobject, jobject buffer,
                          jint srcWidth, jint srcHeight, jint rowStride,
-                         jint cropX, jint cropY, jint side) {
+                         jint cropX, jint cropY, jint side, jlong tsNs) {
     if (buffer == nullptr) return;
     void* pixels = env->GetDirectBufferAddress(buffer);
     if (pixels == nullptr) return;  // not a direct buffer — nothing we can read
     aimbotng::capture::pushFrame(pixels, srcWidth, srcHeight, rowStride,
-                                 cropX, cropY, side);
+                                 cropX, cropY, side,
+                                 static_cast<uint64_t>(tsNs));
 }
 
 /// Whether the menu wants frames right now (its capture switch).

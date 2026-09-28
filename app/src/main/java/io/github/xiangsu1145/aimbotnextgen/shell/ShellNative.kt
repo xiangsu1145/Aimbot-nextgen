@@ -232,6 +232,11 @@ object ShellNative {
      * boundary is what lets the virtual display stay at full size — which is
      * the only way the platform hands over unscaled pixels — without paying to
      * copy a 2K frame across.
+     *
+     * [tsNs] is the frame's [android.media.Image.getTimestamp] value —
+     * CLOCK_MONOTONIC nanoseconds, the moment SurfaceFlinger finished
+     * compositing this frame. Propagated through the whole native pipeline so
+     * every consumer can know how old the pixels it acts on really are.
      */
     external fun capturePushFrame(
         buffer: java.nio.ByteBuffer,
@@ -240,7 +245,8 @@ object ShellNative {
         rowStride: Int,
         cropX: Int,
         cropY: Int,
-        side: Int
+        side: Int,
+        tsNs: Long
     )
 
     /** Whether the menu's capture switch is on. Polled by [ScreenCapture]. */

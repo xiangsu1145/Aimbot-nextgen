@@ -649,6 +649,18 @@ void syncTriggerPage() {
     p.tapUpAtMs = now + static_cast<int64_t>(dur);
 }
 
+bool triggerIsFiring() {
+    // The auto-fire's own hold gate, exported for consumers that need "is the
+    // gun firing" rather than "is a tap down this instant" (tapDown alone
+    // flickers with the tap cadence — the gun keeps firing between taps, so a
+    // recoil burst keyed on it would start and stop several times a second).
+    // Same gates as syncTriggerPage(): the master switch, and then either
+    // continuous trigger or a real finger held in the hold circle.
+    const PageTrigger& p = g_pageTrigger;
+    if (!p.enabled.value) return false;
+    return p.continuousTrigger.value || realFingerInHoldArea();
+}
+
 }  // namespace sections
 }  // namespace ui
 }  // namespace aimbotng

@@ -105,6 +105,7 @@ void drawHud();
 enum class MenuSection {
     Aim = 0,        // 自瞄
     Trigger,        // 扳机
+    Recoil,         // 压枪 — 弹道分析 + 整梭补偿，复用自瞄的触摸区域
     BackFlash,      // 背闪
     Model,          // 模型
     Touch,          // 触摸

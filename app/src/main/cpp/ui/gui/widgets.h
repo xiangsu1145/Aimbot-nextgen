@@ -232,6 +232,20 @@ void beginFrame();
 /// True when some widget already handled the press/release this frame.
 bool gestureConsumed();
 
+/// Declares that a modal layer owns the pointer, or gives it back.
+///
+/// While set, beginFrame() starts every frame with the gesture already
+/// consumed, so no control on the board reacts to a tap — the layer sitting on
+/// top is the only thing listening. That is what makes a full-width on-screen
+/// keyboard safe to paint over a page's rows: without it a key press would also
+/// flip whichever switch is underneath the key.
+///
+/// The keyboard sets it from its own per-frame sync; being one frame late is
+/// invisible for a modal, and it keeps beginFrame() from having to know which
+/// page owns which dialog.
+void setModalOwner(bool on);
+bool modalOwner();
+
 /// Marks the press/release as handled, so widgets drawn later in the same
 /// frame ignore it. Every widget calls this the moment it acts on a tap.
 void consumeGesture();
@@ -261,8 +275,9 @@ bool clickedOutside(const Rect& r);
 
 /// A row-sized button. Returns true the frame the tap lands inside it.
 /// A Disabled button ignores taps and always returns false.
+/// If interactive is false, the button is painted in its normal variant style but ignores hit-testing and taps.
 bool button(ImDrawList* dl, const Rect& r, const char* label,
-            ButtonVariant variant, float s);
+            ButtonVariant variant, float s, bool interactive = true);
 
 /// The dialog-title "close" affordance: a square Ghost shell carrying a drawn
 /// × rather than the letter X, so it reads the same in every font.

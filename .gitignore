@@ -127,3 +127,8 @@ app/src/main/jniLibs/
 
 # 工具计划缓存（AI 编码助手生成，不入库）
 .zcode/
+logcat_15s.txt
+_tmp_profile211.json
+device_config.json
+mmkv.bin
+.idea/

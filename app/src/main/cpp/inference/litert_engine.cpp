@@ -162,6 +162,11 @@ struct LiteRtEngine::Impl {
     bool boxesChannelsFirst  = true;
     bool scoresChannelsFirst = true;
 
+    // Output index the detection head is read from. Output 0 except for
+    // two-output models where the head is not the first tensor (see the
+    // load-time selection below).
+    int headOutIdx = 0;
+
     std::vector<float>  decoded;
     std::vector<float>  inputF32;
     std::vector<uint8_t> inputU8;
@@ -552,12 +557,33 @@ Status LiteRtEngine::load(const ModelSpec& spec) {
             int bIdx = -1, sIdx = -1;
             if (ch0 == 4 && ch1 != 4)      { bIdx = 0; sIdx = 1; }
             else if (ch1 == 4 && ch0 != 4) { bIdx = 1; sIdx = 0; }
-            else {
-                return status_ = Status::bad(
-                    "split-head outputs not boxes+scores "
-                    "(channels " + std::to_string(ch0) + "/" +
-                    std::to_string(ch1) + "); only [4]+[nc] is decoded so far");
-            }
+            if (bIdx < 0) {
+                // Neither output is a 4-channel box tensor. Some exports
+                // (e.g. CODM.tflite) pair the real head [1, 4+nc, N] with an
+                // auxiliary tensor (raw DFL or feature pyramid) at the same
+                // anchor count. Decode the head, ignore the extra output:
+                // the tensor whose channel count matches 4 + declared classes
+                // wins; with nothing to match on, the smaller channel count
+                // (the aux tensor is always the wider one).
+                const int declared = static_cast<int>(spec.classes.size());
+                int headIdx = -1;
+                if (declared > 0) {
+                    if (ch0 == 4 + declared && ch1 != ch0) headIdx = 0;
+                    else if (ch1 == 4 + declared && ch0 != ch1) headIdx = 1;
+                }
+                if (headIdx < 0) headIdx = (ch0 <= ch1) ? 0 : 1;
+                const int hc = (headIdx == 0) ? ch0 : ch1;
+                const TfLiteTensor* ht = (headIdx == 0) ? t0 : t1;
+                impl->outType = TfLiteTensorType(ht);
+                impl->channels = hc;
+                impl->anchors  = (headIdx == 0) ? an0 : an1;
+                impl->channelsFirst = (headIdx == 0) ? cf0 : cf1;
+                impl->dualHead = false;
+                impl->headOutIdx = headIdx;
+                LOGI("two outputs, neither is boxes+scores (channels %d/%d): "
+                     "decoding out%d [%d,%d] as the head, ignoring the other",
+                     ch0, ch1, headIdx, hc, impl->anchors);
+            } else {
             impl->dualHead = true;
             impl->boxesOutIdx  = bIdx;
             impl->scoresOutIdx = sIdx;
@@ -575,6 +601,7 @@ Status LiteRtEngine::load(const ModelSpec& spec) {
             LOGI("split-head detected: boxes=out%d [4,%d] %s scores=out%d [%d,%d] %s",
                  bIdx, an0, tfliteTypeName(impl->boxesType),
                  sIdx, nc, an0, tfliteTypeName(impl->scoresType));
+            }
         } else {
             return status_ = Status::bad(
                 "model has " + std::to_string(outCount) +
@@ -790,7 +817,7 @@ bool LiteRtEngine::readOutputInto(Impl* m, std::vector<float>& dst) {
 
         return true;
     }
-    const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(m->interp, 0);
+    const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(m->interp, m->headOutIdx);
     if (out == nullptr) return false;
 
     const size_t elems = static_cast<size_t>(m->anchors) * static_cast<size_t>(m->channels);

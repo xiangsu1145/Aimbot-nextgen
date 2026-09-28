@@ -25,6 +25,7 @@
 #include "ui/gui/sections/touch_section.h"
 #include "ui/gui/sections/trigger_section.h"
 #include "ui/gui/sections/backflash_section.h"
+#include "ui/gui/sections/recoil_section.h"
 
 #define TAG "AimbotNg"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -190,6 +191,16 @@ void getSwitch(const json& o, const char* k, ui::widgets::SwitchState& s) {
     s.anim  = s.value ? 1.0f : 0.0f;
 }
 
+void putDropdown(json& o, const char* k, const ui::widgets::DropdownState& d) {
+    o[k] = d.value;
+}
+
+void getDropdown(const json& o, const char* k, ui::widgets::DropdownState& d) {
+    const auto it = o.find(k);
+    if (it == o.end() || !it->is_number_integer()) return;
+    d.value = it->get<int>();
+}
+
 // Box overlay (touch / fire area) and circle overlay (trigger / hold area).
 // Geometry is in screen px; restored only when it looks sane, otherwise the
 // page keeps "not placed yet" and centres itself on first draw as usual.
@@ -308,21 +319,73 @@ json serialize() {
     }
     {
         // Back-Flash page — every user-tuned value persisted so the swipe
-        // gesture keeps its settings across restarts. Same shape as the Aim /
-        // Trigger pages: master switch, the four sliders, the touch-area box,
-        // and the flash-category mask.
+        // gesture keeps its settings across restarts. Enhanced with motion
+        // tuning (wobble, pitch, jitter, speed), timing (settle, cooldown),
+        // and brightness fallback detection thresholds.
         const auto& b = ui::sections::g_pageBackFlash;
         json o;
         putSwitch(o, "on", b.enabled);
+        // Timing
         putSlider(o, "flash", b.flashDelay);
         putSlider(o, "reset", b.resetDelay);
+        putSlider(o, "settle", b.settleMs);
+        putSlider(o, "cooldown", b.cooldownMs);
+        // Motion
         putSlider(o, "slide", b.slideDistancePx);
         putSlider(o, "ppf", b.maxPerFramePx);
+        putSlider(o, "speed", b.swipeSpeed);
+        putSlider(o, "wobble", b.wobble);
+        putSlider(o, "pitch", b.pitchRatio);
+        putSlider(o, "jitter", b.jitterPx);
+        // Brightness detection
+        putSwitch(o, "bright", b.brightDetect);
+        putSlider(o, "brightTh", b.brightThreshold);
+        putSlider(o, "brightLvl", b.brightPixelLevel);
+        putSlider(o, "brightRat", b.brightBlobRatio);
+        // Touch area & category
         putBox(o, "touch", b.touchArea.toggle.value,
                b.touchArea.x, b.touchArea.y, b.touchArea.w, b.touchArea.h,
                b.touchArea.placed);
         o["mask"] = b.category.sel.mask;
         j["backflash"] = std::move(o);
+    }
+    {
+        // Recoil page — the scalars, the two overlay boxes, and WHICH profile
+        // is selected. The profile's own knots and per-shot tuning are
+        // deliberately NOT here: those belong to the weapon, live in
+        // <name>.json / <name>.tune.json, and are shared with whatever the PC
+        // analyser produced. Copying them into the config would give the same
+        // profile two disagreeing copies the moment either was edited.
+        const auto& rc = ui::sections::g_pageRecoil;
+        json o;
+        putSwitch(o, "on", rc.enabled);
+        putDropdown(o, "mode", rc.mode);
+        putDropdown(o, "vWeapon", rc.vWeapon);
+        putSlider(o, "vStage1Px", rc.vStage1Px);
+        putSlider(o, "vStage2Px", rc.vStage2Px);
+        putSlider(o, "vResetMs", rc.vResetMs);
+        putSlider(o, "vReturnSpeed", rc.vReturnSpeed);
+        putSwitch(o, "vReturnHome", rc.vReturnHome);
+        putSlider(o, "travelX", rc.travelX);
+        putSlider(o, "travelY", rc.travelY);
+        putSlider(o, "wx", rc.weightX);
+        putSlider(o, "wy", rc.weightY);
+        putSlider(o, "fov", rc.fov);
+        putSwitch(o, "flipX", rc.flipX);
+        putSwitch(o, "flipY", rc.flipY);
+        putSwitch(o, "editV", rc.editVertical);
+        putSwitch(o, "fireOn", rc.fireToggle);
+        putCircle(o, "fire", rc.fireToggle.value, rc.fire.cx, rc.fire.cy,
+                  rc.fire.r, rc.fire.placed);
+        putSwitch(o, "markOn", rc.markerToggle);
+        // A square, so w and h carry the same number. Stored through the box
+        // helper rather than as three loose keys so "placed" keeps its meaning.
+        putBox(o, "mark", rc.markerToggle.value, rc.marker.x, rc.marker.y,
+               rc.marker.size, rc.marker.size, rc.marker.placed);
+        if (rc.loaded >= 0 && rc.loaded < static_cast<int>(rc.profiles.size())) {
+            o["prof"] = rc.profiles[static_cast<size_t>(rc.loaded)].name;
+        }
+        j["recoil"] = std::move(o);
     }
     {
         const auto& c = ui::sections::g_pageCapture;
@@ -544,10 +607,24 @@ void apply(const json& j) {
         auto& b = ui::sections::g_pageBackFlash;
         const json& o = *it;
         getSwitch(o, "on", b.enabled);
+        // Timing
         getSlider(o, "flash", b.flashDelay);
         getSlider(o, "reset", b.resetDelay);
+        getSlider(o, "settle", b.settleMs);
+        getSlider(o, "cooldown", b.cooldownMs);
+        // Motion
         getSlider(o, "slide", b.slideDistancePx);
         getSlider(o, "ppf", b.maxPerFramePx);
+        getSlider(o, "speed", b.swipeSpeed);
+        getSlider(o, "wobble", b.wobble);
+        getSlider(o, "pitch", b.pitchRatio);
+        getSlider(o, "jitter", b.jitterPx);
+        // Brightness detection
+        getSwitch(o, "bright", b.brightDetect);
+        getSlider(o, "brightTh", b.brightThreshold);
+        getSlider(o, "brightLvl", b.brightPixelLevel);
+        getSlider(o, "brightRat", b.brightBlobRatio);
+        // Touch area
         bool on = false, placed = false;
         float x = -1, y = -1, w = 0, h = 0;
         if (getBox(o, "touch", on, x, y, w, h, placed)) {
@@ -562,6 +639,65 @@ void apply(const json& j) {
             // now so the first model sync keeps it instead of selecting all.
             b.category.sel.mask = m->get<uint32_t>();
             b.category.synced   = true;
+        }
+    }
+    if (const auto it = j.find("recoil"); it != j.end() && it->is_object()) {
+        auto& rc = ui::sections::g_pageRecoil;
+        const json& o = *it;
+        getSwitch(o, "on", rc.enabled);
+        getDropdown(o, "mode", rc.mode);
+        if (rc.mode.value < 0 || rc.mode.value > 1) rc.mode.value = 0;
+        getDropdown(o, "vWeapon", rc.vWeapon);
+        if (rc.vWeapon.value < 0 || rc.vWeapon.value > 2) rc.vWeapon.value = 0;
+        getSlider(o, "vStage1Px", rc.vStage1Px);
+        getSlider(o, "vStage2Px", rc.vStage2Px);
+        getSlider(o, "vResetMs", rc.vResetMs);
+        getSlider(o, "vReturnSpeed", rc.vReturnSpeed);
+        getSwitch(o, "vReturnHome", rc.vReturnHome);
+        getSlider(o, "travelX", rc.travelX);
+        getSlider(o, "travelY", rc.travelY);
+        getSlider(o, "wx", rc.weightX);
+        getSlider(o, "wy", rc.weightY);
+        getSlider(o, "fov", rc.fov);
+        getSwitch(o, "flipX", rc.flipX);
+        getSwitch(o, "flipY", rc.flipY);
+        getSwitch(o, "editV", rc.editVertical);
+        getSwitch(o, "fireOn", rc.fireToggle);
+        bool on = false, placed = false;
+        float x = -1, y = -1, w = 0, h = 0;
+        float cx = -1, cy = -1, r = 0;
+        if (getCircle(o, "fire", on, cx, cy, r, placed)) {
+            rc.fireToggle.value = on;
+            rc.fireToggle.anim  = on ? 1.0f : 0.0f;
+            rc.fire.cx = cx; rc.fire.cy = cy; rc.fire.r = r;
+            rc.fire.placed = true;
+        } else if (getBox(o, "fire", on, x, y, w, h, placed)) {
+            // Files written before the fire area became a circle: take the old
+            // box's centre and inscribe the circle in it.
+            rc.fireToggle.value = on;
+            rc.fireToggle.anim  = on ? 1.0f : 0.0f;
+            rc.fire.cx = x + w * 0.5f;
+            rc.fire.cy = y + h * 0.5f;
+            rc.fire.r = std::max(60.0f, std::min(w, h) * 0.5f);
+            rc.fire.placed = true;
+        }
+        getSwitch(o, "markOn", rc.markerToggle);
+        if (getBox(o, "mark", on, x, y, w, h, placed)) {
+            rc.markerToggle.value = on;
+            rc.markerToggle.anim  = on ? 1.0f : 0.0f;
+            rc.marker.x = x; rc.marker.y = y;
+            // Guard against a file with a degenerate size: the correlation
+            // patch would be one pixel and match anything.
+            if (w >= 8.0f) rc.marker.size = w;
+            rc.marker.placed = true;
+        }
+        // The profile is stored by NAME (see the note on PageRecoil::wantName).
+        // It is handed to the catalogue as a request and applied when the
+        // profile files are next listed, which is the only moment an index can
+        // be assigned to it.
+        if (const auto p = o.find("prof"); p != o.end() && p->is_string()) {
+            rc.wantName = p->get<std::string>();
+            rc.catalogDirty = true;
         }
     }
     if (const auto it = j.find("settings"); it != j.end() && it->is_object()) {

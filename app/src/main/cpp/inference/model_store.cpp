@@ -56,8 +56,14 @@ void saveLocked();
 // XNNPACK on this build (dense false detections). The user picks, we never
 // auto-decide. Index 0 stays XNNPACK so older entries that serialised as
 // engine=1 still mean "XNNPACK".
-const char* kOnnxEngines[]   = {"ONNX Runtime · XNNPACK", "ONNX Runtime · 普通 CPU"};
-const Engine kOnnxEngineIds[] = {Engine::OnnxRuntime, Engine::OnnxCpu};
+//
+// OnnxHtp (QNN EP plugin, Snapdragon NPU) is appended third. HTP row is greyed
+// on non-Qualcomm devices by epAvailable(); keeping it in the list means a
+// model saved with it on a Snapdragon stays labelled when the list is read
+// elsewhere.
+const char* kOnnxEngines[]   = {"ONNX Runtime · XNNPACK", "ONNX Runtime · 普通 CPU",
+                                "ONNX Runtime · QNN HTP"};
+const Engine kOnnxEngineIds[] = {Engine::OnnxRuntime, Engine::OnnxCpu, Engine::OnnxHtp};
 
 // QNN HTP first: it is the reason to run a .tflite model on this device. NNAPI
 // and CPU are the fallbacks for when the delegate refuses a graph — which it
@@ -188,6 +194,10 @@ void ensureLoadedLocked() {
             if (c < 0) c = 0;
             e.classCount = c;
         }
+        // binPath is the 14th field (index 13); for NCNN companion .bin
+        if (fields.size() > 13) {
+            e.binPath = fields[13];
+        }
         if (fields.size() > 7 && !fields[7].empty()) {
             std::istringstream cls(fields[7]);
             std::string name;
@@ -278,6 +288,9 @@ void saveLocked() {
         // positional-compatibility reason as the fields above it.
         fputc(kFieldSep, f);
         fprintf(f, "%d", e.classCount);
+        // binPath is the 14th field (index 13)
+        fputc(kFieldSep, f);
+        fputs(e.binPath.c_str(), f);
         fputc('\n', f);
     }
     fclose(f);
@@ -309,10 +322,14 @@ bool endsWith(const std::string& s, const char* suffix) {
 
 // ── Kinds and engines ────────────────────────────────────────────────────────
 
+const char* kNcnnEngines[]    = {"NCNN · CPU", "NCNN · GPU (Vulkan)"};
+const Engine kNcnnEngineIds[] = {Engine::NcnnCpu, Engine::NcnnGpu};
+
 Kind kindOfPath(const std::string& path) {
     const std::string p = lower(path);
     if (endsWith(p, ".onnx")) return Kind::Onnx;
     if (endsWith(p, ".tflite")) return Kind::Tflite;
+    if (endsWith(p, ".param") || endsWith(p, ".bin")) return Kind::Ncnn;
     return Kind::Unknown;
 }
 
@@ -320,6 +337,7 @@ const char* kindLabel(Kind kind) {
     switch (kind) {
         case Kind::Onnx:   return "ONNX";
         case Kind::Tflite: return "TFLite";
+        case Kind::Ncnn:   return "NCNN";
         default:           return "?";
     }
 }
@@ -328,6 +346,7 @@ const char* engineLabel(Engine engine) {
     switch (engine) {
         case Engine::OnnxRuntime:   return "ONNX Runtime · XNNPACK";
         case Engine::OnnxCpu:       return "普通 CPU";
+        case Engine::OnnxHtp:       return "ONNX Runtime · QNN HTP";
         case Engine::QnnHtp:        return "QNN HTP";
         case Engine::Nnapi:         return "NNAPI";
         case Engine::Cpu:           return "CPU";
@@ -340,6 +359,8 @@ const char* engineLabel(Engine engine) {
 #if AIMBOTNG_HAVE_NEURON
         case Engine::Neuron:        return "Neuron (APU)";
 #endif
+        case Engine::NcnnCpu:       return "NCNN · CPU";
+        case Engine::NcnnGpu:       return "NCNN · GPU (Vulkan)";
         default:                    return "未选择";
     }
 }
@@ -353,6 +374,7 @@ const char* const* enginesFor(Kind kind, int& count) {
     switch (kind) {
         case Kind::Onnx:   count = arrayLen(kOnnxEngines);   return kOnnxEngines;
         case Kind::Tflite: count = arrayLen(kTfliteEngines); return kTfliteEngines;
+        case Kind::Ncnn:   count = arrayLen(kNcnnEngines);   return kNcnnEngines;
         default:           count = 0; return nullptr;
     }
 }
@@ -366,19 +388,14 @@ Engine engineAt(Kind kind, int index) {
         return (index >= 0 && index < arrayLen(kTfliteEngineIds))
                    ? kTfliteEngineIds[index] : Engine::None;
     }
+    if (kind == Kind::Ncnn) {
+        return (index >= 0 && index < arrayLen(kNcnnEngineIds))
+                   ? kNcnnEngineIds[index] : Engine::None;
+    }
     return Engine::None;
 }
 
 /// The dropdown index for `engine`, or -1 when this build has no row for it.
-///
-/// -1 rather than 0 is load-bearing. 0 is a real index (it is "NPU (LiteRT)"
-/// in the tflite list and "ONNX Runtime · XNNPACK" in the onnx one), so
-/// returning it for "not found" does not mean "no selection" — it means a
-/// concrete engine the user never picked. A stored engine that this build
-/// cannot name (NeuroPilot saved by a NeuroPilot build, then opened by one
-/// built without it) would come back as index 0, the Settings dialog would
-/// show "NPU (LiteRT)", and pressing Save would write LiteRtNpu over the
-/// user's model. Callers must treat negative as "leave the selection alone".
 int engineIndex(Kind kind, Engine engine) {
     if (kind == Kind::Onnx) {
         for (int i = 0; i < arrayLen(kOnnxEngineIds); ++i)
@@ -386,6 +403,9 @@ int engineIndex(Kind kind, Engine engine) {
     } else if (kind == Kind::Tflite) {
         for (int i = 0; i < arrayLen(kTfliteEngineIds); ++i)
             if (kTfliteEngineIds[i] == engine) return i;
+    } else if (kind == Kind::Ncnn) {
+        for (int i = 0; i < arrayLen(kNcnnEngineIds); ++i)
+            if (kNcnnEngineIds[i] == engine) return i;
     }
     return -1;
 }

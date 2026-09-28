@@ -48,9 +48,15 @@ struct PageModel {
     // name is taken from the file's basename, and class names were dropped.
     char  pathBuf[256]   = {};
     int   pathLen        = 0;
+    char  pathBuf2[256]  = {};
+    int   pathLen2       = 0;
+    int   pickingSlot    = 1;
     bool  pathPicking    = false;
     bool  pathFailed     = false;
     char  pathErr[128]   = {};
+
+    bool  showVerifyError = false;
+    char  verifyErrMsg[256] = {};
 
     // The dropdown and the slider keep their state across frames — a dropdown
     // built fresh every frame forgets it was open, and a slider built fresh

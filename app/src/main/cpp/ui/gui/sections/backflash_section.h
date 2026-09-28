@@ -2,20 +2,30 @@
 //  aimbotng::ui::sections::backflash — the Back-Flash page (背闪).
 //
 //  When the model spots a "flash" target (the player's screen is being
-//  whited-out by an enemy grenade), the player wants to turn AWAY from the
-//  flash so their character model is not lit up when the screen comes back.
-//  This page drives that gesture: a synthetic finger drops inside the touch
-//  area, slides sideways (opposite the flash's screen position), lifts, waits,
-//  then slides back to where the player was.
+//  whited-out by an enemy grenade) or when a full-screen whiteout is detected,
+//  the player wants to turn AWAY from the flash so their character model is not
+//  lit up when the screen comes back.
+//  This page drives that gesture using a multi-harmonic curve for human-like
+//  movement, brightness fallback detection, settle phases, and cooldowns.
 //
 //  Layout, top-to-bottom on the right pane:
-//    1. 背闪延迟  (ms)         — wait this long after spotting the flash
-//    2. 复位延迟  (ms)         — wait this long between the swipe and the reset
-//    3. 滑屏距离(px) [1..2000] — total px the finger travels during a swipe
-//    4. 每帧最大移动 [1..400]   — per-frame movement cap (Bezier velocity peak)
-//    5. 触摸区域               — dashed-box overlay (drag/resize, same shape
-//                                as the Aim page's touch area)
-//    6. 闪光类别               — multi-select over the model's class names
+//    1. 亮度兜底检测     — switch to enable fallback brightness detection
+//    2. 背闪延迟  (ms)   — wait this long after spotting the flash
+//    3. 复位延迟  (ms)   — wait this long between the swipe and the reset
+//    4. 滑屏距离(px)     — total px the finger travels during a swipe
+//    5. 每帧最大移动     — per-frame movement cap
+//    6. 滑动速度(px/s)   — controls how fast the swipe moves
+//    7. 轨迹不规则度     — how irregular the path is (wobble)
+//    8. 垂直分量         — vertical component ratio during swipe
+//    9. 随机抖动(px)     — per-frame random jitter
+//   10. 停顿时间(ms)     — pause after reaching the end before resetting
+//   11. 冷却时间(ms)     — minimum time between two triggers
+//   12. 亮度阈值         — average screen brightness threshold
+//   13. 高亮像素阈值     — single pixel brightness level to count as bright
+//   14. 高亮占比阈值     — ratio of bright pixels needed to trigger
+//   15. 触摸区域         — dashed-box overlay (drag/resize, same shape
+//                          as the Aim page's touch area)
+//   16. 闪光类别         — multi-select over the model's class names
 //
 //  Touch lifecycle per detected flash (one full cycle = one swipe + one
 //  reset; "press / slide / lift" repeats):
@@ -23,20 +33,19 @@
 //    WaitFlashDelay            nothing on screen
 //      ↓ wait flashDelay
 //    Swiping (finger DOWN)     press at a random point inside the touch area,
-//                              slide (Bezier progress curve, per-frame
-//                              movement clamped to maxPerFramePx) to the
-//                              computed END — END = press ± slideDistancePx
-//                              on the axis pointing AWAY from the flash,
-//                              plus ±4 px random on each axis (the END
-//                              jitter is one-shot — only the target is
-//                              randomised, not every frame's move).
+//                              slide (multi-harmonic progress curve, per-frame
+//                              movement clamped) to the computed END on the
+//                              axis pointing AWAY from the flash, recording
+//                              waypoints along the way.
 //                              Lift at END.
 //      ↓
-//    WaitResetDelay            nothing on screen
-//      ↓ wait resetDelay
+//    Settling (finger UP)      wait settleMs and resetDelay
+//      ↓
 //    Resetting (finger DOWN)   press at END (the post-swipe position), slide
-//                              back to (press point + ±4 px random) using
-//                              the same Bezier curve. Lift at END.
+//                              back consuming recorded waypoints in reverse
+//                              to ensure exact inverse path. Lift at start.
+//      ↓
+//    Cooldown                  wait cooldownMs
 //      ↓
 //    Idle                      wait for the next detection
 //
@@ -111,6 +120,9 @@ struct PageBackFlash {
     /// Page master switch — on/off the user toggles from the page header.
     widgets::SwitchState enabled{false};
 
+    /// 亮度兜底检测 — enable brightness-based fallback detection.
+    widgets::SwitchState brightDetect{true};
+
     /// 背闪延迟 (ms) — how long after the qualifying event the swipe fires.
     widgets::SliderState flashDelay{100.0f, 0.0f, 500.0f, 1.0f};
 
@@ -125,12 +137,35 @@ struct PageBackFlash {
     /// it is realised in a single frame.
     widgets::SliderState slideDistancePx{300.0f, 1.0f, 2000.0f, 1.0f};
 
-    /// 每帧最大移动 [1..400] (px) — hard cap on the per-frame step. The
-    /// Bezier curve naturally smooths the velocity around its endpoints,
-    /// but a long swipe + tiny cap could still ask for a > cap step in
-    /// the middle; this clamp rejects the overshoot and lets the swipe
-    /// finish on the next frame instead.
-    widgets::SliderState maxPerFramePx{120.0f, 1.0f, 400.0f, 1.0f};
+    /// 每帧最大移动 [1..1500] (px) — hard cap on the per-frame step.
+    widgets::SliderState maxPerFramePx{300.0f, 1.0f, 1500.0f, 10.0f};
+
+    /// 滑屏速度上限(px/s) [500..60000] — controls how fast the swipe moves.
+    widgets::SliderState swipeSpeed{12000.0f, 500.0f, 60000.0f, 500.0f};
+
+    /// 轨迹不规则度 — how irregular the path is (0=straight, 1=very wavy).
+    widgets::SliderState wobble{0.40f, 0.0f, 1.0f, 0.05f};
+
+    /// 垂直分量 — vertical component ratio during swipe.
+    widgets::SliderState pitchRatio{0.12f, 0.0f, 0.5f, 0.01f};
+
+    /// 随机抖动(px) — per-frame random jitter.
+    widgets::SliderState jitterPx{1.5f, 0.0f, 10.0f, 0.5f};
+
+    /// 停顿时间(ms) — pause after reaching the end before resetting.
+    widgets::SliderState settleMs{80.0f, 0.0f, 500.0f, 10.0f};
+
+    /// 冷却时间(ms) — minimum time between two triggers.
+    widgets::SliderState cooldownMs{2500.0f, 500.0f, 10000.0f, 100.0f};
+
+    /// 亮度阈值 — average screen brightness threshold for whiteout detection.
+    widgets::SliderState brightThreshold{0.86f, 0.5f, 1.0f, 0.01f};
+
+    /// 高亮像素阈值 — single pixel brightness level to count as "very bright".
+    widgets::SliderState brightPixelLevel{0.90f, 0.5f, 1.0f, 0.01f};
+
+    /// 高亮占比阈值 — ratio of bright pixels needed to trigger.
+    widgets::SliderState brightBlobRatio{0.22f, 0.01f, 0.5f, 0.01f};
 
     /// Touch-area overlay (the dashed box on screen).
     BackFlashTouchArea touchArea;
@@ -142,9 +177,10 @@ struct PageBackFlash {
     enum class Phase {
         Idle,           // waiting for a target
         WaitFlashDelay, // target seen, waiting flashDelay before swiping
-        Swiping,        // finger DOWN, sliding to the swipe end
-        WaitResetDelay, // swipe done, finger UP, waiting resetDelay
-        Resetting,      // finger DOWN, sliding back to the press point
+        Swiping,        // finger DOWN, sliding along multi-harmonic curve
+        Settling,       // NEW: finger UP, waiting settleMs (模拟真人停顿)
+        Resetting,      // finger DOWN, sliding back using recorded waypoints
+        Cooldown,       // NEW: cycle complete, waiting cooldownMs
     };
     Phase    phase        = Phase::Idle;
     int64_t  phaseEnterMs = 0;
@@ -156,22 +192,51 @@ struct PageBackFlash {
     // Post-swipe position (== reset's start position).
     float swipeEndX = 0.0f, swipeEndY = 0.0f;
 
-    // Current sub-action endpoints (set on entry to Swiping / Resetting,
-    // advanced by the per-frame Bezier step). The Bezier progress curve
-    // maps onto the segment (curStart..curEnd).
-    float curStartX = 0.0f, curStartY = 0.0f;
-    float curEndX   = 0.0f, curEndY   = 0.0f;
-
     // Last uploaded position — used by the per-frame clamp to compute the
     // actual step (the Bezier asks for an offset; the clamp may shrink it).
     float lastX = 0.0f, lastY = 0.0f;
 
-    // Frame budget for the current sub-action. Computed at entry as
-    // ceil(distance / maxPerFramePx) — the Bezier curve is slower at
-    // the endpoints so this is a slight under-budget; the per-frame clamp
-    // covers the rare overshoot.
-    int subFrame      = 0;
-    int subTotalFrames = 0;
+    // ── Multi-harmonic curve state ──────────────────────────────────────
+    // Random phases for the 3 harmonics, generated at cycle start.
+    double harm1Phase = 0.0, harm2Phase = 0.0, harm3Phase = 0.0;
+    // Vertical drift amplitude for this cycle (±3% of slideDistancePx).
+    double driftY = 0.0;
+    // Total intended travel and current progress along the curve.
+    double totalForward = 0.0;
+    double forwardPos   = 0.0;
+    // Direction sign: +1 = swipe right (flash on left), -1 = swipe left.
+    double dirSign = 1.0;
+
+    // ── Lossless accumulator (记账式无损累积器) ──────────────────────────
+    // Tracks the exact intended position vs. what was actually sent to
+    // uinput, ensuring the reset phase returns the finger to EXACTLY the
+    // press point with zero pixel residual. The fractional remainder from
+    // integer truncation is preserved across frames.
+    double intentX = 0.0, intentY = 0.0;  // cumulative intended offset from press
+    int    sentX   = 0,    sentY   = 0;    // cumulative integer px actually sent
+
+    // ── Waypoint recording (航点录制) ───────────────────────────────────
+    // During Swiping, each frame's geometric step (dx, dy) is recorded.
+    // During Resetting, waypoints are consumed in reverse (LIFO) to
+    // ensure the finger returns along the exact inverse path.
+    std::vector<float> waypointDx;
+    std::vector<float> waypointDy;
+    size_t backIdx    = 0;     // current reverse-playback index
+    double backShift  = 0.0;   // partial consumption within one waypoint
+    bool   backDone   = false;  // all waypoints consumed
+
+    // ── Brightness detection (亮度检测) ─────────────────────────────────
+    // Results from the last frame's brightness sampling, used by the state
+    // machine as a fallback trigger when YOLO doesn't detect a flash.
+    float lastBrightFraction = 0.0f;  // ratio of "very bright" pixels
+    float lastMeanLuma       = 0.0f;  // average screen brightness [0,1]
+
+    // ── Cooldown ────────────────────────────────────────────────────────
+    int64_t lastTriggerMs  = 0;  // timestamp of last trigger completion
+    int64_t cycleStartMs   = 0;  // when the current cycle started
+
+    // ── Time tracking ───────────────────────────────────────────────────
+    int64_t lastFrameMs = 0;  // timestamp of last frame for dt computation
 
     // Finger currently held down on UINPUT_SLOT_PRIMARY. Every entry to
     // Swiping/Resetting sets it true with a uinput_down; every exit to
@@ -206,8 +271,8 @@ void drawBackFlashSection(ImDrawList* dl, float x, float& y, float w,
 void drawBackFlashOverlays();
 
 /// Per-frame state-publishing hook. Syncs the flash-category list, runs the
-/// phase machine (Idle / WaitFlashDelay / Swiping / WaitResetDelay /
-/// Resetting), and writes uinput_down / uinput_move / uinput_up on
+/// phase machine (Idle / WaitFlashDelay / Swiping / Settling /
+/// Resetting / Cooldown), and writes uinput_down / uinput_move / uinput_up on
 /// UINPUT_SLOT_PRIMARY. Sets `blockingAim=true` for the entire cycle so
 /// syncAimPage() yields the slot. Called from drawHud() BEFORE syncAimPage()
 /// so the blocking flag is set before aim checks it.
@@ -217,6 +282,11 @@ void syncBackFlashPage();
 /// than Idle). Read by syncAimPage() — when true, aim lifts its finger and
 /// refuses to drive a new one. Backed by `g_pageBackFlash.blockingAim`.
 bool backflashIsBlockingAim();
+
+/// Samples the latest capture frame's brightness. Called from syncBackFlashPage()
+/// to provide fallback flash detection when the model fails to identify a flash
+/// (e.g. full-screen whiteout). Uses step-16 interval sampling for minimal CPU cost.
+void sampleFrameBrightness(float& outBrightFraction, float& outMeanLuma);
 
 }  // namespace sections
 }  // namespace ui

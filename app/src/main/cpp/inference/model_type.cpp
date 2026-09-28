@@ -25,6 +25,8 @@
 #include <android/log.h>
 
 #include <cstdio>
+#include <cstdint>
+#include <fstream>
 #include <string>
 
 #define TAG "AimbotInfer"
@@ -209,6 +211,7 @@ bool detectTfliteShape(const std::string& path, int& w, int& h, int& classes) {
             const int c0 = chOf(o0), c1 = chOf(o1);
             if (c0 == 4 && c1 != 4)      classes = c1;
             else if (c1 == 4 && c0 != 4) classes = c0;
+            else if (c0 > 4 && c1 > 4)   classes = (c0 <= c1) ? c0 - 4 : c1 - 4;
             else classes = tfliteOutputClasses(o0);
         }
         ok = (w > 0 && h > 0);
@@ -263,6 +266,81 @@ bool detectOnnxShape(const std::string& path, int& w, int& h, int& classes) {
     }
 }
 
+bool detectNcnnShape(const std::string& path, int& w, int& h, int& classes) {
+    std::string paramPath = path;
+    if (paramPath.size() >= 4 && paramPath.compare(paramPath.size() - 4, 4, ".bin") == 0) {
+        paramPath = paramPath.substr(0, paramPath.size() - 4) + ".param";
+    }
+
+    FILE* f = fopen(paramPath.c_str(), "rb");
+    if (f == nullptr) return false;
+
+    char magic[32] = {};
+    if (fgets(magic, sizeof(magic), f) == nullptr || strstr(magic, "7767517") == nullptr) {
+        fclose(f);
+        return false;
+    }
+
+    w = 640;
+    h = 640;
+    classes = 1;
+
+    // Check if filename specifies a standard resolution
+    for (int res : {1280, 1024, 768, 640, 512, 480, 416, 384, 320, 256, 192}) {
+        std::string sres = std::to_string(res);
+        if (paramPath.find(sres) != std::string::npos) {
+            w = res;
+            h = res;
+            break;
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
+std::string detectNcnnType(const std::string& path) {
+    std::string paramPath = path;
+    std::string binPath;
+    if (paramPath.size() >= 6 && paramPath.compare(paramPath.size() - 6, 6, ".param") == 0) {
+        binPath = paramPath.substr(0, paramPath.size() - 6) + ".bin";
+    } else if (paramPath.size() >= 4 && paramPath.compare(paramPath.size() - 4, 4, ".bin") == 0) {
+        binPath = paramPath;
+        paramPath = paramPath.substr(0, paramPath.size() - 4) + ".param";
+    } else {
+        binPath = paramPath + ".bin";
+        paramPath = paramPath + ".param";
+    }
+
+    // 1. Check if .param contains Quantize / Dequantize or int8 convolution
+    std::ifstream pf(paramPath);
+    if (pf.is_open()) {
+        std::string line;
+        while (std::getline(pf, line)) {
+            if (line.rfind("Quantize", 0) == 0 || line.rfind("Dequantize", 0) == 0) {
+                return "int8";
+            }
+            if (line.find("Convolution") != std::string::npos &&
+                (line.find(" 8=1") != std::string::npos || line.find(" 8=2") != std::string::npos)) {
+                return "int8";
+            }
+        }
+    }
+
+    // 2. Check .bin tag (NCNN weight format)
+    std::ifstream bf(binPath, std::ios::binary);
+    if (bf.is_open()) {
+        uint32_t tag = 0;
+        if (bf.read(reinterpret_cast<char*>(&tag), sizeof(tag))) {
+            if (tag == 0x000D4B38) return "int8";
+            if (tag == 0x01306B47) return "fp16";
+            if (tag == 0x0002C056) return "bf16";
+        }
+    }
+
+    return "fp32";
+}
+
 }  // namespace
 
 namespace aimbotng {
@@ -272,6 +350,7 @@ std::string detectModelType(const std::string& path) {
     switch (model::kindOfPath(path)) {
         case model::Kind::Onnx:   return detectOnnxType(path);
         case model::Kind::Tflite: return detectTfliteType(path);
+        case model::Kind::Ncnn:   return detectNcnnType(path);
         default:                  return "";
     }
 }
@@ -280,6 +359,7 @@ bool detectModelInputSize(const std::string& path, int& w, int& h) {
     switch (model::kindOfPath(path)) {
         case model::Kind::Onnx:   return detectOnnxInputSize(path, w, h);
         case model::Kind::Tflite: return detectTfliteInputSize(path, w, h);
+        case model::Kind::Ncnn:   { int c = 0; return detectNcnnShape(path, w, h, c); }
         default:                  return false;
     }
 }
@@ -288,6 +368,7 @@ bool detectModelShape(const std::string& path, int& w, int& h, int& classes) {
     switch (model::kindOfPath(path)) {
         case model::Kind::Onnx:   return detectOnnxShape(path, w, h, classes);
         case model::Kind::Tflite: return detectTfliteShape(path, w, h, classes);
+        case model::Kind::Ncnn:   return detectNcnnShape(path, w, h, classes);
         default:                  return false;
     }
 }

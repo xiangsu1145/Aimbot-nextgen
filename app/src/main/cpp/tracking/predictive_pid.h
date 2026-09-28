@@ -277,15 +277,37 @@ constexpr float kVelKalmanR = 1.0f;
 /// is what lets the feed-forward release cleanly instead of chasing noise.
 constexpr float kVelZeroPx = 0.5f;
 
-/// The FIR the velocity is finally passed through: 6 samples, weights rising
-/// toward the newest. This is not just smoothing — it is what makes the
-/// estimate LAG deliberately, which is the right thing to do with a signal that
-/// has our own output in it.
-constexpr std::size_t kPredSamples     = 6;
+/// The FIR the velocity is finally passed through: weights rising toward the
+/// newest. This is not just smoothing — it is what makes the estimate LAG
+/// deliberately, which is the right thing to do with a signal that has our own
+/// output in it.
+///
+/// ★ ROUND 28 — SHORTENED, 6 SAMPLES TO 4, AND THE CONFIRMATION TO ONE.
+///
+/// The estimator's total delay is what sets the ALLOWED gain on the
+/// feed-forward self-loop (`u += kf · u(n−L)`): a longer L means a smaller kf
+/// that still stays stable. Measured on the device, that ceiling had been
+/// carried down to kf ≈ 0.21, and the whole cost is paid in the carrier — at
+/// kf = 0.21 the integral has to supply 1 − kf = 79 % of it, and the integral is
+/// a slow accumulator that HOLDS inside the band, which is exactly the "起步慢
+/// + 停下过冲" pair. The old chain was kPredSamples + kPredStableReady +
+/// TWO Kalman stages ≈ 16 frames of lag; the reference implementation of the
+/// same idea carries one filter stage and ~2.4 frames.
+///
+/// So this is a DELAY REDUCTION and nothing else, which is why it is the safe
+/// direction: delay is a pure destabiliser here, so removing it can only add
+/// phase margin. It introduces no new source of oscillation. What it does NOT
+/// do is raise the gain for you — kf still has to be re-tuned upward afterwards,
+/// and that is the point.
+///
+/// Weights keep the old shape (a rising ramp with extra weight on the newest
+/// sample) and still sum to 1.00, so the estimator's DC gain is unchanged: only
+/// its phase lag moves.
+constexpr std::size_t kPredSamples     = 4;
 constexpr std::size_t kPredHistoryCap  = 16;
 constexpr std::size_t kPredHistoryMask = kPredHistoryCap - 1;
-constexpr int         kPredStableReady = 2;
-constexpr float kPredWeights[kPredSamples] = {0.05f, 0.09f, 0.13f, 0.17f, 0.24f, 0.32f};
+constexpr int         kPredStableReady = 1;
+constexpr float kPredWeights[kPredSamples] = {0.12f, 0.20f, 0.29f, 0.39f};
 
 // ── The stop / reversal machinery (this is what replaced carry) ─────────────
 
@@ -462,14 +484,38 @@ constexpr float kIntegralLeakPerFrame = 0.95f;
 /// 1 − |e|/threshold while the error is small, i.e. it only gains authority
 /// once the aim is close. Together with the leak this is why a fresh engagement
 /// cannot wind up.
+///
+/// ★ NOTE on `rate` (round 26): adjustGain() only USES it while |e| <
+/// threshold — above the threshold the suppression branch hard-wires 0.1. So
+/// this constant governs the recovery that happens AS THE AIM CLOSES, which is
+/// the last stretch of the approach and not the initial charge. At 0.025 that
+/// recovery was a 40-frame (0.33 s) affair: the same "second ramp" the
+/// prediction gain had, and the same reason the final pixels took so long to
+/// close. 0.15 is ~7 frames — still rate-limited, still monotone toward the
+/// same target, so the steady state is unchanged and only the approach is
+/// quicker.
 constexpr float kIntegralGainThreshold = 50.0f;
-constexpr float kIntegralGainRate      = 0.025f;
+constexpr float kIntegralGainRate      = 0.15f;
 
-/// The prediction gain, same shape and same reason: the carrier RAMPS IN over
-/// roughly 0.4 s instead of arriving in one step. A step in the carrier is a
-/// step in output velocity, which is the "乱甩" fault of round 15 — so it
-/// ramps, exactly as the kf guard did, but with no estimator and no latch.
-constexpr float kPredGainRate = 0.025f;
+/// The prediction gain.
+///
+/// ★ ROUND 26 — THE 0.4 s RAMP-IN IS GONE, and the 乱甩 it was written against
+/// does not come back with it. That guard was aimed at a STEP in the carrier,
+/// but this carrier cannot step: the only thing this gain multiplies is `vel`,
+/// and `vel` is the output of a 6-tap FIR fed by two cascaded Kalman filters,
+/// with `pushVelocity` publishing NOTHING until six samples have arrived and
+/// two of them agree on a direction. The term is therefore already ~15-20
+/// frames old before this gain has any say at all. A slow rate bought nothing
+/// except a SECOND ramp stacked on the first: 40 frames of time constant at
+/// 0.025, i.e. ~0.77 s before the carrier reaches 90 %, with the entire
+/// tracking command simply absent for that whole span. That is the reported
+/// "跟枪要等一段时间才开始跟". 0.40 settles in ~10 frames, inside the velocity
+/// filter's own settling time, so what limits the ramp is now the filters
+/// rather than a constant nobody can observe.
+///
+/// It is still a ramp and still monotone, so no phase is changed and the
+/// stability margin (lookahead < 1) is untouched.
+constexpr float kPredGainRate = 0.40f;
 
 // ── The output gain ────────────────────────────────────────────────────────
 
@@ -485,6 +531,81 @@ constexpr float kInitOutGainErrLo  = 8.0f;
 constexpr float kInitOutGainErrHi  = 80.0f;
 constexpr float kOutGainThreshold  = 640.0f;
 constexpr float kOutGainRate       = 0.03f;
+
+// ── The approach-braking set (ROUND 29, ported from the Chris controller) ──
+//
+// The reference (D:\克里斯开源某控制器\pid.cpp, chimera_reconstructed::
+// updateAxis) has no D term at all. What it has instead is three ASYMMETRIC
+// braking mechanisms that only ever REMOVE energy — they fire while the error
+// is converging or has been crossed, and do nothing while it grows. This
+// loop's D is the opposite shape: symmetric in Δe, linear in kd, and blind to
+// how large a fraction of the remaining error one frame actually closed. Two
+// of his three mechanisms are covered here already (the errorRate offset by
+// the D term itself, the sign-flip decay by the integral's reversal wipe), so
+// the port below brings over the one this loop never had — convergence
+// braking, his "越来越慢" — plus the saturation pair that makes the P knob
+// behave like his outputGain instead of like the loop gain.
+//
+// His braking (pid.cpp:213):
+//
+//     prevMag > 1 && prevMag > |e| && same sign:
+//         command *= 1 − (1 − |e|/prevMag) · (approachDamping · 0.2)
+//
+// i.e. the output is cut in proportion to the FRACTION of the remaining error
+// the frame just closed. On an exponentially settling approach (e ← ρ·e) that
+// fraction is the constant (1−ρ), so the brake raises ρ — the approach
+// literally gets slower the closer it is — and releases to a no-op the moment
+// the error stops shrinking: a steady lock, a strafe lag and a completed stop
+// all have shrink ≈ 0 and pass through untouched. That self-release is what
+// makes it safe to apply to the WHOLE output here, feed-forward included. It
+// is the opposite shape from the round-26 fault, where the carrier was
+// suppressed by the SIZE of the error (a positive feedback: big error → less
+// drive → bigger error); this one is driven by the CLOSURE of the error,
+// which only exists while the loop is already winning, so it can slow an
+// approach but never stall one.
+constexpr float kConvBrakeStrength = 1.0f;  // his approachDamping 5.0 × 0.2
+
+// …but his multiplier is allowed to reach exactly 0 (an instant collapse of
+// the error reads as "full brake" for one frame). This file's history — the
+// band in round 15, the deadband in round 26 — made "output silently zeroed
+// near the target" the most expensive fault class on the device, so the
+// multiplier is floored: the brake may halve nothing more than 60 % of the
+// command in a single step, and never zero it.
+constexpr float kConvBrakeMinMult  = 0.40f;
+
+/// His gate is `prevMag > 1.0` (view px here). Below about a pixel of error
+/// the frame-to-frame ratio is OneEuro filter noise, not closure, and braking
+/// on it would be a permanent tax on exactly the terminal phase the brake is
+/// supposed to smooth.
+constexpr float kConvBrakeErrFloor = 1.0f;
+
+// ── P saturation, the port of his normalizedError clamp ────────────────────
+//
+// His P term is `clamp(error · outputGain / 5, ±3)` — at his default gain the
+// knee sits at error = 60 px, and BEYOND THE KNEE RAISING THE GAIN CHANGES
+// NOTHING. That is the structural reason his kp cannot shake the aim: the
+// knob only has authority in the last 60 px. This loop's P was linear all the
+// way out, so kp was the loop gain itself and every raise went straight into
+// the phase margin — the reported "kp 拉大会乱晃".
+//
+// The port is a soft knee (tanh) with the same break point: linear below
+// ~30 px, asymptoting at kPSatPx, so on-target behaviour and the terminal
+// approach are bit-identical to the unsaturated loop. THE INTENDED USAGE
+// CHANGES WITH IT: from this round on, "kp 拉大" is how terminal aggression
+// is bought — the knee keeps the raise local, past ~60 px it cannot reach the
+// loop's stability any more — and far-field approach speed stays the
+// feed-forward's job, as designed. If the initial pull of a re-lock now feels
+// soft, that is the knee working; raise kp to pay for it, which is free.
+constexpr float kPSatPx = 60.0f;
+
+// ── The derivative's rate clamp, the port of his errorRate clamp ───────────
+//
+// His errorRate is clamped to ±10 before anything downstream sees it; this
+// loop's dNorm was unbounded, its only guard the jump detector zeroing de
+// outright. 20 px/frame is 2400 px/s — an order of magnitude above any real
+// strafe — so the clamp is invisible to real motion and only caps what a
+// detector spike that slipped past the jump gate can cost through kd.
+constexpr float kDerivClampPx = 20.0f;
 
 constexpr float kMaxPidGain = 200.0f;
 constexpr float kMaxKiGain  = 20.0f;
@@ -609,11 +730,45 @@ public:
             reset();
             hardReset = true;
         } else if (hasPrevRaw_) {
-            const float step = std::fabs(raw - prevRaw_);
+            // ── ★ ROUND 26: measure the step with OUR OWN contribution removed ─
+            //
+            // `raw` is target − crosshair, and the crosshair moves because WE
+            // move it, so one frame's difference is
+            //
+            //     Δraw = (the target's own screen motion) − kSensFrozen·u_prev
+            //
+            // The second term is our own handwriting, and at the shipped output
+            // ceiling it is worth up to 180 screen px — SIX times the 30 px soft
+            // threshold. The detector therefore used to fire on the aim simply
+            // WORKING: the harder it drove to close the error, the more reliably
+            // that was read as a track switch. A soft jump then cuts
+            // transferBleed_ = 0.25 into the integral, the integral GAIN and the
+            // prediction gain — three quarters of the carrier gone in one step,
+            // followed by the loop ramping it back up. That is the "跟上去一点
+            // 又退回慢慢爬" half of the report, and it is a limit on how fast
+            // the aim is ever allowed to approach.
+            //
+            // The correction is applied ONLY when it can explain the step (same
+            // opposite sign) and it is SUBTRACTED, never added. The direction
+            // matters: kSensFrozen = 1.0 is a deliberate OVER-estimate of the
+            // plant gain, so ADDING it would inflate every genuine step by the
+            // estimate's own error — turning a fix for false positives into a
+            // source of false negatives. Subtracting a too-large number can only
+            // make this detector quieter, never louder, and a quieter detector is
+            // safe here: it is a FALLBACK. The caller has the track id and
+            // reports a real switch through `targetChanged`, confirmed against
+            // position, which is strictly better information than a magnitude.
+            float step = raw - prevRaw_;
+            const float selfStep = kSensFrozen * lastOutput_;
+            if (step * selfStep < 0.0f) {
+                step = std::fmax(std::fabs(step) - std::fabs(selfStep), 0.0f);
+            } else {
+                step = std::fabs(step);
+            }
             const float soft = std::fmax(kMeasurementJumpStep, 0.5f * boxPx_);
             const float hard = std::fmax(kHardTargetSwitchStep, 1.5f * boxPx_);
-            if (step >= hard)      { reset(); hardReset = true; }
-            else if (step >= soft) { softReset(); softJump = true; }
+            if (step >= hard)      { ++jumpHard_; reset(); hardReset = true; }
+            else if (step >= soft) { ++jumpSoft_; softReset(); softJump = true; }
         }
 
         const float filtered = errFilter_.update(raw, dt);
@@ -716,16 +871,35 @@ public:
 
         // ── The output sum ───────────────────────────────────────────────
         //
-        // Frozen (inside the stop band) suppresses P and D only. It must NOT
+        // Frozen (inside the stop band) suppresses P, and ONLY P. It must NOT
         // touch the feed-forward: the band's job is to stop the loop chasing
         // the detector's box jitter, and the feed-forward is not chasing
         // anything — it is the command a moving target requires. Suppressing it
         // is round 15's fault, where the band zeroed the axis outright and read
         // on the device as 乱甩乱晃.
+        //
+        // ★ ROUND 26 — D USED TO BE GATED HERE TOO, and that is a bang-bang on
+        // the axis's damping. The instant the crosshair enters the band the loop
+        // loses the one term that can stop it, so the (lagging) prediction term
+        // rides straight on through; the crosshair leaves the band, D comes
+        // back, pulls it in, the band takes D away again — a limit cycle whose
+        // amplitude is set by the band width and the carrier's lag, and one that
+        // CANNOT be tuned out with kp/ki/kd because its cause is the switch
+        // itself. On the reported 0.4 band (40 % of the box half-width, so
+        // ±15-20 px) that is exactly "停下来左右小幅度晃".
+        //
+        // D is safe inside the band: it is a difference of the FILTERED error,
+        // and `raw` is snapped to zero below kErrorEpsPx, so at rest dNorm is
+        // ~0 and D contributes nothing. It only comes alive while the crosshair
+        // is actually moving — which is precisely when it is wanted.
         const float gate = frozen ? 0.0f : 1.0f;
-        const float pT   = e * kp_ * (1.0f + kKpTrustBoost * ad.trust) * gate;
-        const float dT   = dNorm * kd_ *
-                           (1.0f + kKdTrustBoost * ad.trust) * gate;
+        // ★ ROUND 29 — P reads the soft-knee error, everything else the true
+        // one. The knee is what lets kp be raised without the raise becoming
+        // loop gain at large error; see kPSatPx.
+        const float eForP = kPSatPx * std::tanh(e / kPSatPx);
+        const float pT   = eForP * kp_ * (1.0f + kKpTrustBoost * ad.trust) * gate;
+        const float dT   = clampRange(dNorm, -kDerivClampPx, kDerivClampPx) *
+                           kd_ * (1.0f + kKdTrustBoost * ad.trust);
         float iOut = iTerm * ad.intScale;
 
         // The prediction term, in FINGER px:
@@ -745,6 +919,26 @@ public:
         if (std::fabs(ff)   <= kOutDeadbandPx * 0.5f)   ff   = 0.0f;
 
         float out = pT + iOut + dT + ff;
+
+        // ── Convergence braking — the ported "越来越慢" ────────────────────
+        // Whole-output cut in proportion to the fraction of the remaining
+        // error the frame just closed, while the error holds its sign and is
+        // actually shrinking. Skipped on jump frames: there the step is the
+        // tracker's, not the approach's, and braking on it would be braking
+        // an artifact. `lastError_` at this point still holds the previous
+        // step's filtered error (it is overwritten at the bottom of update).
+        // A steady lock, a strafe lag and a completed stop all have shrink
+        // ≈ 0 and pass through untouched — the brake only exists while the
+        // loop is already winning, which is what makes it safe to apply to
+        // the feed-forward too. See kConvBrakeStrength for the full port note.
+        const float prevMag = std::fabs(lastError_);
+        if (!hardReset && !softJump &&
+            prevMag > kConvBrakeErrFloor && prevMag > absE &&
+            sameSign(e, lastError_)) {
+            const float shrink = 1.0f - absE / prevMag;
+            out *= clampRange(1.0f - shrink * kConvBrakeStrength,
+                              kConvBrakeMinMult, 1.0f);
+        }
 
         // Soft ceiling, then the global gain, then the optional output EMA.
         out = kAimOutLimitPx * std::tanh(out / kAimOutLimitPx);
@@ -826,6 +1020,10 @@ public:
     float outLimitPx()     const { return kAimOutLimitPx; }
     /// The lookahead in force, frames — for the log.
     float lookaheadValue() const { return lookahead_; }
+    /// ★ ROUND 26 — jump-detector firing counts, cumulative since construction.
+    /// Diagnostics only; nothing in the loop reads them.
+    int jumpSoftCount() const { return jumpSoft_; }
+    int jumpHardCount() const { return jumpHard_; }
 
 private:
     // ── Adaptive state ────────────────────────────────────────────────────
@@ -1116,6 +1314,18 @@ private:
 
     // Last step's contributions, for the log line only.
     float pDisp_ = 0.0f, dDisp_ = 0.0f, iDisp_ = 0.0f, fDisp_ = 0.0f;
+
+    /// ★ ROUND 26 — how many times the jump detector fired, cumulative.
+    ///
+    /// A soft/hard jump is the loop saying "I mistook this step for a track
+    /// switch". Counted from construction on purpose and NOT cleared by
+    /// reset(): the interesting number is the RATE at which they accrue during
+    /// an ordinary approach, and a hard jump would otherwise erase its own
+    /// evidence. On a clean approach this should stay flat; if it climbs while
+    /// a target is merely being tracked, the `selfStep` correction above is
+    /// either missing a case or kSensFrozen is far enough off to hide one.
+    int jumpSoft_ = 0;
+    int jumpHard_ = 0;
 
     /// Used by the jump detector: a soft jump cuts the transient state without
     /// wiping the loop (see kJumpIntegralKeep).

@@ -31,6 +31,7 @@
 #include "ui/gui/sections/backflash_section.h"
 #include "ui/gui/sections/capture_section.h"
 #include "ui/gui/sections/model_section.h"
+#include "ui/gui/sections/recoil_section.h"
 #include "ui/gui/sections/settings_section.h"
 #include "ui/gui/sections/touch_section.h"
 #include "ui/gui/sections/trigger_section.h"
@@ -175,7 +176,7 @@ constexpr float kTitleRuleGap   = 24.0f;  // title -> hairline
 constexpr float kFirstRowGap    = 30.0f;  // hairline -> first control
 
 // The rail's labels, in MenuSection order.
-const char* kNavLabels[] = {"自瞄", "扳机", "背闪", "模型", "触摸", "截图", "设置"};
+const char* kNavLabels[] = {"自瞄", "扳机", "压枪", "背闪", "模型", "触摸", "截图", "设置"};
 static_assert(sizeof(kNavLabels) / sizeof(kNavLabels[0]) ==
                   static_cast<size_t>(MenuSection::Count),
               "kNavLabels must have one entry per MenuSection");
@@ -289,7 +290,11 @@ void drawRail(ImDrawList* dl, const HudRect& r, float s, float railW, const Xf& 
     // release lands inside it), and dead while a Model dialog owns the board:
     // a tap outside the dialog card is the dialog's scrim-dismiss, never a
     // page switch.
-    const bool dialogOpen = sections::anyDialogOpen();
+    // A modal owns the pointer while it is up — the Model page's add/file
+    // dialogs, and the Recoil page's keyboard and recording card. The rail
+    // stops switching pages for the duration, so a tap meant for the modal
+    // cannot also move the user to another page underneath it.
+    const bool dialogOpen = sections::anyDialogOpen() || sections::anyRecoilModal();
     for (int i = 0; i < count; ++i) {
         const ImVec2 mn(railMin.x + padX, firstY + i * rowStep);
         const ImVec2 mx(railMax.x - padX, mn.y + rowH);
@@ -367,6 +372,7 @@ widgets::SwitchState* masterSwitch(MenuSection section) {
     switch (section) {
         case MenuSection::Aim:       return &sections::g_pageAim.enabled;
         case MenuSection::Trigger:   return &sections::g_pageTrigger.enabled;
+        case MenuSection::Recoil:    return &sections::g_pageRecoil.enabled;
         case MenuSection::BackFlash: return &sections::g_pageBackFlash.enabled;
         case MenuSection::Capture:   return &sections::g_pageCapture.enabled;
         case MenuSection::Model:     return &sections::g_pageModel.enabled;
@@ -439,6 +445,12 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
         // surface honest — there is exactly one knob in each mode, and which
         // knob it is changes with the Settings switch.
         bool modelSwitchLive = !sections::anyDialogOpen();
+        if (g_section == MenuSection::Recoil) {
+            // The Recoil master switch is inert while its own modal is up. The
+            // board's controls are already frozen by the modal claim; without
+            // this the one switch drawn above the scrim would still be live.
+            modelSwitchLive = !sections::anyRecoilModal();
+        }
         if (g_section == MenuSection::Model) {
             const bool continuous = sections::g_pageSettings.continuousInference.value;
             modelSwitchLive = modelSwitchLive && continuous;
@@ -480,6 +492,30 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
             const float roY = titleY + (titleSize - roSize) * 0.5f;
             dl->AddText(font, roSize, xf.pt(ImVec2(roX, roY)), xf.col(TextMuted),
                         readout.c_str());
+        }
+    } else if (g_section == MenuSection::Recoil) {
+        // Same job as the Model page's readout, and the same slot: the header
+        // says what the switch on it is currently costing. Which profile is
+        // loaded is the one fact about this page that the rail cannot show, and
+        // it is the one the user needs before deciding to fire.
+        const std::string readout = sections::recoilHeaderText();
+        if (!readout.empty()) {
+            const float roSize = tsize(kPageTitleSize * 0.55f) * s;
+            const float gap    = 22.0f * s;
+            // Measured, not assumed: the Model branch can hard-code a three-glyph
+            // title because 模型 is always three, and 压枪 is not.
+            const float titleW =
+                font->CalcTextSizeA(titleSize, FLT_MAX, 0.0f,
+                                    kNavLabels[static_cast<int>(g_section)]).x;
+            const float avail = switchLeft - (x + titleW) - gap * 2.0f;
+            const float roW =
+                font->CalcTextSizeA(roSize, FLT_MAX, 0.0f, readout.c_str()).x;
+            if (roW <= avail) {
+                const float roX = switchLeft - gap - roW;
+                const float roY = titleY + (titleSize - roSize) * 0.5f;
+                dl->AddText(font, roSize, xf.pt(ImVec2(roX, roY)), xf.col(TextMuted),
+                            readout.c_str());
+            }
         }
     }
 
@@ -532,6 +568,7 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
     // Scroll gesture detection runs BEFORE the section, so it can claim the
     // gesture on the same frame a press-down crosses into scroll-drag
     // territory — widgets then see a consumed gesture and stay inert.
+    const bool dialogOpen = sections::anyDialogOpen() || sections::anyRecoilModal();
     {
         const ImGuiIO& io = ImGui::GetIO();
         const ImVec2 mouse = io.MousePos;
@@ -540,7 +577,8 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
         // stays available to whatever control is underneath. Skip if a widget
         // is already dragging the finger: the slider owns the gesture for as
         // long as it's tracking the thumb, and the page must stay still.
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        if (!dialogOpen &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             !widgets::gestureConsumed() &&
             !widgets::widgetDraggingActive() &&
             inside(mouse,
@@ -587,6 +625,9 @@ void drawContent(ImDrawList* dl, const HudRect& r, float s, float railW, const X
             break;
         case MenuSection::Trigger:
             sections::drawTriggerSection(dl, x, y, w, bottomY, s, es, xf, sc);
+            break;
+        case MenuSection::Recoil:
+            sections::drawRecoilSection(dl, x, y, w, bottomY, s, es, xf, sc);
             break;
         case MenuSection::BackFlash:
             sections::drawBackFlashSection(dl, x, y, w, bottomY, s, es, xf, sc);
@@ -674,6 +715,13 @@ void drawBoard(ImDrawList* dl, const HudRect& r, float s, const Xf& xf) {
     // the Add-Model dialog (and the file browser sitting on top of it).
     // reach for it from here so the rail does not have to know it exists.
     sections::drawModelOverlays(dl, s, xf.effective_s(s), xf);
+
+    // Recoil is the second page that owns the space above the board: the
+    // recording / analysing card, and the on-screen keyboard that names a
+    // profile. Both are modals, so they go last — nothing on the board may be
+    // drawn over them, and their own modal claim is what silences the board's
+    // controls while they are up.
+    sections::drawRecoilDialogs(dl, s, xf.effective_s(s), xf);
 }
 
 }  // namespace
@@ -904,6 +952,11 @@ void drawHud() {
     // the menu is open, and so the user can see where the swipe operates
     // after the menu is dismissed.
     sections::drawBackFlashOverlays();
+    // Recoil overlays: the fire area and the recorder's marker box. These must
+    // survive the board being hidden more than any of the others do — the whole
+    // feature fires while the menu is out of the way, and the fire area is
+    // where the compensation decides it is time to work.
+    sections::drawRecoilOverlays();
 
     // The pages' switches are published here rather than from inside the board,
     // because they describe *system* state and not a rendering concern. While
@@ -923,6 +976,12 @@ void drawHud() {
     // After syncAimPage (which keeps the Kalman tracker warm) so the trigger
     // reads smoothed tracks from this very frame.
     sections::syncTriggerPage();
+    // Recoil runs after the Trigger page because it reads that page's tap state
+    // to answer "is the burst firing", and after Aim because the compensation it
+    // publishes is consumed by the Aim page on the next pass. It is also the
+    // fourth claimant of UINPUT_SLOT_PRIMARY (back-flash, aim, trigger, then
+    // this) and it yields to the two that can already hold it.
+    sections::syncRecoilPage();
     sections::syncCapturePage();
     sections::syncModelPage();
     sections::syncSettingsPage();

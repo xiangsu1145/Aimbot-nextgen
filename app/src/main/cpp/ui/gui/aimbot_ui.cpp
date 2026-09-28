@@ -29,12 +29,18 @@
 #include "config/config_manager.h"
 #include "inference/model_runtime.h"
 #include "input/skip_screenshot.h"
+#include "tracking/crosshair_recoil.h"
+#include "tracking/recoil_recorder.h"
+#include "tracking/tuning_server.h"
 #include "ui/gui/float_button.h"
 #include "ui/gui/notify.h"
 #include "ui/gui/sections/settings_section.h"
-// For sections::aimIsDriving(), which the frame-rate tier below consults so the
-// aim loop runs at the display's rate while a target is engaged.
+#include "ui/gui/sections/recoil_section.h"
+// For sections::aimIsDriving() and sections::backflashIsBlockingAim(), which
+// the frame-rate tier below consults so the render loop runs at native display
+// rate while aim or backflash is active.
 #include "ui/gui/sections/aim_section.h"
+#include "ui/gui/sections/backflash_section.h"
 
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
@@ -1074,9 +1080,18 @@ bool updateCaptureTexture() {
     // running.
     const bool wantsPreview = (currentSection() == MenuSection::Capture) && !hudHidden();
     const bool wantsInfer   = infer::runtime::wantsFrames();
+    // The recoil recorder is a THIRD reason to keep frames coming, and the one
+    // most likely to be missed: it samples the crop the marker lives in while a
+    // burst is being measured, which happens with the board hidden and with the
+    // Recoil page — not the Capture page — selected. Without this the take would
+    // record the mirror being torn down underneath it.
+    const bool wantsRecoil  = recoil::wantsFrames();
+    // The crosshair-recoil mode is a FOURTH reader: sampling and tracking both
+    // need the mirror alive with the board hidden.
+    const bool wantsCross   = crosshair::wantsFrames();
     // Told to the frame thread rather than kept private: it is the one doing the
     // crop, so it is the only place the work can actually be avoided.
-    capture::setConsuming(wantsPreview || wantsInfer);
+    capture::setConsuming(wantsPreview || wantsInfer || wantsRecoil || wantsCross);
     // The supervisor that owns the virtual display reads this one to decide
     // whether a mirror is worth holding open, and it has to answer "is anyone
     // reading pixels" — which includes inference. It used to be handed the
@@ -1089,7 +1104,7 @@ bool updateCaptureTexture() {
     // so this does not resurrect the older bug where holding to infer kept a
     // mirror alive on a switch that read "off" — capture::enabled() is still
     // false in that case and the AND still fails.
-    capture::setPreviewWanted(wantsPreview || wantsInfer);
+    capture::setPreviewWanted(wantsPreview || wantsInfer || wantsRecoil || wantsCross);
 
     // ── The frame generation, and why it must not be gated on the preview ───
     //
@@ -1305,6 +1320,11 @@ void updateRegions() {
         regions.push_back(static_cast<int>(btn.w));
         regions.push_back(static_cast<int>(btn.h));
     }
+
+    // Sections that draw swallow-worthy overlays outside the board (the recoil
+    // page's marker box). Before the ImGui-window loop so an overlay rect
+    // cannot be pushed out by the kMaxRegions cap.
+    sections::recoilSwallowRects(regions);
 
     for (ImGuiWindow* window : ctx->Windows) {
         if (!window->WasActive || window->Hidden) continue;
@@ -1624,7 +1644,7 @@ void* renderThread(void*) {
         // wants 60, the aim wants the native rate, and the native rate is the
         // safe superset. Paid only while a target is engaged — the moment the aim
         // lets go, the tier falls back on its own.
-        const bool aiming = sections::aimIsDriving();
+        const bool aiming = sections::aimIsDriving() || sections::backflashIsBlockingAim();
         int64_t periodUs;
         if (idleFor < kActiveHoldUs) {
             periodUs = kFramePeriodUs;
@@ -1787,10 +1807,12 @@ bool start() {
         return false;
     }
     LOGI("render thread started");
+    tuning::startServer(18086);
     return true;
 }
 
 void stop() {
+    tuning::stopServer();
     g_running = false;
     if (g_thread) {
         pthread_join(g_thread, nullptr);

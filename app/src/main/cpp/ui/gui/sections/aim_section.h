@@ -264,6 +264,25 @@ struct AimController {
     float outGainX() const { return pidX.outGain(); }
     float outGainY() const { return pidY.outGain(); }
 
+    /// ★ ROUND 26 — the prediction gain in force, 0…1. While it is still
+    /// climbing, the carrier is still ramping in. It now reaches ~90 % in ten
+    /// frames (kPredGainRate was 0.025, i.e. 40-frame and ~0.77 s), so a value
+    /// still near zero several tenths of a second into an engagement means the
+    /// loop was RESET under way instead of merely ramping — read it together
+    /// with `jr` below.
+    float predGainX() const { return pidX.predGainValue(); }
+    float predGainY() const { return pidY.predGainValue(); }
+
+    /// ★ ROUND 26 — cumulative jump-detector firings (soft, hard), counted from
+    /// construction and never cleared. A soft jump cuts the integral, the
+    /// integral gain AND the prediction gain to a quarter; a hard jump wipes
+    /// the loop outright. Neither should accrue while a target is merely being
+    /// tracked: the `selfStep` correction in update() exists to stop the
+    /// detector firing on the aim's own approach, so a rate here is the
+    /// fingerprint of that fault.
+    int jumpSoftCount() const { return pidX.jumpSoftCount(); }
+    int jumpHardCount() const { return pidX.jumpHardCount(); }
+
     /// True once enough consecutive velocity samples have agreed on a direction
     /// for a velocity to be published at all. While false the prediction term is
     /// zero — the first few frames of an engagement, by design.
@@ -285,8 +304,9 @@ private:
 
 // ── Aim-touch state machine ───────────────────────────────────────────────
 //
-// Two phases: Idle (no finger down) and Pressed (a synthetic finger is held
-// on the panel). The transitions:
+// Three phases. Idle (no contact), Pressed (the aim is driving the contact) and
+// Holding (the contact is still down, but the aim is no longer driving it — the
+// player's own finger is). The transitions:
 //
     //   Idle → Pressed   on a frame where the aim is permitted (master switch on,
     //                    uinput ready, and either continuous-trigger OR a real
@@ -307,8 +327,31 @@ private:
 //                    the touch-area edge. Convergence does NOT release: the finger
 //                    stays locked on the target (hold-on-lock, like the old
 //                    project) so the aim does not thrash press/release.
+//   Pressed → Holding
+//                    when the aim would otherwise have to let go (target lost, or
+//                    the trigger hold ended) AND a finger the single-point guard
+//                    is WITHHOLDING is still pressed inside the touch area. The
+//                    contact is NOT lifted. It is handed over to that finger's own
+//                    movement: the app keeps seeing the one continuous press it
+//                    has been seeing all along.
+//   Holding → Pressed
+//                    the moment a target is on screen and the aim is permitted
+//                    again. Nothing has to be re-pressed — the contact never came
+//                    up, so the aim simply resumes driving it.
+//   Holding → Idle   when the withheld finger LIFTS (that is the release the app
+//                    can see, and the only one it needs — it was never told the
+//                    finger went down), or when the aim is switched off outright
+//                    / the injection backend is gone / the back-flash needs the
+//                    slot. Those three are the player saying "stop", not the
+//                    world taking the target away.
+//
+// Why Holding exists at all: the aim holds exactly ONE contact, and to the app
+// the withheld finger never existed. So the contact's whole lifecycle can belong
+// to the physical hand — pressed by the aim, moved by both (the finger's share is
+// the one-way assist), and lifted by the finger going up. No up/down pair, no
+// coordinate jump: to the app this is one ordinary finger that slid around.
 struct TouchAimState {
-    enum class Phase { Idle, Pressed };
+    enum class Phase { Idle, Pressed, Holding };
     Phase  phase   = Phase::Idle;
     ImVec2 position = ImVec2(0, 0);   // current synthetic-finger position (screen px)
     ImVec2 start    = ImVec2(0, 0);   // press point; drag safety compares against this
@@ -329,11 +372,22 @@ struct TouchAimState {
     bool drivingReal = false;
     int  realId = -1;
 
-    /// Last physical finger position seen, in screen px. Drives the one-way
-    /// fusion assist: (current - lastPhysical) is the player's movement this
-    /// frame, of which only the component along the aim direction is kept.
+    /// The physical finger whose movement fed the one-way assist last frame:
+    /// its panel id, and its position in screen px. (current - lastPhys) is the
+    /// player's movement this frame, of which only the component ALONG the aim
+    /// direction is kept — see driveAimToTarget.
+    ///
+    /// WHOSE movement that is depends on the phase: while the aim drives a REAL
+    /// finger (fusion takeover) it is that finger; otherwise it is the finger the
+    /// single-point guard is WITHHOLDING — the only physical finger left that the
+    /// app cannot see, and therefore the only one whose movement is free to be
+    /// mistaken for the contact's own. The id is part of the state because those
+    /// two swap mid-engagement, and a delta taken across the swap would be the
+    /// distance BETWEEN the fingers, not a movement.
+    ///
     /// -1 means "no physical finger was tracked last frame" — the delta is
     /// meaningless across that boundary and must not be computed.
+    int   lastPhysId = -1;
     float lastPhysX = -1.0f, lastPhysY = -1.0f;
 
     /// Set for ONE frame after a fusion takeover is released (real finger lifted /
@@ -405,7 +459,9 @@ struct TouchAimState {
     void release();
 };
 
-/// True while the aim is actually driving a finger. The render loop uses it to
+/// True while the aim is HOLDING a contact — either driving it itself or in
+/// Holding, where the withheld physical finger is driving it. Both need the
+/// smooth position, so the render loop uses it to
 /// decide whether the overlay needs the full 120 Hz rate: syncing at 60 Hz while
 /// a 120 fps game is being tracked makes the finger advance in 12 px steps at
 /// 720 px/s (visible as stepping) and doubles the loop's delay in seconds. The

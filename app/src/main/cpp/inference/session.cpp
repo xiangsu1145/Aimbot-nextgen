@@ -189,6 +189,7 @@ bool Session::Impl::ensureCapacity(size_t bytes) {
 void Session::Impl::run() {
     uint64_t seq = 0;
     int w = 0, h = 0, stride = 0;
+    uint64_t tsNs = 0;
     const uint8_t* pixels = nullptr;
 
     for (;;) {
@@ -209,6 +210,7 @@ void Session::Impl::run() {
             h = slotView.height;
             stride = slotView.rowStrideBytes;
             pixels = static_cast<const uint8_t*>(slotView.pixels);
+            tsNs   = slotView.tsNs;
         }
 
         if (pixels == nullptr) continue;
@@ -231,6 +233,7 @@ void Session::Impl::run() {
         view.width = w;
         view.height = h;
         view.rowStrideBytes = stride;
+        view.tsNs = tsNs;
 
         Roi roi;
         ResultFn cb;
@@ -241,8 +244,14 @@ void Session::Impl::run() {
         }
 
         const std::vector<Box> boxes = eng->run(view, roi);
-        const Timing timing = eng->lastTiming();
+        const Timing engineTiming = eng->lastTiming();
         const bool ok = eng->lastStatus().ok;
+
+        // The engine's Timing knows only what its own run cost; the frame's
+        // composition time rides here so the consumer can compute the age of
+        // the pixels these numbers (and boxes) describe.
+        Timing timing = engineTiming;
+        timing.frameTsNs = tsNs;
 
         static int s_runs = 0;
         if (++s_runs % 30 == 1) {
@@ -461,6 +470,7 @@ void Session::submit(const FrameView& frame) {
         impl_->slotView.width = frame.width;
         impl_->slotView.height = frame.height;
         impl_->slotView.rowStrideBytes = frame.rowStrideBytes;
+        impl_->slotView.tsNs = frame.tsNs;
         impl_->published = dst;      // what the worker will read
         impl_->slotSeq++;
         impl_->nextSeq = dst ^ 1;

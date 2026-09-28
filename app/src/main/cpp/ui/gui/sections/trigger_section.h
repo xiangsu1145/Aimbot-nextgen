@@ -156,6 +156,13 @@ void drawTriggerOverlays();
 /// tracks.
 void syncTriggerPage();
 
+/// True while the auto-fire is engaged — master switch on AND (continuous
+/// trigger OR a real finger held in the hold circle). Unlike `tapDown`, this
+/// does NOT flicker with the tap cadence: the gun keeps firing between taps,
+/// and this is the honest "is the gun firing" signal for consumers that ride
+/// the burst (recoil compensation).
+bool triggerIsFiring();
+
 }  // namespace sections
 }  // namespace ui
 }  // namespace aimbotng

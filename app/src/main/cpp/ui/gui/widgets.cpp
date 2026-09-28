@@ -31,6 +31,9 @@ namespace widgets {
 // does not need its symbol to be visible — only to be reachable, which is the
 // same thing once `g_gestureConsumed` and the latch are visible above.
 bool g_gestureConsumed = false;
+/// True while a modal layer (the on-screen keyboard) owns the pointer — see
+/// beginFrame() and setModalOwner().
+bool g_modalOwner = false;
 ImVec2 g_pressPos{0.0f, 0.0f};
 bool   g_pressValid = false;
 /// Set the frame a widget grabs a drag (e.g. slider press-down). Stays set
@@ -1054,8 +1057,17 @@ void consumeTap() {
     g_gestureConsumed = true;
 }
 
+void setModalOwner(bool on) { g_modalOwner = on; }
+bool modalOwner() { return g_modalOwner; }
+
 void beginFrame() {
-    g_gestureConsumed = false;
+    // A modal layer (the on-screen keyboard) owns the pointer for as long as it
+    // is up: every widget starts the frame believing the gesture is taken, so a
+    // key press cannot also flip the switch the keyboard happens to be painted
+    // over. The flag is set from the layer's own sync, i.e. one frame in
+    // arrears — invisible for a modal, and it avoids teaching beginFrame() about
+    // every page that might own a dialog.
+    g_gestureConsumed = g_modalOwner;
     // Start every frame with the display as the popup bound. The board narrows
     // it again from inside its own content clip (hud.cpp), so this is what a
     // popover drawn with no board at all — or a frame that skipped the board
@@ -1118,9 +1130,9 @@ void paintButton(ImDrawList* dl, const Rect& r, const char* label,
                  ButtonVariant variant, float s, bool held);
 
 bool button(ImDrawList* dl, const Rect& r, const char* label,
-            ButtonVariant variant, float s) {
+            ButtonVariant variant, float s, bool interactive) {
     if (r.w <= 1.0f || r.h <= 1.0f) return false;
-    if (variant == ButtonVariant::Disabled) {
+    if (variant == ButtonVariant::Disabled || !interactive) {
         paintButton(dl, r, label, variant, s, false);
         return false;
     }

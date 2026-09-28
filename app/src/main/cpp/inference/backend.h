@@ -7,9 +7,18 @@
 //  is the real identity, and this header is the only place the matrix lives.
 //
 //                     CPU  XNNPACK  NNAPI   GPU  Vulkan   HTP    NPU
-//    ONNX Runtime      -     -       -      .      .      -      .    QNN EP needs
-//                                                                    a custom ORT
-//                                                                    build
+//    ONNX Runtime      -     -       -      .      -      .    QNN EP is a
+//                                                                    plugin EP
+//                                                                    (onnxruntime-
+//                                                                    qnn 2.x);
+//                                                                    no custom
+//                                                                    ORT build.
+//                                                                    Plugin must
+//                                                                    pair exactly
+//                                                                    with the QNN
+//                                                                    runtime's
+//                                                                    interface
+//                                                                    version
 //    LiteRT            -     -       -      -      .      -      -    XNNPACK *is*
 //                                                                    its CPU path.
 //                                                                    HTP = TFLite
@@ -18,19 +27,12 @@
 //                                                                    vendor dispatch
 //                                                                    (two runtimes,
 //                                                                    both open .tflite)
-//    NCNN              -     .       .      .      -      .      .    Vulkan needs a
-//                                                                    rebuild (see note)
+//    NCNN              -     .       .      .      -      .      .    CPU + Vulkan GPU
 //    QNN (direct)      -     .       .      -      .      -      .    runs a
 //                                                                    pre-compiled .bin
 //
 //  '-' implemented, '.' not. validPair() is the authority; the table is a
 //  summary and the code is the truth.
-//
-//  Note on the prebuilt ncnn: the arm64-v8a package carried over from the old
-//  project was configured with NCNN_VULKAN 0 (see include/ncnn/platform.h), so
-//  the Vulkan cell above is aspirational until ncnn is rebuilt with it on. The
-//  header is generated at ncnn build time, so that flag is the ground truth and
-//  not a guess.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -46,7 +48,7 @@ enum class Runtime : uint8_t {
     Unknown = 0,
     OnnxRuntime,   // .onnx         — one library, many execution providers
     LiteRT,        // .tflite       — delegates rather than execution providers
-    Ncnn,          // .param + .bin — CPU only unless ncnn is rebuilt with Vulkan
+    Ncnn,          // .param + .bin — CPU and Vulkan GPU
     Qnn,           // .bin          — a pre-compiled QNN context, run directly
     Count
 };

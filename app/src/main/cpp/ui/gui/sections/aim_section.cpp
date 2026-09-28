@@ -10,6 +10,7 @@
 #ifdef HAS_IMGUI
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -23,6 +24,9 @@
 #include "input/uinput_inject.h"
 #include "input/touch_reader.h"
 #include "tracking/kalman_tracker.h"
+#include "tracking/tuning_server.h"
+#include "tracking/recoil_profile.h"
+#include "ui/gui/sections/recoil_section.h"
 
 namespace aimbotng {
 namespace ui {
@@ -250,6 +254,53 @@ bool realFingerInTouchArea(int& outId, float& outX, float& outY) {
     return found;
 }
 
+// The finger the single-point guard is holding back: it is on the glass, it is
+// driving nothing, and the app has never been told about it. Fills in its id and
+// its current screen position.
+//
+// This is the finger that makes Holding possible. The guard keeps it out of the
+// mirror so the app never sees a second contact appear (reader_set_point_guard)
+// — but the finger itself is still a finger the player is pressing and sliding,
+// and that movement turns the view exactly like the contact's movement does. So
+// rather than ignoring it, the aim adds its delta as a one-way assist (it can
+// push, never pull — see driveAimToTarget), and while it is down the contact
+// stays down.
+//
+// `insideOnly` is what separates "may this finger START driving the contact"
+// from "may it KEEP driving it". A finger that started inside the touch area may
+// carry the contact out of it — the area is where the thumb RESTS, not a leash,
+// and re-testing it every frame would make the contact twitch at the boundary.
+// A finger that merely wandered into the rectangle on its way somewhere else,
+// though, must not grab the contact. When several qualify, the one nearest the
+// touch-area centre wins, so the choice cannot flicker between two fingers.
+bool swallowedFingerHeld(bool insideOnly, int& outId, float& outX, float& outY) {
+    PageAim& p = g_pageAim;
+    if (!reader_is_ready() || !p.touchArea.placed) return false;
+    ReaderPointer pts[READER_MAX_POINTERS];
+    const int n = reader_read_pointers(pts, READER_MAX_POINTERS);
+    const TouchAreaOverlay& a = p.touchArea;
+    const float cx = a.x + a.w * 0.5f;
+    const float cy = a.y + a.h * 0.5f;
+    float bestD2 = 1e18f;
+    int   bestId = -1;
+    float bestX = 0.0f, bestY = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if (!reader_is_pointer_swallowed(pts[i].id)) continue;
+        if (insideOnly &&
+            (pts[i].x < a.x || pts[i].x > a.x + a.w ||
+             pts[i].y < a.y || pts[i].y > a.y + a.h)) continue;
+        const float dx = pts[i].x - cx, dy = pts[i].y - cy;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            bestId = pts[i].id; bestX = pts[i].x; bestY = pts[i].y;
+        }
+    }
+    if (bestId < 0) return false;
+    outId = bestId; outX = bestX; outY = bestY;
+    return true;
+}
+
 // Advances the finger on `slot` toward `target` (screen-centre reference) one
 // frame-rate-independent step and uploads the new position. Shared by both the
 // synthetic and the real-finger (fusion) paths so the aim math is identical.
@@ -287,6 +338,42 @@ bool realFingerInTouchArea(int& outId, float& outX, float& outY) {
 // integrator in a delay loop and it oscillated; its gate could not work either,
 // because the tracker reports the box's SCREEN velocity, which the aim itself
 // nulls. The controller now returns the complete displacement for the step.
+// ── The one door the aim's contact leaves through ───────────────────────────
+//
+// The Recoil page's compensation is a DISPLACEMENT OF THE CONTACT THE PLAYER IS
+// ALREADY USING, not a second finger: one finger on the look axis is the rule
+// the point guard, the fusion takeover and the back-flash cycle all exist to
+// keep, and a second synthetic contact would break it the moment the game
+// noticed. So the compensation is added at the instant the position goes out,
+// and both of this file's output paths — the PID's contact and the fusion
+// `Holding` contact — send through here rather than calling uinput directly.
+// A third path added later cannot forget to carry it.
+//
+// The page publishes the delta once per frame BEFORE this runs, so what is read
+// here is one frame old: at the overlay's rate that is ~8 ms of lag on a term
+// whose whole job is to lead the recoil, which is smaller than the jitter in
+// the measurement it came from.
+//
+// The offset is deliberately NOT folded back into `st.position`. That value is
+// the aim's own model of where its finger is; the compensation is a bias on top
+// of it, and letting the two mix would have the aim's next frame start from a
+// displaced origin and quietly re-tune its own gains.
+void emitContactMove(int slot, float x, float y) {
+    float rdx = 0.0f, rdy = 0.0f;
+    recoil::aimDelta(rdx, rdy);
+    uinput_move(slot, static_cast<int>(x + rdx), static_cast<int>(y + rdy));
+}
+
+// ── Detection age — published by syncAimPageInner() once per frame ──────────
+//
+// Wall-clock milliseconds between the frame the current detections were
+// composited into and the render frame that is about to act on them. The whole
+// sensing chain — producer queue, pump tick, inference, and the wait for this
+// very render frame — in one number, ending the era in which the loop's delay
+// had to be guessed in frames. Negative when the producer supplied no
+// timestamp or nothing has run yet; -1 encodes "unmeasurable".
+float g_detAgeMs = -1.0f;
+
 static void driveAimToTarget(TouchAimState& st, int slot,
                              const ImVec2& target, const ImVec2& rawTarget,
                              const ImVec2& screenCenter,
@@ -325,10 +412,22 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     // the HUD draws. Only the second one can answer "is the crosshair on the
     // target", because with a lead the first is null exactly when the crosshair
     // is v×lead OUTSIDE the box. See the round-17 note on the signature above.
+    // 智能压枪解耦：仅当无畏契约智能压枪开启时配合自瞄 PID。
+    // 当压枪发生时，视角被下移 rdyRecoil 像素，导致画面中目标相对准星上移了 rdyRecoil。
+    // 将 rdyRecoil 补偿回目标坐标，使自瞄 PID 识别出这是正常的压枪位移，而不是脱靶误差，防止反向拉扯。
+    float rdxRecoil = 0.0f, rdyRecoil = 0.0f;
+    const bool smartRecoilActive = g_pageRecoil.enabled.value &&
+                                   (g_pageRecoil.mode.value == PageRecoil::kModeValorant);
+    if (smartRecoilActive) {
+        recoil::aimDelta(rdxRecoil, rdyRecoil);
+    }
+    const float effectiveTargetY = target.y + rdyRecoil;
+    const float effectiveRawTargetY = rawTarget.y + rdyRecoil;
+
     const float dex = target.x - screenCenter.x;
-    const float dey = target.y - screenCenter.y;
+    const float dey = effectiveTargetY - screenCenter.y;
     const float rdx = rawTarget.x - screenCenter.x;
-    const float rdy = rawTarget.y - screenCenter.y;
+    const float rdy = effectiveRawTargetY - screenCenter.y;
     const bool xInDz  = dzXPx > 0.0f && rdx * rdx <= dzXPx * dzXPx;
     const bool yInDz  = dzYPx > 0.0f && rdy * rdy <= dzYPx * dzYPx;
     const bool yInYFollow = yDzPx > 0.0f && rdy * rdy <= yDzPx * yDzPx;
@@ -365,6 +464,28 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     // used to matter twice over.)
     st.aim.step(dex, dey, dt, xInDz, (yInDz || yInYFollow), targetChanged,
                 measurementCorrected, pidX, pidY);
+
+    const float errDist = std::sqrt(rdx * rdx + rdy * rdy);
+    tuning::updateTelemetry(st.lastTargetId, false, rdx, rdy, errDist,
+                            pidX, pidY,
+                            st.aim.propX(), st.aim.propY(),
+                            st.aim.trimX(), st.aim.trimY(),
+                            st.aim.derivX(), st.aim.derivY(),
+                            st.aim.ffX(), st.aim.ffY(),
+                            st.aim.velX(), st.aim.velY(),
+                            g_detAgeMs);
+
+    static int sTuneLogTick = 0;
+    if (tuning::isLogLiveEnabled() || (++sTuneLogTick >= 10)) {
+        if (sTuneLogTick >= 10) sTuneLogTick = 0;
+        LOGI("pid_tune: id=%d dist=%.1f dx=%.1f dy=%.1f | P=(%.2f,%.2f) I=(%.2f,%.2f) D=(%.2f,%.2f) FF=(%.2f,%.2f) => tot=(%.2f,%.2f)",
+             st.lastTargetId, errDist, rdx, rdy,
+             st.aim.propX(), st.aim.propY(),
+             st.aim.trimX(), st.aim.trimY(),
+             st.aim.derivX(), st.aim.derivY(),
+             st.aim.ffX(), st.aim.ffY(),
+             pidX, pidY);
+    }
 
     // ── Aim telemetry ──────────────────────────────────────────────────────
     //
@@ -466,13 +587,24 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     //             yardstick the selection pass already keeps) — the same px/s is a
     //             different physical motion on a distant box and one at contact
     //             range, so "it keeps up" is only meaningful at a stated box size.
-    //   tr      : TRUST in the velocity estimate, 0..1 per axis — the gate on the
-    //             prediction term. On an ordinary strafe it should read 0.85+.
-    //             Persistently below ~0.5 while the target moves smoothly means the
-    //             gate is mis-scaled (kTrustVelScale) and is taxing the carrier:
-    //             the symptom is "能跟枪但总差一口气", never a shake. This replaced
-    //             the old `stop`/`a` group — there is no stop detector to read now,
-    //             because `v` going to 0 IS the stop.
+    //   tr      : TRUST in the velocity estimate, 0..1 per axis.
+    //             ⚠ ROUND 27 — THIS FIELD'S OLD DESCRIPTION WAS STALE AND
+    //             ACTIVELY MISLEADING: it still called tr "the gate on the
+    //             prediction term" and said an ordinary strafe reads 0.85+.
+    //             Neither holds since round 22 deleted the trust gate
+    //             (`kFfTrustFloor` is gone). The live formula is
+    //             `1 - exp(-|v| / kTrustVelScale)` times a stability gate, so
+    //             with kTrustVelScale = 8.0 it only approaches 1 when |v| is
+    //             ~15 SCREEN px/frame: a faster strafe than most, and far out
+    //             of reach for a distant target whose `yard` is single digits.
+    //             ★ A LOW tr IS THEREFORE NORMAL ON A SMALL BOX, NOT A FAULT.
+    //             All it costs is the BOOST — `predScale = 1 + kKpTrustBoost·tr`
+    //             is >= 1, so tr = 0 leaves the feed-forward at its NOMINAL
+    //             value and never throttles it. Do NOT read a small tr as "the
+    //             carrier is being taxed" and go hunting for a gain: read `ff`
+    //             against `kf · tot` for throttling, and ebb/ezc below for a
+    //             shake. This replaced the old `stop`/`a` group — there is no
+    //             stop detector to read now, because `v` going to 0 IS the stop.
     //   og      : the output gain, 0.35–1.0. It falls when the error is large, so a
     //             LOW `og` is expected just after a re-lock and during a jump. If it
     //             stays low while `mean e` is small, something is scaling the output
@@ -489,11 +621,217 @@ static void driveAimToTarget(TouchAimState& st, int slot,
         static int  sTick = 0;
         static float sSumX = 0.0f, sSumY = 0.0f;
         sSumX += dex; sSumY += dey;
+
+        // ★ ROUND 27 — the window's SWAY, not only its mean.
+        //
+        // `mean e` is a MEAN, and a limit cycle averages to zero: the number
+        // meant to expose the shake reads "under a pixel" however hard the
+        // crosshair swings. Every field after it is a ONE-IN-480 SNAPSHOT, and
+        // 480 frames at ~117 fps is 4.1 s — sampling a multi-Hz sway at
+        // 0.24 Hz is aliasing, not measurement. The four fields appended below
+        // are the instrument that was missing:
+        //
+        //   ebb : error PEAK-TO-PEAK over the window, screen px. The amplitude
+        //         of the sway — read this FIRST.
+        //   ezc : error SIGN CHANGES over the window = twice the cycle count in
+        //         4.1 s, so ezc = 20 is ~2.4 Hz. High ezc with a small ebb is
+        //         dither; a low ezc with a small ebb is a slow hunt.
+        //   obb : the command's peak-to-peak, finger px — how hard the loop
+        //         swings to produce that ebb.
+        //   dz  : the stop radius IN FORCE (X, Y), screen px. Read `ebb`
+        //         AGAINST it. ebb ≈ 2·dz means the BAND sets the amplitude
+        //         (a band-edge limit cycle, so fix the band); ebb far wider
+        //         than 2·dz with a low ezc means the CARRIER oscillates (an
+        //         underdamped prediction term, so fix kf/kd). Those two have
+        //         opposite fixes, which is the whole point of the group.
+        //   dmax: the D term's absolute PEAK over the window, px — the
+        //         instrument for the "kd 不像阻尼" finding (ROUND 28). Because
+        //         the crosshair's own motion IS our last output, the D term
+        //         splits as `+kd·目标位移` (a one-frame KICK, algebraically the
+        //         same job as the feed-forward) and `−kd·α·u(n−1)` (a one-frame
+        //         negative-feedback self-loop that rings when kd·α approaches
+        //         1). Averaging cannot see either, so read the PEAK and only
+        //         the peak: on an ordinary strafe dmax should stay a small
+        //         fraction of `obb`, and it is the frames where the TARGET
+        //         STOPS that spike it — the kick inverts there. A dmax
+        //         comparable to `obb` means kd is driving the loop, not damping
+        //         it, and the fix is to take the carrier off kd (raise kf) and
+        //         not to trim kd.
+        //
+        // `obb` is taken from the controller's OWN output for the step (pidX /
+        // pidY), so it is the command the plant saw, not a pre-gain sum.
+        //   rbb : the RAW error's peak-to-peak, screen px — `rdx` is the box
+        //         centre minus the crosshair, i.e. the distance the PLAYER's
+        //         EYE sees, with no lead in it. This is the number "目标停下来
+        //         小震荡" is actually about, and the one `dz` is compared
+        //         against inside the freeze test.
+        //   rzc : the raw error's sign changes, same convention as `ezc`.
+        //         ★ ROUND 29 — read `ebb` AGAINST `rbb`, never against `dz`:
+        //         `ebb - rbb` is how much of the "error" swing is the 延迟补偿
+        //         lead walking the setpoint around. If the swing lives there,
+        //         it cannot be tuned: a lead is a differentiator folded back
+        //         into the point the loop converges to, so it is upstream of
+        //         every gain row.
+        static float sMinX = 0.0f, sMaxX = 0.0f, sMinY = 0.0f, sMaxY = 0.0f;
+        static float sPMinX = 0.0f, sPMaxX = 0.0f, sPMinY = 0.0f, sPMaxY = 0.0f;
+        // ★ ROUND 28 — D-term absolute peak. Note it is a PEAK OF |d|, not a
+        // peak-to-peak of a signed signal: the quantity that matters is how
+        // hard the damping term pulls, whichever way it pulls.
+        static float sDMaxX = 0.0f, sDMaxY = 0.0f;
+        static float sPrevX = 0.0f, sPrevY = 0.0f;
+        static int   sZcX = 0, sZcY = 0;
+        // ★ ROUND 29 — the same two statistics, on the RAW (un-leaded) error.
+        static float sRMinX = 0.0f, sRMaxX = 0.0f, sRMinY = 0.0f, sRMaxY = 0.0f;
+        static float sRPrevX = 0.0f, sRPrevY = 0.0f;
+        static int   sRZcX = 0, sRZcY = 0;
+        // ★ ROUND 34 — THE STEADY-STATE SUBSET.
+        //
+        // The window above SPANS ENGAGEMENTS: `sTick` is static and releasing
+        // the trigger does not reset it, so the approach of every engagement
+        // lands in the same accumulator as its settle. That is why `rbb` reads
+        // 30~40 px while `mean e` reads ~1 px, and why nothing could be
+        // concluded from it: 33 px of peak-to-peak with a 0.9 px mean is the
+        // target's own STEP (a step is a few frames wide, and `dmax/kd` puts
+        // the biggest single-frame target move at ~8 px), not a sway.
+        //
+        // These four accumulate ONLY on frames whose raw error is inside
+        // kR34QuietPx, i.e. the frames that are actually ON TARGET:
+        //   sqb : the residual's peak-to-peak, screen px — the number 目标停下
+        //         小震荡 is about.
+        //   sqc : its sign changes in the window, so sqc/2 / 4.14 s is its Hz.
+        //   sqn : how many frames that estimate stands on. A small sqn means
+        //         the target never settled and the other two mean nothing.
+        static float sQMinX = 0.0f, sQMaxX = 0.0f, sQMinY = 0.0f, sQMaxY = 0.0f;
+        static float sQPrevX = 0.0f, sQPrevY = 0.0f;
+        static int   sQZcX = 0, sQZcY = 0, sQN = 0;
+        static bool  sQSeeded = false, sQBreak = true;
+        // ★ AGE — the sensing chain's own window statistics. Frames where the
+        // producer had no timestamp (age < 0) contribute nothing, and sAgeN
+        // says how much of the window was even measurable. ageMax is the one
+        // to read against a one-frame step no gain can remove: it is the
+        // largest staleness the loop was fed in four seconds.
+        static float sAgeSum = 0.0f, sAgeMax = 0.0f;
+        static int   sAgeN = 0;
+        // ★ ROUND 34 — THE TRANSIENT RECORDER. An aggregate cannot show a
+        // damping ratio; a waveform can. One line per frame from the moment the
+        // raw error leaves the band until it has stayed quiet. Two things fall
+        // out of it that nothing else in this file provides:
+        //   * the step response — rise time, overshoot, and whether it rings;
+        //   * the PLANT GAIN α. With `Δe = (target motion) − α·u(n−1)`, a line
+        //     fitted through (u(n−1), Δe) on a steady strafe has slope −α, and
+        //     Δe is `d/kd` off the log. α is the one constant still guessed at:
+        //     `kSensFrozen` is set to 1.0 against an α that the kd blow-up
+        //     boundary (kd = 0.40 flew ⇒ kd·α ≈ 1) puts nearer 2.5.
+        static int sRecI = -1, sRecQuiet = 0, sRecCool = 0;
+        constexpr float kR34QuietPx    = 6.0f;   // ~1.6x the shipped stop radius
+        constexpr float kR34TrigPx     = 8.0f;   // a target STEP, not a jitter
+        constexpr int   kR34RecFrames  = 60;
+        constexpr int   kR34CoolFrames = 120;
+
+        if (sTick == 0) {               // seed on the window's first frame
+            sMinX = sMaxX = sPMinX = sPMaxX = sPrevX = dex;
+            sMinY = sMaxY = sPMinY = sPMaxY = sPrevY = dey;
+            sRMinX = sRMaxX = sRPrevX = rdx;
+            sRMinY = sRMaxY = sRPrevY = rdy;
+            sDMaxX = 0.0f; sDMaxY = 0.0f;
+            sZcX = sZcY = 0;
+            sRZcX = sRZcY = 0;
+            sQSeeded = false; sQZcX = sQZcY = 0; sQN = 0; sQBreak = true;
+            sAgeSum = 0.0f; sAgeMax = 0.0f; sAgeN = 0;
+        } else {
+            if (dex < sMinX) sMinX = dex;
+            if (dex > sMaxX) sMaxX = dex;
+            if (dey < sMinY) sMinY = dey;
+            if (dey > sMaxY) sMaxY = dey;
+            // At rest the error is snapped to zero, so a run of exact zeros
+            // must not read as one crossing per frame: sign(0) counts as
+            // positive on both sides and therefore contributes nothing.
+            if ((dex > 0.0f) != (sPrevX > 0.0f)) ++sZcX;
+            if ((dey > 0.0f) != (sPrevY > 0.0f)) ++sZcY;
+            sPrevX = dex; sPrevY = dey;
+            if (rdx < sRMinX) sRMinX = rdx;
+            if (rdx > sRMaxX) sRMaxX = rdx;
+            if (rdy < sRMinY) sRMinY = rdy;
+            if (rdy > sRMaxY) sRMaxY = rdy;
+            if ((rdx > 0.0f) != (sRPrevX > 0.0f)) ++sRZcX;
+            if ((rdy > 0.0f) != (sRPrevY > 0.0f)) ++sRZcY;
+            sRPrevX = rdx; sRPrevY = rdy;
+        }
+
+        // ★ ROUND 34 — the steady-state subset (see the note at the statics).
+        if (g_detAgeMs >= 0.0f) {
+            sAgeSum += g_detAgeMs;
+            if (g_detAgeMs > sAgeMax) sAgeMax = g_detAgeMs;
+            ++sAgeN;
+        }
+        if (std::fabs(rdx) <= kR34QuietPx) {
+            if (!sQSeeded) {
+                sQSeeded = true;
+                sQMinX = sQMaxX = sQPrevX = rdx;
+                sQMinY = sQMaxY = sQPrevY = rdy;
+            } else {
+                if (rdx < sQMinX) sQMinX = rdx;
+                if (rdx > sQMaxX) sQMaxX = rdx;
+                if (rdy < sQMinY) sQMinY = rdy;
+                if (rdy > sQMaxY) sQMaxY = rdy;
+                // A crossing across a gap is not a crossing — the transient
+                // frames in between are simply not part of this series.
+                if (!sQBreak) {
+                    if ((rdx > 0.0f) != (sQPrevX > 0.0f)) ++sQZcX;
+                    if ((rdy > 0.0f) != (sQPrevY > 0.0f)) ++sQZcY;
+                }
+                sQPrevX = rdx; sQPrevY = rdy;
+            }
+            sQBreak = false;
+            ++sQN;
+        } else {
+            sQBreak = true;
+        }
+
+        // ★ ROUND 34 — the transient recorder (see the note at the statics).
+        if (sRecCool > 0) --sRecCool;
+        if (sRecI < 0) {
+            if (sRecCool <= 0 && std::fabs(rdx) > kR34TrigPx) {
+                sRecI = 0; sRecQuiet = 0;
+            }
+        } else {
+            LOGI("aimf: i=%d rdx=%.2f rdy=%.2f u=(%.3f,%.3f) v=(%.2f,%.2f) "
+                 "ff=(%.3f,%.3f) I=(%.2f,%.2f) p=(%.2f,%.2f) d=(%.3f,%.3f) "
+                 "age=%.1f",
+                 sRecI, rdx, rdy, pidX, pidY,
+                 st.aim.velX(), st.aim.velY(),
+                 st.aim.ffX(), st.aim.ffY(),
+                 st.aim.trimX(), st.aim.trimY(),
+                 st.aim.propX(), st.aim.propY(),
+                 st.aim.derivX(), st.aim.derivY(),
+                 g_detAgeMs);
+            ++sRecI;
+            if (std::fabs(rdx) <= 1.0f) ++sRecQuiet; else sRecQuiet = 0;
+            if (sRecI >= kR34RecFrames || sRecQuiet >= 20) {
+                sRecI = -1; sRecCool = kR34CoolFrames;
+            }
+        }
+
+        if (pidX < sPMinX) sPMinX = pidX;
+        if (pidX > sPMaxX) sPMaxX = pidX;
+        if (pidY < sPMinY) sPMinY = pidY;
+        if (pidY > sPMaxY) sPMaxY = pidY;
+
+        const float dAbsX = std::fabs(st.aim.derivX());
+        const float dAbsY = std::fabs(st.aim.derivY());
+        if (dAbsX > sDMaxX) sDMaxX = dAbsX;
+        if (dAbsY > sDMaxY) sDMaxY = dAbsY;
+
         if (++sTick >= 480) {
             LOGI("aim: id=%d mean e=(%.1f,%.1f) tot=(%.2f,%.2f) "
                  "ff=(%.1f,%.1f) v=(%.1f,%.1f) d=(%.2f,%.2f) trim=(%.1f,%.1f) "
                  "p=(%.1f,%.1f) kf=%.2f tr=(%.2f,%.2f) og=(%.2f,%.2f) "
-                 "vok=(%d,%d) lim=%.0f yard=%.0f dt=%.1fms",
+                 "vok=(%d,%d) lim=%.0f yard=%.0f dt=%.1fms "
+                 "pg=(%.2f,%.2f) jr=(%d,%d) "
+                 "ebb=(%.1f,%.1f) ezc=(%d,%d) obb=(%.2f,%.2f) dz=(%.1f,%.1f) "
+                 "dmax=(%.2f,%.2f) rbb=(%.1f,%.1f) rzc=(%d,%d) "
+                 "sqb=(%.1f,%.1f) sqc=(%d,%d) sqn=%d "
+                 "ageAvg=%.1f ageMax=%.1f ageN=%d",
                  st.lastTargetId,
                  sSumX / sTick, sSumY / sTick, pidX, pidY,
                  st.aim.ffX(), st.aim.ffY(),
@@ -511,8 +849,29 @@ static void driveAimToTarget(TouchAimState& st, int slot,
                  st.aim.outGainX(), st.aim.outGainY(),
                  st.aim.velReadyX() ? 1 : 0, st.aim.velReadyY() ? 1 : 0,
                  st.aim.outLimitPx(),
-                 st.lastTargetBox, dt * 1000.0f);
+                 st.lastTargetBox, dt * 1000.0f,
+                 // ★ ROUND 26 — see AimController::predGainX / jumpSoftCount.
+                 // `pg` still near 0 several tenths of a second in means the
+                 // loop was reset under way; `jr` climbing during an ordinary
+                 // approach means the jump detector is still firing on our own
+                 // movement.
+                 st.aim.predGainX(), st.aim.predGainY(),
+                 st.aim.jumpSoftCount(), st.aim.jumpHardCount(),
+                 // ★ ROUND 27 — the sway, not the mean. Read these
+                 // against `dz`: see the accumulator block above.
+                 sMaxX - sMinX, sMaxY - sMinY,
+                 sZcX, sZcY,
+                 sPMaxX - sPMinX, sPMaxY - sPMinY,
+                 dzXPx, dzYPx,
+                 sDMaxX, sDMaxY,
+                 sRMaxX - sRMinX, sRMaxY - sRMinY, sRZcX, sRZcY,
+                 // ★ ROUND 34 — the residual, on the quiet frames only.
+                 sQMaxX - sQMinX, sQMaxY - sQMinY, sQZcX, sQZcY, sQN,
+                 // ★ AGE — mean/peak detection age over the window.
+                 sAgeN > 0 ? sAgeSum / sAgeN : -1.0f, sAgeMax, sAgeN);
             sTick = 0; sSumX = 0.0f; sSumY = 0.0f;
+            sQSeeded = false; sQZcX = sQZcY = 0; sQN = 0; sQBreak = true;
+            sAgeSum = 0.0f; sAgeMax = 0.0f; sAgeN = 0;
         }
     }
 
@@ -532,38 +891,19 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     float moveX = pidX;
     float moveY = pidY;
 
-    // ── One-way fusion assist ───────────────────────────────────────────────
-    // The player's finger may push the aim forwards, never backwards. Only the
-    // component of the physical delta that lies ALONG the aim direction is
-    // added; the opposing component is dropped. Projecting the delta (rather
-    // than testing a dot-product sign and then adding the raw vector) is what
-    // makes "helps, never hinders" true for every direction at once: a diagonal
-    // drag that fights the aim still contributes its forward half, where the old
-    // sign test threw the whole vector away.
+    // ── Full-pass touch fusion (全透传直接叠加融合) ───────────────────────────
+    // 废除向量投影折扣与“不可以反向”限制：
+    // 玩家手指的物理滑动位移 (physDeltaX, physDeltaY) 直接全量叠加到控制指令中，
+    // 无论是同向助推还是反向拉扯微调，100% 透传，不打折，彻底消除粘滞感与迟钝感。
     const float physLen2 = physDeltaX * physDeltaX + physDeltaY * physDeltaY;
-    if (physLen2 > 0.25f) {  // > 0.5 px: below that it is panel jitter, not intent
-        const float aimLen2 = moveX * moveX + moveY * moveY;
-        if (aimLen2 > 0.25f) {
-            const float invAim = 1.0f / std::sqrt(aimLen2);
-            const float ux = moveX * invAim, uy = moveY * invAim;
-            const float along = physDeltaX * ux + physDeltaY * uy;   // signed
-            if (along > 0.0f) {
-                moveX += ux * along;
-                moveY += uy * along;
-            }
-            // along <= 0: the finger is pulling against the aim. Ignored — this
-            // is the "不可以反向" half of the rule.
-        } else {
-            // Aim has no direction this frame (already converged) — let the
-            // finger through so the player can still fine-tune by hand.
-            moveX = physDeltaX;
-            moveY = physDeltaY;
-        }
+    if (physLen2 > 0.25f) {  // > 0.5 px 过滤轻微硬件抖动
+        moveX += physDeltaX;
+        moveY += physDeltaY;
     }
 
     st.position.x += moveX;
     st.position.y += moveY;
-    uinput_move(slot, static_cast<int>(st.position.x), static_cast<int>(st.position.y));
+    emitContactMove(slot, st.position.x, st.position.y);
 }
 
 // ── Touch-area hit testing & drag ───────────────────────────────────────────
@@ -1231,6 +1571,24 @@ static void syncAimPageInner() {
     const infer::runtime::Snapshot snap = infer::runtime::snapshot();
     std::vector<std::string> classLabels = snap.classes;
 
+    // ── Publish the detection age for this frame ──────────────────────────
+    // now minus the frame's composition timestamp (Image.getTimestamp,
+    // carried through capture -> FrameView -> Timing). This is the whole
+    // sensing chain's latency: producer queue + pump tick + inference + the
+    // wait for this render frame. It is measurement only — nothing in the
+    // controller consumes it yet, on purpose (the 延迟补偿 lead has an
+    // oscillation history and switches over only once this number has a
+    // baseline). 0 means the producer had no timestamp; negative wall-clock
+    // difference means a clock-base mismatch, and both read as -1.
+    {
+        const long long nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count();
+        const long long ageNs = nowNs - static_cast<long long>(snap.timing.frameTsNs);
+        g_detAgeMs = (snap.timing.frameTsNs != 0 && ageNs > 0)
+                         ? static_cast<float>(ageNs) / 1e6f
+                         : -1.0f;
+    }
+
     // Placeholder fallback. Models whose TSV row has no class names (older
     // entries, or models that ship without an embedded label file) end up
     // with an empty `snap.classes` even when `classCount > 0` — the snapshot
@@ -1345,13 +1703,137 @@ static void syncAimPageInner() {
     // runs BEFORE this function so it is current; we just read it.
     const bool blockedByBackFlash = backflashIsBlockingAim();
     const bool canAim = p.enabled.value && inject_is_ready() && holdActive && !blockedByBackFlash;
+
+    // ── When the aim must let go, who decides when the contact lifts? ─────────
+    //
+    // Not the aim, as long as a withheld finger is still pressed inside the touch
+    // area: the contact is handed to that finger instead of being lifted, so the
+    // app sees one continuous press and never an up/down pair (see Holding in
+    // aim_section.h). What CANNOT be handed over is the player switching the aim
+    // off, the injection backend being gone, or the back-flash needing the slot
+    // this very frame — those are not "the world took the target away", they are
+    // "stop", and they win.
+    const bool hardStop = !p.enabled.value || !inject_is_ready() || blockedByBackFlash;
+    int   heldId = -1;
+    float heldX = 0.0f, heldY = 0.0f;
+    const bool heldFinger = swallowedFingerHeld(/*insideOnly=*/true, heldId, heldX, heldY);
+
+    // Lifts the contact for good. Handing a taken-over real finger back to the
+    // mirror uses no uinput_up, so it does not flicker down/up; a synthetic (or
+    // already handed-over) contact is lifted normally. A hand-back also arms the
+    // one-frame guard that keeps the Idle branch from spawning a synthetic finger
+    // the instant the real one left (see justReleasedTakeover).
+    auto liftContact = [&]() {
+        if (p.touchAim.drivingReal) {
+            uinput_release_takeover();
+            p.touchAim.justReleasedTakeover = true;
+        } else {
+            uinput_up(p.touchAim.slot);
+        }
+        p.touchAim.release();
+    };
+
+    // Turns "the aim is done" into "the finger is done": the contact stays down
+    // and the withheld finger takes it over. False when there is nobody to hand it
+    // to, in which case the caller lifts.
+    auto holdInsteadOfLifting = [&]() {
+        if (hardStop || !heldFinger) return false;
+        if (p.touchAim.phase == TouchAimState::Phase::Idle) return false;
+        if (p.touchAim.phase == TouchAimState::Phase::Holding) return true;
+        p.touchAim.phase = TouchAimState::Phase::Holding;
+        LOGI("fusion: holding the contact (finger id=%d) — the aim let go, the "
+             "contact stays down until that finger lifts", heldId);
+        return true;
+    };
+
+    // ── Whose movement feeds the assist this frame ────────────────────────────
+    //
+    // Resolved HERE, ahead of the permission check, because the Holding pass below
+    // spends the delta on the frame it arrives — including on the frames where the
+    // aim is not allowed to drive anything, which is the whole point of Holding.
+    //
+    // Two candidates, and exactly one of them applies:
+    //   * a real finger the aim has TAKEN OVER (fusion) — the aim is moving that
+    //     finger's slot, so the player's own hand movement on it is a push;
+    //   * the finger the single-point guard is WITHHOLDING — the app has never
+    //     seen it, so it drives nothing, and its movement is therefore free to be
+    //     spent on the contact the aim is holding.
+    //
+    // `prevRealId` is read BEFORE the block below writes the new id back: comparing
+    // the freshly written id against itself would make the "a different finger is
+    // now under the crosshair" test permanently false, so a takeover would happily
+    // follow whatever finger happened to be nearest instead of the one it took.
+    int  realId = -1;
+    float realX = 0.0f, realY = 0.0f;
+    const bool realFingerInArea = realFingerInTouchArea(realId, realX, realY);
+    const int prevRealId = p.touchAim.realId;
+    int   physId = -1;
+    float physX  = 0.0f, physY = 0.0f;
+    if (p.fusion.value && realFingerInArea) {
+        physId = realId; physX = realX; physY = realY;
+        p.touchAim.realId = realId;
+    } else {
+        // Strictly from INSIDE the touch area — UNLESS the contact is already in
+        // Holding, where the inside test is dropped. The touch area is where the
+        // thumb RESTS, not a leash, so a swipe covering half the screen must not
+        // end the contact the moment it crosses the edge. A finger that merely
+        // wandered in from outside, though, must not be able to grab the contact,
+        // which is why the strict test is the default.
+        const bool alreadyHolding = (p.touchAim.phase == TouchAimState::Phase::Holding);
+        swallowedFingerHeld(/*insideOnly=*/!alreadyHolding, physId, physX, physY);
+    }
+
+    // A delta is only meaningful while the SAME finger was tracked last frame — a
+    // first sighting, or a swap between two fingers, is a gap across which "delta"
+    // would be the distance BETWEEN them.
+    float physDeltaX = 0.0f, physDeltaY = 0.0f;
+    if (physId >= 0) {
+        if (p.touchAim.lastPhysId == physId && p.touchAim.lastPhysX >= 0.0f) {
+            physDeltaX = physX - p.touchAim.lastPhysX;
+            physDeltaY = physY - p.touchAim.lastPhysY;
+        }
+        p.touchAim.lastPhysId = physId;
+        p.touchAim.lastPhysX  = physX;
+        p.touchAim.lastPhysY  = physY;
+    } else {
+        // No physical finger to read — the delta is undefined next frame.
+        p.touchAim.lastPhysId = -1;
+        p.touchAim.lastPhysX = p.touchAim.lastPhysY = -1.0f;
+    }
+
+    // ── Holding: keep the contact alive, let the finger drive it ──────────────
+    //
+    // Runs BEFORE the permission check on purpose: Holding's whole premise is
+    // that the aim is NOT allowed to drive any more. The contact stays down and
+    // the withheld finger's movement is added to it verbatim — no aim output and
+    // no one-way projection (with no aim direction to project onto there is
+    // nothing for "one-way" to mean, and a thumb that is already down should just
+    // work).
+    //
+    // The contact ends when that FINGER ends. Its lift is the one release the app
+    // can see, and the only one it needs — it was never told the finger went down.
+    // That is the "别抬手，直到物理手指抬起" rule.
+    if (p.touchAim.phase == TouchAimState::Phase::Holding) {
+        if (hardStop) { liftContact(); return; }
+        // `physId` is whoever is physically holding this contact up: the finger
+        // the aim took over (if any) or the withheld one. When neither is on the
+        // glass any more there is nothing left to drive the contact, and letting
+        // it lift is exactly the release the app is expecting.
+        if (physId < 0) {
+            LOGI("fusion: the finger driving the contact lifted — releasing it");
+            liftContact();
+            return;
+        }
+        p.touchAim.position.x += physDeltaX;
+        p.touchAim.position.y += physDeltaY;
+        emitContactMove(p.touchAim.slot, p.touchAim.position.x, p.touchAim.position.y);
+        if (!canAim) return;   // still no permission: nothing else to do this frame
+    }
+
     if (!canAim) {
-        if (p.touchAim.phase == TouchAimState::Phase::Pressed) {
-            // Hand a taken-over real finger back to the mirror (no uinput_up, so it
-            // does not flicker down/up); lift a synthetic finger normally.
-            if (p.touchAim.drivingReal) uinput_release_takeover();
-            else                        uinput_up(p.touchAim.slot);
-            p.touchAim.release();
+        if (p.touchAim.phase != TouchAimState::Phase::Idle) {
+            if (holdInsteadOfLifting()) return;
+            liftContact();
         }
         return;
     }
@@ -1416,31 +1898,54 @@ static void syncAimPageInner() {
     // decide which track is the target, so aim precision is untouched.
     const auto& tracks = tracking::tracker().tracks();
     if (p.aimCategory.hasAnySelected()) {
-        for (int pass = 0; pass < 2 && !hasTarget; ++pass) {
-            const bool wantLost = (pass == 1);
+        // ── Sticky retention for currently locked target ───────────────────
+        // If the locked target is still alive in tracks (even if t.lost == true within
+        // terminateFrames), stick to it! This prevents a momentary 1-frame dropout from
+        // flipping to a nearby rival enemy in multi-target situations, ensuring that
+        // the configured "丢失帧数" works as expected.
+        const tracking::TrackedTarget* lockedTrack = nullptr;
+        if (p.touchAim.lastTargetId >= 0) {
             for (const auto& t : tracks) {
-                if (!t.confirmed) continue;
-                if (t.lost != wantLost) continue;
-                if (!p.aimCategory.isClassSelected(t.cls)) continue;
-                const float dx = t.cx - screenCenter.x;
-                const float dy = t.cy - screenCenter.y;
-                const float dSq = dx * dx + dy * dy;
-                // The sticky bonus, applied as a distance discount so a single
-                // comparison covers both "is this the engaged track" and "is a
-                // rival far enough ahead to take over".
-                const float eff = (t.id == p.touchAim.lastTargetId)
-                    ? dSq / (kStickyReselect * kStickyReselect)
-                    : dSq;
-                if (eff >= bestDistSq) continue;
-                bestDistSq = eff;
-                target     = ImVec2(t.cx, t.cy);
-                bestVelX   = t.vx;
-                bestVelY   = t.vy;
-                targetW    = t.w;
-                targetH    = t.h;
-                bestCls    = t.cls;
-                bestId     = t.id;
-                hasTarget  = true;
+                if (t.id == p.touchAim.lastTargetId && t.confirmed &&
+                    p.aimCategory.isClassSelected(t.cls)) {
+                    lockedTrack = &t;
+                    break;
+                }
+            }
+        }
+
+        if (lockedTrack) {
+            target     = ImVec2(lockedTrack->cx, lockedTrack->cy);
+            bestVelX   = lockedTrack->vx;
+            bestVelY   = lockedTrack->vy;
+            targetW    = lockedTrack->w;
+            targetH    = lockedTrack->h;
+            bestCls    = lockedTrack->cls;
+            bestId     = lockedTrack->id;
+            hasTarget  = true;
+        } else {
+            // Not currently locking any target, or the locked target expired.
+            // Pick the nearest target: pass 0 = live tracks, pass 1 = lost tracks.
+            for (int pass = 0; pass < 2 && !hasTarget; ++pass) {
+                const bool wantLost = (pass == 1);
+                for (const auto& t : tracks) {
+                    if (!t.confirmed) continue;
+                    if (t.lost != wantLost) continue;
+                    if (!p.aimCategory.isClassSelected(t.cls)) continue;
+                    const float dx = t.cx - screenCenter.x;
+                    const float dy = t.cy - screenCenter.y;
+                    const float dSq = dx * dx + dy * dy;
+                    if (dSq >= bestDistSq) continue;
+                    bestDistSq = dSq;
+                    target     = ImVec2(t.cx, t.cy);
+                    bestVelX   = t.vx;
+                    bestVelY   = t.vy;
+                    targetW    = t.w;
+                    targetH    = t.h;
+                    bestCls    = t.cls;
+                    bestId     = t.id;
+                    hasTarget  = true;
+                }
             }
         }
     }
@@ -1669,32 +2174,9 @@ static void syncAimPageInner() {
     // from the mirror (uinput_takeover_physical_id), so nothing competes with aim
     // for its position — that is the entire reason the takeover exists.
 
-    int  realId = -1;
-    float realX = 0.0f, realY = 0.0f;
-    const bool realFingerInArea = realFingerInTouchArea(realId, realX, realY);
-
-    // Physical touch delta for the fusion assist. Taken from `prevRealId`, read
-    // BEFORE the block below writes the new id back: comparing the freshly
-    // written id against itself would make the "a different finger is now under
-    // the crosshair" test permanently false, so a takeover would happily follow
-    // whatever finger happened to be nearest instead of the one it took.
-    const int prevRealId = p.touchAim.realId;
-    float physDeltaX = 0.0f, physDeltaY = 0.0f;
-    if (p.fusion.value && realFingerInArea) {
-        // Only meaningful while the SAME finger was tracked last frame — a
-        // first sighting, or a switch between two fingers, is a gap across
-        // which "delta" would be the distance between them.
-        if (prevRealId == realId && p.touchAim.lastPhysX >= 0.0f) {
-            physDeltaX = realX - p.touchAim.lastPhysX;
-            physDeltaY = realY - p.touchAim.lastPhysY;
-        }
-        p.touchAim.lastPhysX = realX;
-        p.touchAim.lastPhysY = realY;
-        p.touchAim.realId    = realId;
-    } else {
-        // No physical finger in the area — the delta is undefined next frame.
-        p.touchAim.lastPhysX = p.touchAim.lastPhysY = -1.0f;
-    }
+    // ── Whose movement feeds the assist this frame is resolved ABOVE ──────────
+    // (see the note next to the permission check — it has to run before the
+    // Holding pass, which needs the delta for the frame it is about to spend).
 
     // 前馈增益 (kf) is pushed in with the gains — see setGains() below.
     //
@@ -1712,6 +2194,23 @@ static void syncAimPageInner() {
     // them; that one is an explicit, optional bet on the target continuing.
     // Nothing in the controller consumes the velocity any more.
 
+    // ── Holding → Pressed: the aim may have the contact back ──────────────────
+    //
+    // Nothing has to be re-pressed — the contact never came up, so the aim simply
+    // resumes driving it. This frame's finger movement was already spent by the
+    // Holding pass at the top, so it is cleared here: spending it a second time
+    // through the one-way assist would move the contact twice for one movement.
+    if (p.touchAim.phase == TouchAimState::Phase::Holding) {
+        if (!hasTarget) return;   // already moved for this frame, still waiting
+        p.touchAim.phase = TouchAimState::Phase::Pressed;
+        physDeltaX = physDeltaY = 0.0f;
+        // Re-anchor drag safety at wherever the finger left the contact. Holding
+        // may have carried it far from the press point, and reading that travel as
+        // "the aim has strayed too far" would lift the contact immediately — an
+        // up/down pair, the one thing this whole mechanism exists to avoid.
+        p.touchAim.start = p.touchAim.position;
+    }
+
     if (p.touchAim.phase == TouchAimState::Phase::Idle) {
         // ── Idle: start aiming when a selected target is on screen ────────────
         if (!hasTarget) return;
@@ -1726,7 +2225,8 @@ static void syncAimPageInner() {
                 p.touchAim.slot        = slot;
                 p.touchAim.drivingReal = true;
                 p.touchAim.realId      = realId;
-                p.touchAim.lastPhysX   = realX;   // anchor the assist delta here
+                p.touchAim.lastPhysId  = realId;  // anchor the assist delta here
+                p.touchAim.lastPhysX   = realX;
                 p.touchAim.lastPhysY   = realY;
                 p.touchAim.phase       = TouchAimState::Phase::Pressed;
                 p.touchAim.aim.reset();
@@ -1765,14 +2265,24 @@ static void syncAimPageInner() {
         return;
     }
 
-    // ── Pressed: stay locked on; release only on target-loss ──────────────────
+    // ── Pressed: stay locked on while there is a target ───────────────────────
     if (!hasTarget) {
+        // Target lost. Normally that ends the engagement — but when a finger the
+        // guard is withholding is still pressed inside the touch area, the contact
+        // is handed to THAT FINGER instead of being lifted: it keeps moving, the
+        // app keeps seeing the one press it already had, and the lift happens when
+        // the finger lifts. So the up/down pair a hand-back would produce never
+        // happens — nor the coordinate jump that comes with it, which exists
+        // because the app's contact would re-appear at the aim's last position
+        // while the finger is somewhere else. See Holding in aim_section.h.
+        if (holdInsteadOfLifting()) return;
         if (p.touchAim.drivingReal) {
             // Hand the finger back to the mirror; no uinput_up, so the game does
             // not see it flicker up and down.
             uinput_release_takeover();
             p.touchAim.justReleasedTakeover = true;
-            LOGI("fusion: handed back finger id=%d (target lost)", prevRealId);
+            LOGI("fusion: handed back finger id=%d (target lost, nothing withheld to hold for)",
+                 prevRealId);
         } else {
             uinput_up(p.touchAim.slot);
         }
@@ -1841,13 +2351,18 @@ static void syncAimPageInner() {
 //   * a finger already down when the aim engages keeps the point — the fusion
 //     takeover drives it, so the aim's point IS the player's finger;
 //   * a finger landing in the touch box while the aim holds a point does not
-//     reach the game at all — and it goes on not reaching it until that finger
-//     LIFTS, even after the aim has let go. Releasing it the moment the aim
+//     reach the game at all, and it goes on not reaching it until that finger
+//     LIFTS — even after the aim has let go. Releasing it the moment the aim
 //     stops would drop it onto the app at its CURRENT position while the app's
 //     one look contact sits wherever the aim left it: a second contact landing
 //     tens of pixels away is a camera jump, the same fault in reverse. A finger
-//     the app was never told about is also one it does not have to be told
-//     about when it comes up — the lift is the only release the app cannot see;
+//     the app was never told about is also one it does not have to be told about
+//     when it comes up — the lift is the only release the app cannot see. What
+//     such a finger IS good for is movement: while the aim holds a contact its
+//     delta is spent on that contact (one-way — see driveAimToTarget), and when
+//     the aim is done the contact is handed to it outright instead of being
+//     lifted (Holding in aim_section.h). So this is a refusal of a SECOND
+//     contact, not of the finger;
 //   * everything outside the box — the fire button, the trigger finger — is
 //     mirrored exactly as before. Swallowing the trigger finger would release
 //     the aim's own hold, so this is a requirement, not a courtesy.
@@ -1857,7 +2372,13 @@ static void syncAimPageInner() {
 // only names a finger the mirror is carrying).
 static void publishPointGuard() {
     PageAim& p = g_pageAim;
-    const bool holding = (p.touchAim.phase == TouchAimState::Phase::Pressed);
+    // Armed for as long as a contact is held — Pressed OR Holding. A Holding
+    // contact is still down and still the only one the app can see, so a finger
+    // landing in the box must still be refused: that is the finger which will
+    // eventually take the contact over, and until then it must not become a
+    // second look contact. Disarming the moment the aim stops would let exactly
+    // that finger in the instant it matters.
+    const bool holding = (p.touchAim.phase != TouchAimState::Phase::Idle);
     if (!holding || !p.touchArea.placed) {
         // Disarming only stops NEW landings from being refused; it does not
         // release the fingers already refused — those leave by lifting, which is
@@ -1869,9 +2390,20 @@ static void publishPointGuard() {
     const TouchAreaOverlay& a = p.touchArea;
     const int rect[4] = {static_cast<int>(a.x), static_cast<int>(a.y),
                          static_cast<int>(a.w), static_cast<int>(a.h)};
-    // The finger the aim drives has to keep its gesture: it IS the point, and
-    // the takeover needs it in the mirror so that handing it back is seamless.
-    const int keepId = p.touchAim.drivingReal ? p.touchAim.realId : -1;
+    // The finger the aim drives has to keep its gesture: it IS the point, and the
+    // takeover needs it in the mirror so that handing it back is seamless. Only
+    // while it is really still on the glass, though — in Holding it may already
+    // have lifted, and the panel REUSES tracking ids, so naming an id nobody is
+    // holding would wave the next finger given that id straight into the mirror.
+    // That is the second-contact path this guard exists to close.
+    int keepId = -1;
+    if (p.touchAim.drivingReal) {
+        ReaderPointer pts[READER_MAX_POINTERS];
+        const int n = reader_read_pointers(pts, READER_MAX_POINTERS);
+        for (int i = 0; i < n; ++i) {
+            if (pts[i].id == p.touchAim.realId) { keepId = p.touchAim.realId; break; }
+        }
+    }
     reader_set_point_guard(rect, true, keepId);
 }
 
@@ -1903,7 +2435,9 @@ void syncAimPage() {
 // actually being engaged: the moment the aim lets go, the tier falls back to
 // whatever it was doing before.
 bool aimIsDriving() {
-    return g_pageAim.touchAim.phase == TouchAimState::Phase::Pressed;
+    // Holding counts: the contact is still down and still being moved every frame
+    // (by the withheld finger now), so it needs the same smooth rate.
+    return g_pageAim.touchAim.phase != TouchAimState::Phase::Idle;
 }
 
 }  // namespace sections

@@ -36,6 +36,7 @@ enum class Kind {
     Unknown = 0,
     Onnx,
     Tflite,
+    Ncnn,
 };
 
 /// A runtime that can execute a model. Not every engine can run every kind —
@@ -60,11 +61,14 @@ enum class Engine {
                    //           TFLite interpreter underneath. Not the same thing
                    //           as NeuroPilot: no MediaTek TFLite fork is used,
                    //           only the delegate/APU half of their SDK.
-                   //
-                   // Appended last on purpose. This enum is persisted as an int
-                   // in the model store, so inserting anywhere but the end
-                   // would silently re-label every model already saved on
-                   // device (a stored 5 would become a different engine).
+    OnnxHtp,       // .onnx — ONNX Runtime with the QNN EP plugin on the HTP
+                   //           (Snapdragon NPU). Plugin EP: stock libonnxruntime
+                   //           plus libonnxruntime_providers_qnn.so registered at
+                   //           session build. The plugin pairs EXACTLY with the
+                   //           bundled QNN runtime's interface version (2.6.0 ↔
+                   //           QAIRT 2.50) — see backend.h and libpath.cpp.
+    NcnnCpu,       // .param + .bin — NCNN CPU (multi-threaded via OpenMP)
+    NcnnGpu,       // .param + .bin — NCNN GPU (Vulkan compute)
 };
 
 /// One entry in the list. `loaded` is a marker, not a state of the runtime: at
@@ -72,7 +76,8 @@ enum class Engine {
 struct Entry {
     int                      id = 0;
     std::string              name;        // shown in the list; defaults to the file name
-    std::string              path;        // absolute path to a .onnx / .tflite file
+    std::string              path;        // absolute path to a .onnx / .tflite / .param file
+    std::string              binPath;     // companion .bin file for NCNN
     Kind                     kind = Kind::Unknown;
     Engine                   engine = Engine::None;
     std::vector<std::string> classes;     // index 0 is class 0

@@ -197,6 +197,50 @@ const char* const kLiteRtQnn[] = {
     nullptr,
 };
 
+/// ONNX Runtime + the QNN EP plugin stack.
+///
+/// The QNN EP is a *plugin* EP: stock libonnxruntime.so stays as-is, and
+/// libonnxruntime_providers_qnn.so is registered into an OrtEnv at session
+/// build time (RegisterExecutionProviderLibrary). The plugin dlopens
+/// libQnnHtp.so itself (told via the `backend_path` provider option), and
+/// libQnnHtp pulls the per-arch skel — both must already be resident in the
+/// same namespace, which is what this list is for.
+///
+/// Version pairing is exact and not negotiable: the plugin consumes the QNN
+/// interface version it was compiled against (2.6.0 → QAIRT 2.50 → interface
+/// v2_39), and QnnInterface_getProviders matches on major.minor exactly. The
+/// bundled QNN runtime is therefore 2.50, and it also serves the LiteRT
+/// delegate path above — one stack, one version, shared by both runtimes.
+const char* const kOrtQnn[] = {
+    "libonnxruntime.so",
+    "libonnxruntime_providers_qnn.so",
+    "libQnnSystem.so",
+    "libQnnHtp.so",
+    "libQnnHtpNetRunExtensions.so",
+    "libQnnHtpPrepare.so",
+    "libQnnHtpOptraceProfilingReader.so",
+    "libQnnHtpProfilingReader.so",
+    // No V{arch}Skel entries here, unlike kLiteRtQnn above. A Skel is a
+    // Hexagon ELF and the host linker refuses it — dlopen always fails, and
+    // on this strict-ish path that noise reads like a real problem. The Stub
+    // list below covers what libQnnHtp dlopens by SONAME; the Skels are
+    // found by the DSP driver via ADSP_LIBRARY_PATH (set in
+    // ort_engine.cpp's ensureQnnStack) and never by the host linker.
+    "libQnnHtpV68Stub.so",
+    "libQnnHtpV69Stub.so",
+    "libQnnHtpV73Stub.so",
+    "libQnnHtpV75Stub.so",
+    "libQnnHtpV79Stub.so",
+    "libQnnHtpV81Stub.so",
+    "libQnnHtpV68CalculatorStub.so",
+    "libQnnHtpV69CalculatorStub.so",
+    "libQnnHtpV73CalculatorStub.so",
+    "libQnnHtpV75CalculatorStub.so",
+    "libQnnHtpV79CalculatorStub.so",
+    "libQnnHtpV81CalculatorStub.so",
+    nullptr,
+};
+
 /// The QNN stack, assembled once.
 ///
 /// Holds the strings itself and hands out pointers into them, because
@@ -268,6 +312,15 @@ const char* const* runtimeLibraries(Runtime runtime, Ep ep, int& count) {
             return s.ptrs.data();
         }
         case Runtime::OnnxRuntime:
+            // HTP under ORT goes through the QNN EP plugin (see kOrtQnn).
+            // Every other ONNX Runtime backend needs only the runtime itself,
+            // which ensureOrt() preloads on first use — so an explicit list
+            // here would only move that dlopen earlier for no gain.
+            if (ep == Ep::Htp) {
+                count = listLen(kOrtQnn);
+                return kOrtQnn;
+            }
+            return kNone;
         case Runtime::Ncnn:
         default:
             return kNone;

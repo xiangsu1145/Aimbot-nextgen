@@ -19,6 +19,8 @@
 #include "inference/neuron_engine.h"
 #endif
 #include "inference/ort_engine.h"
+#include "inference/ncnn_engine.h"
+#include <ncnn/gpu.h>
 
 #include <android/log.h>
 
@@ -45,7 +47,11 @@ const Pair kPairs[] = {
     {Runtime::OnnxRuntime, Ep::Xnnpack},   // the default: XNNPACK kernels
     {Runtime::OnnxRuntime, Ep::Cpu},       // plain MLAS, for when XNNPACK is wrong
     {Runtime::OnnxRuntime, Ep::Nnapi},     // the platform delegate
-    {Runtime::OnnxRuntime, Ep::Htp},       // needs an ORT built with the QNN EP
+    // QNN EP is a plugin EP since onnxruntime-qnn 2.0: a standalone .so
+    // registered into the OrtEnv at runtime — no custom ORT build. The plugin
+    // (libonnxruntime_providers_qnn.so) must pair EXACTLY with the bundled QNN
+    // runtime's interface version (2.6.0 ↔ QAIRT 2.50 ↔ v2_39).
+    {Runtime::OnnxRuntime, Ep::Htp},
 
     // LiteRT. Listed separately so the user can pick between the default
     // CPU path and an explicit XNNPACK delegate, even though the latter is
@@ -130,7 +136,7 @@ Probe      g_probes[static_cast<int>(Runtime::Count)][static_cast<int>(Ep::Count
 /// is present and links.
 bool implemented(Runtime r, Ep e) {
     if (r == Runtime::OnnxRuntime) {
-        return e == Ep::Xnnpack || e == Ep::Cpu;
+        return e == Ep::Xnnpack || e == Ep::Cpu || e == Ep::Htp;
     }
     if (r == Runtime::LiteRT) {
         return e == Ep::Cpu     || e == Ep::Xnnpack ||
@@ -146,6 +152,9 @@ bool implemented(Runtime r, Ep e) {
                || e == Ep::NeuroPilot
         // #endif
         ;
+    }
+    if (r == Runtime::Ncnn) {
+        return e == Ep::Cpu || e == Ep::Vulkan;
     }
     return false;
 }
@@ -297,6 +306,35 @@ bool epAvailable(Runtime r, Ep e) {
             p.ok  = false;
             p.why = "libonnxruntime.so is not loadable — " + why;
             return false;
+        }
+        // QNN HTP under ORT: the plugin EP plus the QNN runtime it drives.
+        // Same shape as the LiteRT QNN probe below — existence checks only,
+        // because the real registration (RegisterExecutionProviderLibrary and
+        // the HTP context build) is expensive and belongs to load(), which
+        // already runs off the UI thread. The skel/arch gating matches the
+        // LiteRT path: a Snapdragon we ship no skel for sees a grey row.
+        if (e == Ep::Htp) {
+            const auto& caps = capabilities();
+            if (!caps.isQualcomm || caps.htpArch <= 0) {
+                p.ok  = false;
+                p.why = caps.isQualcomm
+                          ? "QNN HTP skel for this SoC is not shipped"
+                          : "QNN HTP requires a Qualcomm SoC";
+                return false;
+            }
+            if (!libraryPresent("libonnxruntime_providers_qnn.so")) {
+                p.ok  = false;
+                p.why = "libonnxruntime_providers_qnn.so is not on this device";
+                return false;
+            }
+            if (!libraryPresent("libQnnHtp.so")) {
+                p.ok  = false;
+                p.why = "libQnnHtp.so is not on this device";
+                return false;
+            }
+            p.ok = true;
+            LOGI("backend available: %s (htp v%d)", pairLabel(r, e), caps.htpArch);
+            return true;
         }
         p.ok = true;
         LOGI("backend available: %s", pairLabel(r, e));
@@ -462,6 +500,25 @@ bool epAvailable(Runtime r, Ep e) {
         return true;
     }
 
+    if (r == Runtime::Ncnn) {
+        if (e == Ep::Vulkan) {
+            int gpuCount = ncnn::get_gpu_count();
+            if (gpuCount <= 0) {
+                p.ok  = false;
+                p.why = "no Vulkan GPU device found on this device";
+                return false;
+            }
+            p.ok = true;
+            LOGI("backend available: %s (Vulkan GPU detected)", pairLabel(r, e));
+            return true;
+        }
+        if (e == Ep::Cpu) {
+            p.ok = true;
+            LOGI("backend available: %s", pairLabel(r, e));
+            return true;
+        }
+    }
+
     p.ok  = false;
     p.why = "engine not implemented yet";
     LOGW("backend unavailable: %s — %s", pairLabel(r, e), p.why.c_str());
@@ -559,6 +616,12 @@ std::unique_ptr<Engine> create(Runtime r, Ep e, std::string* why) {
         // device lacks a usable skel). The factory just constructs the
         // object; the constructor is cheap.
         auto engine = std::make_unique<LiteRtEngine>(e);
+        if (why != nullptr) why->clear();
+        return engine;
+    }
+
+    if (r == Runtime::Ncnn) {
+        auto engine = std::make_unique<NcnnEngine>(e);
         if (why != nullptr) why->clear();
         return engine;
     }

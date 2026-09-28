@@ -135,9 +135,37 @@ int reader_get_region_count(void);
 /// Pass `enabled = false` (rect may be null) to disarm the guard.
 void reader_set_point_guard(const int* rect, bool enabled, int keepId);
 
+/// ── Mirror view offset (压枪) ────────────────────────────────────────────────
+///
+/// An extra displacement added to the MIRROR of every finger whose current
+/// position is inside `rect` ({x, y, w, h} in screen pixels). `rect` may be null
+/// to clear, and a zero displacement is the same as clearing.
+///
+/// This exists because the recoil compensation has to rotate the view without
+/// creating a touch point. When the aimbot is driving, the compensation is added
+/// to the position the aim loop computes. When the player is aiming BY HAND
+/// there is no such place to add it — the look contact is a real thumb, mirrored
+/// straight from the panel — and pressing a synthetic one beside it would put
+/// two fingers on the game's look area, which is the exact fault
+/// reader_set_point_guard() exists to prevent. So the compensation is added to
+/// the finger we are already mirroring, on its way out.
+///
+/// Applied on the reader thread, from values written by the render thread, so
+/// the setters are atomics. The offset is ABSOLUTE (not a per-frame delta): it
+/// is a property of the current burst, and re-applying it every frame from the
+/// panel's own coordinates is what keeps it from accumulating twice.
+///
+/// The raw (panel) coordinates are re-derived from the shifted screen position
+/// rather than offset separately, so both encodings describe the same point —
+/// otherwise the two backends would disagree by the rotation-dependent amount.
+void reader_set_view_offset(const int* rect, float dx, float dy);
+
+/// How many mirrored fingers the view offset is currently displacing
+/// (diagnostics; the count is from the last mirrored frame).
+int reader_get_view_offset_count(void);
+
 /// Whether the guard is currently armed (diagnostics).
 bool reader_get_point_guard(void);
-
 /// How many fingers the guard is swallowing right now (diagnostics).
 int reader_get_point_guard_count(void);
 

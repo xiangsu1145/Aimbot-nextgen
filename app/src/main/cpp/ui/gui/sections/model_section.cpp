@@ -12,11 +12,13 @@
 #include <dirent.h>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #include "inference/model_runtime.h"
 #include "inference/model_store.h"
 #include "inference/model_type.h"
+#include "inference/ncnn_engine.h"
 #include "ui/gui/hud.h"
 #include "ui/gui/notify.h"
 #include "ui/gui/sections/settings_section.h"
@@ -35,6 +37,17 @@ PageModel g_pageModel;
 
 namespace {
 using namespace theme;
+
+std::string lower(const std::string& str) {
+    std::string s = str;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s;
+}
+
+bool endsWith(const std::string& str, const std::string& suffix) {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
 constexpr float kModelRowH     = 96.0f;
 constexpr float kModelRowGap   = 12.0f;
@@ -119,7 +132,7 @@ std::string parentOf(const std::string& dir) {
 
 bool isPickableName(const std::string& name) {
     const model::Kind k = model::kindOfPath(name);
-    return k == model::Kind::Onnx || k == model::Kind::Tflite;
+    return k == model::Kind::Onnx || k == model::Kind::Tflite || k == model::Kind::Ncnn;
 }
 
 /** Which engines actually honour the "CPU Threads" slider — i.e. the ones
@@ -130,7 +143,8 @@ bool engineUsesCpuThreads(model::Engine e) {
     return e == model::Engine::OnnxRuntime ||
            e == model::Engine::OnnxCpu ||
            e == model::Engine::Cpu ||
-           e == model::Engine::TfliteXnnpack;
+           e == model::Engine::TfliteXnnpack ||
+           e == model::Engine::NcnnCpu;
 }
 
 /** Whether an engine row in the 推理引擎 dropdown should be dimmed and
@@ -275,19 +289,21 @@ void openFileBrowser() {
 
 void selectFile(const std::string& path) {
     PageModel& pg = g_pageModel;
+    if (pg.pickingSlot == 2) {
+        const size_t n = std::min(path.size(), sizeof(pg.pathBuf2) - 1);
+        memcpy(pg.pathBuf2, path.data(), n);
+        pg.pathBuf2[n] = '\0';
+        pg.pathLen2 = static_cast<int>(n);
+        g_fileBrowser.open = false;
+        g_fileBrowser.dragScroll = false;
+        LOGI("AddDialog: companion file selected path='%s'", pg.pathBuf2);
+        return;
+    }
+
     const size_t n = std::min(path.size(), sizeof(pg.pathBuf) - 1);
     memcpy(pg.pathBuf, path.data(), n);
     pg.pathBuf[n] = '\0';
     pg.pathLen = static_cast<int>(n);
-    // -1, not 0. The old engine index may well not fit the new file's kind —
-    // that is what this line is for — but 0 is a *valid* index and it maps to
-    // "NPU (LiteRT)" in the tflite list, so resetting to 0 does not mean
-    // "nothing chosen", it means "LiteRtNpu chosen". The Add button already
-    // gates on `pg.engine.value >= 0` and the dropdown already treats -1 as
-    // "no selection" (see the Unknown-kind branch below), so -1 is the value
-    // this screen was written against. Resetting to 0 silently enrolled every
-    // newly added .tflite on the LiteRT 2.x NPU path, which is the one that
-    // traps in __loader_android_link_namespaces and takes the process down.
     pg.engine.value = -1;
     pg.pathPicking = false;
     pg.pathFailed = false;
@@ -295,9 +311,42 @@ void selectFile(const std::string& path) {
     g_fileBrowser.open = false;
     LOGI("AddDialog: file selected path='%s'", pg.pathBuf);
     g_fileBrowser.dragScroll = false;
-    // Peek the model's tensor element type so the XNNPACK caution (and the list
-    // label) can react to FP16 without loading the whole graph yet.
+
+    // Peek the model's tensor element type
     pg.pathType = aimbotng::infer::detectModelType(std::string(pg.pathBuf, pg.pathLen));
+
+    // For NCNN models, check if the sibling companion file exists in the same folder
+    const model::Kind kind = model::kindOfPath(std::string(pg.pathBuf, pg.pathLen));
+    if (kind == model::Kind::Ncnn) {
+        std::string p(pg.pathBuf, pg.pathLen);
+        std::string lp = lower(p);
+        if (endsWith(lp, ".param")) {
+            std::string companion = p.substr(0, p.size() - 6) + ".bin";
+            if (access(companion.c_str(), R_OK) == 0) {
+                const size_t cLen = std::min(companion.size(), sizeof(pg.pathBuf2) - 1);
+                memcpy(pg.pathBuf2, companion.data(), cLen);
+                pg.pathBuf2[cLen] = '\0';
+                pg.pathLen2 = static_cast<int>(cLen);
+            } else {
+                pg.pathBuf2[0] = '\0';
+                pg.pathLen2 = 0;
+            }
+        } else if (endsWith(lp, ".bin")) {
+            std::string companion = p.substr(0, p.size() - 4) + ".param";
+            if (access(companion.c_str(), R_OK) == 0) {
+                const size_t cLen = std::min(companion.size(), sizeof(pg.pathBuf2) - 1);
+                memcpy(pg.pathBuf2, companion.data(), cLen);
+                pg.pathBuf2[cLen] = '\0';
+                pg.pathLen2 = static_cast<int>(cLen);
+            } else {
+                pg.pathBuf2[0] = '\0';
+                pg.pathLen2 = 0;
+            }
+        }
+    } else {
+        pg.pathBuf2[0] = '\0';
+        pg.pathLen2 = 0;
+    }
 }
 
 struct QuickFolder { const char* label; const char* path; };
@@ -528,6 +577,9 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     if (closeOnOutsideTap(card)) {
         pg.dialog = ModelDialogState::Closed;
         pg.pathPicking = false;
+        pg.pathBuf2[0] = '\0';
+        pg.pathLen2 = 0;
+        pg.pickingSlot = 1;
         return;
     }
 
@@ -550,36 +602,61 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     if (widgets::closeButton(dl, xRect, es)) {
         pg.dialog = ModelDialogState::Closed;
         pg.pathPicking = false;
+        pg.pathBuf2[0] = '\0';
+        pg.pathLen2 = 0;
+        pg.pickingSlot = 1;
         return;
     }
 
-    // Body — stack: path picker, engine, confirm/cancel. The display name is
-    // taken from the file's basename (see Add button below), so there is no
-    // text field on this dialog — and therefore no route through the
-    // `requestText` / system-IME relay that used to fire `AimModelTextActivity`
-    // on every stale residual JSON.
+    // Body — stack: path picker(s), engine, confirm/cancel.
+    const model::Kind kind = (pg.pathLen > 0)
+                              ? model::kindOfPath(std::string(pg.pathBuf, pg.pathLen))
+                              : model::Kind::Unknown;
+    const bool isNcnn = (kind == model::Kind::Ncnn);
+
     const float padX     = widgets::dialogInnerPad(es);
-    const float padY     = 24.0f * s;
+    const float padY     = isNcnn ? (14.0f * s) : (22.0f * s);
+    const float pillH    = isNcnn ? (64.0f * s) : (74.0f * s);
     float yc = card.y + titleH + padY;
 
-    // 1. Path picker.
+    // 1. Path picker (Slot 1).
+    if (isNcnn) {
+        bool isBin = endsWith(lower(std::string(pg.pathBuf, pg.pathLen)), ".bin");
+        dl->AddText(font, tsize(18.0f) * s, ImVec2(card.x + padX, yc),
+                    xf.col(TextMuted), isBin ? "模型权重文件 (.bin)" : "模型结构文件 (.param)");
+        yc += 22.0f * s;
+    }
     if (widgets::pathPill(dl, {card.x + padX, yc,
-                               card.w - 2.0f * padX, 78.0f * s},
+                               card.w - 2.0f * padX, pillH},
                           pg.pathBuf, pg.pathLen, false, es)) {
+        pg.pickingSlot = 1;
         openFileBrowser();
         pg.pathFailed = false;
     }
-    yc += 78.0f * s + padY;
+    yc += pillH + padY;
     if (pg.pathFailed && pg.pathErr[0] != '\0') {
         dl->AddText(font, tsize(18.0f) * s, ImVec2(card.x + padX, yc),
                     xf.col(IM_COL32(255, 96, 96, 255)), pg.pathErr);
         yc += 28.0f * s;
     }
 
+    // 1b. Companion file picker (Slot 2) — only shown when NCNN model is selected.
+    if (isNcnn) {
+        bool isBin = endsWith(lower(std::string(pg.pathBuf, pg.pathLen)), ".bin");
+        dl->AddText(font, tsize(18.0f) * s, ImVec2(card.x + padX, yc),
+                    xf.col(TextMuted), isBin ? "模型结构文件 (.param)" : "模型权重文件 (.bin)");
+        yc += 22.0f * s;
+
+        if (widgets::pathPill(dl, {card.x + padX, yc,
+                                   card.w - 2.0f * padX, pillH},
+                              pg.pathBuf2, pg.pathLen2, false, es)) {
+            pg.pickingSlot = 2;
+            openFileBrowser();
+        }
+        yc += pillH + padY;
+    }
+
     // 2. Engine dropdown — gated when no path has been picked yet.
-    const model::Kind kind = (pg.pathLen > 0)
-                              ? model::kindOfPath(std::string(pg.pathBuf, pg.pathLen))
-                              : model::Kind::Unknown;
     const char* label = (kind == model::Kind::Unknown)
                             ? "请先选择模型"
                             : "推理引擎";
@@ -601,32 +678,24 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
                       enginesCount, es, false, engineDisabled);
     yc += 58.0f * s + padY;
 
-    // 3. Confidence — the threshold detections are filtered by. Lives here as
-    //    well as in the per-model dialog so a model is usable the moment it
-    //    is added, without a second trip through Settings.
-    widgets::Rect confRect{card.x + padX, yc, card.w - 2.0f * padX, 80.0f * s};
+    // 3. Confidence — the threshold detections are filtered by.
+    widgets::Rect confRect{card.x + padX, yc, card.w - 2.0f * padX, 76.0f * s};
     widgets::sliderFloat(dl, confRect, pg.conf, "置信度", 2, es);
-    yc += 80.0f * s + padY;
+    yc += 76.0f * s + padY;
 
     // Which engine is currently selected drives which extra controls show.
     const model::Engine selEngine = (kind != model::Kind::Unknown && pg.engine.value >= 0)
                                      ? model::engineAt(kind, pg.engine.value)
                                      : model::Engine::None;
 
-    // 4. "CPU Threads" — only for engines that actually run on CPU cores and
-    //    take a thread count (ONNX XNNPACK / plain CPU, LiteRT CPU / XNNPACK).
-    //    QNN HTP, NNAPI and GPU ignore it, so it is hidden there.
+    // 4. "CPU Threads" — only for engines that actually run on CPU cores.
     if (engineUsesCpuThreads(selEngine)) {
-        widgets::Rect threadsRect{card.x + padX, yc, card.w - 2.0f * padX, 80.0f * s};
+        widgets::Rect threadsRect{card.x + padX, yc, card.w - 2.0f * padX, 76.0f * s};
         widgets::sliderFloat(dl, threadsRect, pg.threadsSlider, "CPU 线程数", 0, es);
-        yc += 80.0f * s + padY;
+        yc += 76.0f * s + padY;
     }
 
-    // 4b. HTP performance-mode picker — for the QNN HTP engine, and for the
-    //     LiteRT 2.x NPU engine because on a Snapdragon that one ends up on the
-    //     same Hexagon and takes the same vote. On MediaTek it is accepted and
-    //     ignored, which is harmless: the MediaTek path has its own options,
-    //     set unconditionally by the engine.
+    // 4b. HTP performance-mode picker.
     widgets::Rect htpRect{};
     int htpCount = 0;
     const char* const* htpLabels = nullptr;
@@ -638,39 +707,59 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
         yc += 58.0f * s + padY;
     }
 
-    // 5. Confirm / Cancel. These stay at their normal fixed position — the
-    //    dropdown popover is painted LAST on the foreground draw list (see the
-    //    dropdownList() calls below), so an open Inference-Engine / HTP list
-    //    simply floats *over* this row instead of shoving it downward. The
-    //    buttons never move; they are momentarily covered by the open popover,
-    //    which is the expected behaviour for a floating menu.
+    // 5. Confirm / Cancel.
     const float btnW = (card.w - 2.0f * padX - 12.0f * s) * 0.5f;
-    const float btnH = 76.0f * s;
+    const float btnH = 68.0f * s;
     widgets::Rect cancelRect{card.x + padX, yc, btnW, btnH};
     widgets::Rect confirmRect{cancelRect.x + btnW + 12.0f * s, yc, btnW, btnH};
     if (widgets::button(dl, cancelRect, "取消", widgets::ButtonVariant::Ghost, es)) {
         pg.dialog = ModelDialogState::Closed;
         pg.pathPicking = false;
+        pg.pathBuf2[0] = '\0';
+        pg.pathLen2 = 0;
+        pg.pickingSlot = 1;
         return;
     }
-    const bool canConfirm = (pg.pathLen > 0 && pg.engine.value >= 0);
+    const bool canConfirm = (pg.pathLen > 0 && pg.engine.value >= 0 &&
+                             (!isNcnn || pg.pathLen2 > 0));
     if (widgets::button(dl, confirmRect, "添加",
                         canConfirm ? widgets::ButtonVariant::Primary
                                     : widgets::ButtonVariant::Disabled, es)) {
+        std::string p1(pg.pathBuf, pg.pathLen);
+        std::string p2(pg.pathBuf2, pg.pathLen2);
+        std::string paramPath = p1;
+        std::string binPath = p2;
+
+        if (isNcnn) {
+            // Sort out which is .param and which is .bin
+            if (endsWith(lower(p1), ".bin") || endsWith(lower(p2), ".param")) {
+                paramPath = p2;
+                binPath = p1;
+            }
+
+            // Validate NCNN model files before adding
+            std::string verifyErr;
+            if (!aimbotng::infer::validateNcnnModel(paramPath, binPath, verifyErr)) {
+                LOGW("AddDialog: NCNN validation failed: %s", verifyErr.c_str());
+                pg.showVerifyError = true;
+                const size_t eLen = std::min(verifyErr.size(), sizeof(pg.verifyErrMsg) - 1);
+                memcpy(pg.verifyErrMsg, verifyErr.data(), eLen);
+                pg.verifyErrMsg[eLen] = '\0';
+                return;
+            }
+        }
+
         model::Entry e;
-        e.path.assign(pg.pathBuf, pg.pathLen);
-        // Display name is just the file's basename — no manual rename.
+        e.path = paramPath;
+        e.binPath = binPath;
         e.name       = model::baseName(e.path);
         e.kind       = kind;
         e.engine     = model::engineAt(kind, pg.engine.value);
-        LOGI("AddDialog: CONFIRM path='%s', kind=%d, engine=%d (%s), "
+        LOGI("AddDialog: CONFIRM path='%s', binPath='%s', kind=%d, engine=%d (%s), "
              "dropdown index=%d",
-             e.path.c_str(), static_cast<int>(e.kind),
+             e.path.c_str(), e.binPath.c_str(), static_cast<int>(e.kind),
              static_cast<int>(e.engine), model::engineLabel(e.engine),
              pg.engine.value);
-        // Peek the model's real input edge and class count so the list can
-        // show "N classes • WxH" and so preprocessing feeds the right size.
-        // Falls back to 640 when the size is not statically known.
         int mw = 0, mh = 0, mcls = 0;
         if (aimbotng::infer::detectModelShape(e.path, mw, mh, mcls)) {
             e.inputSize = (mw > 0) ? mw : 640;
@@ -685,6 +774,9 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
         model::add(e);
         pg.dialog = ModelDialogState::Closed;
         pg.pathPicking = false;
+        pg.pathBuf2[0] = '\0';
+        pg.pathLen2 = 0;
+        pg.pickingSlot = 1;
     }
 
     // Popovers are painted LAST, on the foreground draw list, so an open
@@ -890,7 +982,7 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
 }  // namespace
 
 bool anyDialogOpen() {
-    return g_pageModel.dialog != ModelDialogState::Closed || g_fileBrowser.open;
+    return g_pageModel.dialog != ModelDialogState::Closed || g_fileBrowser.open || g_pageModel.showVerifyError;
 }
 
 void drawModelSection(ImDrawList* dl, float x, float& y, float w,
@@ -908,15 +1000,15 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
     };
 
     // A dialog covers almost the whole board but the rows underneath are still
-    // drawn and still hit-tested — the scrim is only paint. Without this guard
-    // a tap that opens or dismisses a dialog would also fire whatever row
-    // button happens to sit under the finger.
-    const bool dialogOpen = (pg.dialog != ModelDialogState::Closed);
+    // drawn — the scrim is only paint. Pass interactive = !dialogOpen so the
+    // background buttons are painted normally but do not hit-test or consume
+    // tap gestures meant for the dialog on top.
+    const bool dialogOpen = anyDialogOpen();
 
     // Add-button: full row width.
     const float addH = kModelAddBtnH * s;
     if (widgets::button(dl, wRect(x, y, w, addH), "Add Model",
-                        widgets::ButtonVariant::Primary, es) && !dialogOpen) {
+                        widgets::ButtonVariant::Primary, es, !dialogOpen)) {
         pg.dialog = ModelDialogState::Adding;
         // Swallow the opening tap: the release lands outside the dialog card,
         // where the dialog's own outside-tap-close would otherwise read it
@@ -927,6 +1019,11 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
         // it on entry keeps an open dialog from lying about its state.
         pg.pathBuf[0]        = '\0';
         pg.pathLen           = 0;
+        pg.pathBuf2[0]       = '\0';
+        pg.pathLen2          = 0;
+        pg.pickingSlot       = 1;
+        pg.showVerifyError   = false;
+        pg.verifyErrMsg[0]   = '\0';
         pg.engine.value      = -1;       // gated until a file lands
         pg.engine.open       = false;
         pg.conf.value        = 0.5f;
@@ -1022,7 +1119,7 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
 
         if (widgets::button(dl, wRect(setRect.x, setRect.y, setRect.w, setRect.h),
                             "Setting",
-                             widgets::ButtonVariant::Ghost, es) && !dialogOpen) {
+                             widgets::ButtonVariant::Ghost, es, !dialogOpen)) {
             pg.settingsId = e.id;
             LOGI("ModelList: tap Setting on model #%d '%s' (engine=%d %s)",
                  e.id, e.name.c_str(),
@@ -1049,12 +1146,12 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
         }
         if (widgets::button(dl, wRect(ldrRect.x, ldrRect.y, ldrRect.w, ldrRect.h),
                             e.loaded ? "Unload" : "Load",
-                            widgets::ButtonVariant::Primary, es) && !dialogOpen) {
+                            widgets::ButtonVariant::Primary, es, !dialogOpen)) {
             model::toggleLoaded(e.id);
         }
         if (widgets::button(dl, wRect(delRect.x, delRect.y, delRect.w, delRect.h),
                             "Delete",
-                            widgets::ButtonVariant::Danger, es) && !dialogOpen) {
+                            widgets::ButtonVariant::Danger, es, !dialogOpen)) {
             model::remove(e.id);
         }
         y += rowH + gap;
@@ -1405,9 +1502,66 @@ void drawNoModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     }
 }
 
+/// Modal error dialog shown when NCNN model validation fails on confirm.
+void drawVerifyErrorDialog(ImDrawList* dl, const HudRect& board, float s, float es,
+                           const Xf& xf) {
+    PageModel& pg = g_pageModel;
+
+    const ImVec2 min(board.x, board.y);
+    const ImVec2 max(board.x + board.w, board.y + board.h);
+    dl->AddRectFilled(xf.pt(min), xf.pt(max),
+                      xf.col(IM_COL32(0, 0, 0, 180)));
+
+    const float w = 620.0f * s;
+    const float h = 280.0f * s;
+    const float cx = board.x + board.w * 0.5f;
+    const float cy = board.y + board.h * 0.5f;
+    const ImVec2 cmin(cx - w * 0.5f, cy - h * 0.5f);
+    const ImVec2 cmax(cx + w * 0.5f, cy + h * 0.5f);
+
+    widgets::Rect card{cmin.x, cmin.y, w, h};
+    if (closeOnOutsideTap(card)) {
+        pg.showVerifyError = false;
+        return;
+    }
+
+    dl->AddRectFilled(cmin, cmax, xf.col(PaneRight), xf.s(20.0f * s));
+    dl->AddRect(cmin, cmax, xf.col(IM_COL32(239, 68, 68, 255)), xf.s(20.0f * s), 0, xf.s(1.5f * s));
+
+    ImFont* font = ImGui::GetFont();
+    const float padX = 36.0f * s;
+    dl->AddText(font, tsize(28.0f) * s,
+                ImVec2(cmin.x + padX, cmin.y + 28.0f * s),
+                xf.col(IM_COL32(239, 68, 68, 255)), "模型校验失败");
+
+    dl->AddText(font, tsize(20.0f) * s,
+                ImVec2(cmin.x + padX, cmin.y + 78.0f * s),
+                xf.col(TextPrimary), "所选文件不是合法的 NCNN 模型：");
+
+    const std::string cutErr = ellipsize(font, tsize(18.0f) * s,
+                                         pg.verifyErrMsg[0] ? pg.verifyErrMsg : "未知错误",
+                                         w - 2.0f * padX);
+    dl->AddText(font, tsize(18.0f) * s,
+                ImVec2(cmin.x + padX, cmin.y + 116.0f * s),
+                xf.col(TextMuted), cutErr.c_str());
+
+    const float btnW = 180.0f * s;
+    const float btnH = 58.0f * s;
+    widgets::Rect btn{cx - btnW * 0.5f, cmax.y - btnH - 24.0f * s, btnW, btnH};
+    if (widgets::button(dl, btn, "确定", widgets::ButtonVariant::Primary, es)) {
+        pg.showVerifyError = false;
+    }
+}
+
 void drawModelOverlays(ImDrawList* dl, float s, float es, const Xf& xf) {
-    if (g_pageModel.dialog == ModelDialogState::Closed) return;
+    if (g_pageModel.dialog == ModelDialogState::Closed && !g_pageModel.showVerifyError) return;
     const HudRect board = hudRect();
+
+    // The verification error modal sits on top of everything.
+    if (g_pageModel.showVerifyError) {
+        drawVerifyErrorDialog(dl, board, s, es, xf);
+        return;
+    }
 
     // The file browser is its own card and paints its own scrim.
     if (g_fileBrowser.open) {

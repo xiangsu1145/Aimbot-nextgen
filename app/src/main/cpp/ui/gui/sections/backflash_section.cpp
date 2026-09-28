@@ -1,6 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  aimbotng::ui::sections::backflash — implementation. See backflash_section.h
 //  for the touch lifecycle, the blockingAim contract, and the page layout.
+//
+//  Enhanced with:
+//    * Multi-harmonic curve (多谐波不规则闭合曲线) for human-like trajectory
+//    * Brightness fallback detection (亮度兜底检测) for full-screen whiteout
+//    * Lossless accumulator (记账式无损累积器) for zero-residual return
+//    * Waypoint recording & reverse playback (航点录制/倒序回放)
+//    * Settle phase (停顿) to simulate a real player pausing
+//    * Cooldown timer (冷却) to prevent rapid re-triggering
 // ─────────────────────────────────────────────────────────────────────────────
 #include "backflash_section.h"
 
@@ -16,6 +24,7 @@
 
 #include "imgui.h"
 
+#include "capture/capture.h"
 #include "inference/model_runtime.h"
 #include "inference/model_store.h"
 #include "input/inject_backend.h"
@@ -58,6 +67,13 @@ constexpr ImU32 kOverlayLabel  = IM_COL32(238, 240, 246, 235);
 // every frame's move (the per-frame Bezier step is what shapes the path).
 constexpr float kEndJitterPx = 4.0f;
 
+// Maximum waypoints recorded during one swipe. Well above what any realistic
+// swipe produces (~200 at 120 Hz × 2 s) but cheap to bound.
+constexpr size_t kMaxRecordedSteps = 2000;
+
+// π constant
+constexpr double kPi = 3.14159265358979323846;
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 inline int64_t nowMs() {
@@ -86,21 +102,61 @@ inline float randSigned(PageBackFlash& p) {
     return static_cast<float>((p.rng >> 8) & 0xFFFFFFu) * (1.0f / 16777216.0f) * 2.0f - 1.0f;
 }
 
+/// Double-precision uniform in [0, 1).
+inline double randPositiveD(PageBackFlash& p) {
+    p.rng = p.rng * 1103515245u + 12345u;
+    return static_cast<double>((p.rng >> 8) & 0xFFFFFFu) * (1.0 / 16777216.0);
+}
+
+/// Double-precision uniform in [-1, 1).
+inline double randSignedD(PageBackFlash& p) {
+    return randPositiveD(p) * 2.0 - 1.0;
+}
+
 /**
- * 4th-order (quartic) Bezier curve, 5 control points.
- *   B(t) = (1-t)^4 P0 + 4(1-t)^3 t P1 + 6(1-t)^2 t^2 P2 + 4(1-t) t^3 P3 + t^4 P4
+ * Evaluates the human-like swipe trajectory at normalized progress t ∈ [0, 1].
  *
- * Control points (0, 0.25, 0.75, 1, 1) yield an ease-in-out: B'(0) = 1
- * (smooth at the press — no jerk on the way out), B'(1) = 0 (lands at
- * the END with zero velocity — no overshoot). The peak velocity sits
- * around t ≈ 0.5 and is bounded by 1 (in normalized units), so the per-
- * frame clamp below is the safety net, not the regulator.
+ * At t = 0: outX = 0, outY = 0 (exact press point).
+ * At t = 1: outX = dirSign * dist, outY = 0 (exact target point).
+ *
+ * Uses:
+ *   - Smooth cubic ease-in-out progress along the main swipe axis.
+ *   - Multi-harmonic perturbation (simulating human hand irregularity/tremor).
+ *   - Natural thumb rotation arc modulation (pitchRatio).
+ *   - Per-cycle drift (driftY).
+ *
+ * An envelope function sin(π·t) guarantees that all perturbations and vertical offsets
+ * smoothly vanish at t = 0 and t = 1, ensuring zero error at the endpoints.
  */
-inline float bezier4(float t,
-                     float p0, float p1, float p2, float p3, float p4) {
-    const float u = 1.0f - t;
-    return u*u*u*u*p0 + 4.0f*u*u*u*t*p1 +
-           6.0f*u*u*t*t*p2 + 4.0f*u*t*t*t*p3 + t*t*t*t*p4;
+inline void evalMultiHarmonic(const PageBackFlash& p, double t,
+                              double& outX, double& outY) {
+    const double dist = std::max(1.0, static_cast<double>(p.slideDistancePx.value));
+    const double wob  = static_cast<double>(p.wobble.value);
+    const double pitch = static_cast<double>(p.pitchRatio.value);
+
+    t = std::clamp(t, 0.0, 1.0);
+
+    // Cubic smoothstep for ease-in and ease-out
+    const double u = t * t * (3.0 - 2.0 * t);
+
+    // Multi-harmonic modulation (fundamental + 2nd harmonic + 3rd harmonic)
+    const double harm = 0.55 * std::sin(2.0 * kPi * 1.0 * t + p.harm1Phase)
+                      + 0.30 * std::sin(2.0 * kPi * 2.0 * t + p.harm2Phase)
+                      + 0.15 * std::sin(2.0 * kPi * 3.0 * t + p.harm3Phase);
+
+    // Boundary envelope: vanishes at t = 0 and t = 1
+    const double envelope = std::sin(kPi * t);
+
+    // Horizontal: main swipe travel towards dirSign * dist
+    const double baseX = p.dirSign * dist * u;
+    const double devX  = p.dirSign * (wob * dist * 0.05 * harm) * envelope;
+    outX = baseX + devX;
+
+    // Vertical: thumb rotation arc + wobble + drift
+    const double arcY   = pitch * dist * envelope;
+    const double devY   = (wob * dist * 0.08 * harm) * envelope;
+    const double driftY = p.driftY * envelope;
+    outY = arcY + devY + driftY;
 }
 
 inline void drawDashedRect(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
@@ -315,13 +371,6 @@ void cancelFinger() {
     }
 }
 
-// Picks a random press point INSIDE the touch area (uniform on the rectangle).
-void pickPressPoint(PageBackFlash& p, float& outX, float& outY) {
-    const BackFlashTouchArea& a = p.touchArea;
-    outX = a.x + randPositive(p) * a.w;
-    outY = a.y + randPositive(p) * a.h;
-}
-
 // Direction the swipe goes, derived from the flash target vs. screen centre.
 //
 //   flash.cx < screen.cx → swipe RIGHT  (+1 in x) — turning away to the right
@@ -334,58 +383,38 @@ int swipeDirection(float flashCx, float screenCx) {
     return (flashCx < screenCx) ? +1 : -1;
 }
 
-/**
- * Advances the current sub-action one frame. Both Swiping and Resetting
- * share this step — the only difference between them is which (start, end)
- * pair is in `p.curStart*` / `p.curEnd*`.
- *
- * The Bezier progress curve maps 0..1 onto the segment; the per-frame
- * clamp (`maxPerFramePx`) is a safety on the rare frame the curve's
- * local slope would ask for more than the cap. Termination is "close
- * enough to the END" (|last - end| < 1 px) OR a hard 2× subTotalFrames
- * ceiling — the latter is the guard against a clamp that prevents the
- * curve from ever landing (shouldn't happen with the chosen control
- * points, but cheap to bound).
- */
-void advanceSubFrame(PageBackFlash& p) {
-    ++p.subFrame;
-    const float tF = static_cast<float>(p.subFrame) /
-                     static_cast<float>(p.subTotalFrames);
-    const float t = (tF > 1.0f) ? 1.0f : tF;
-    const float u = bezier4(t, 0.0f, 0.25f, 0.75f, 1.0f, 1.0f);
-
-    float nx = p.curStartX + u * (p.curEndX - p.curStartX);
-    float ny = p.curStartY + u * (p.curEndY - p.curStartY);
-
-    const float cap = std::max(1.0f, p.maxPerFramePx.value);
-    const float dx = nx - p.lastX, dy = ny - p.lastY;
-    const float d  = std::sqrt(dx * dx + dy * dy);
-    if (d > cap && d > 0.0f) {
-        const float s = cap / d;
-        nx = p.lastX + dx * s;
-        ny = p.lastY + dy * s;
+// Picks a random press point INSIDE the touch area oriented towards the swipe direction
+// to maximize available travel distance across the screen.
+void pickPressPoint(PageBackFlash& p, int dir, float screenW, float screenH,
+                    float& outX, float& outY) {
+    const BackFlashTouchArea& a = p.touchArea;
+    if (dir > 0) {
+        // Swiping right (+X): start near left edge of touch area for maximum stroke runway
+        outX = a.x + randPositive(p) * std::min(a.w * 0.25f, 60.0f);
+    } else {
+        // Swiping left (-X): start near right edge of touch area
+        outX = a.x + a.w - randPositive(p) * std::min(a.w * 0.25f, 60.0f);
     }
-    p.lastX = nx;
-    p.lastY = ny;
-    uinput_move(UINPUT_SLOT_PRIMARY,
-                static_cast<int>(nx), static_cast<int>(ny));
+    outY = a.y + a.h * 0.25f + randPositive(p) * (a.h * 0.5f);
+
+    // Keep within valid display bounds
+    outX = std::clamp(outX, 10.0f, screenW - 10.0f);
+    outY = std::clamp(outY, 10.0f, screenH - 10.0f);
 }
 
-// True when the synthetic finger has effectively reached the END of the
-// current sub-action. Two termination criteria, see advanceSubFrame.
-bool subActionDone(const PageBackFlash& p) {
-    const float dx = p.curEndX - p.lastX, dy = p.curEndY - p.lastY;
-    return (dx*dx + dy*dy < 1.0f) ||
-           (p.subFrame >= p.subTotalFrames * 2);
-}
-
-// Compute the (start, end, totalFrames) for one sub-action. The endpoints
-// are set by the caller; this just derives the frame budget.
-void armSubAction(PageBackFlash& p, float totalDistance) {
-    const float cap = std::max(1.0f, p.maxPerFramePx.value);
-    p.subTotalFrames = std::max(2,
-        static_cast<int>(std::ceil(std::max(1.0f, totalDistance) / cap)));
-    p.subFrame = 0;
+// Resets all per-cycle state to prepare for a new swipe cycle.
+void resetCycleState(PageBackFlash& p) {
+    p.intentX = 0.0;
+    p.intentY = 0.0;
+    p.sentX   = 0;
+    p.sentY   = 0;
+    p.forwardPos  = 0.0;
+    p.totalForward = 0.0;
+    p.waypointDx.clear();
+    p.waypointDy.clear();
+    p.backIdx   = 0;
+    p.backShift = 0.0;
+    p.backDone  = false;
 }
 
 }  // namespace
@@ -411,6 +440,59 @@ void BackFlashCategoryState::syncFromModel(
     }
 }
 
+// ── sampleFrameBrightness ──────────────────────────────────────────────────
+//
+// Samples the latest capture frame to compute:
+//   outBrightFraction — ratio of sampled pixels whose luma >= brightPixelLevel
+//   outMeanLuma       — average luma of all sampled pixels, normalised to [0,1]
+//
+// Uses step-16 interval sampling over the RGBA capture buffer. At 640×640
+// this yields ~2560 samples — enough for stable statistics at negligible CPU
+// cost. The capture module stores frames as tightly-packed RGBA.
+
+void sampleFrameBrightness(float& outBrightFraction, float& outMeanLuma) {
+    outBrightFraction = 0.0f;
+    outMeanLuma       = 0.0f;
+
+    int w = 0, h = 0;
+    if (!capture::peekSize(w, h) || w <= 0 || h <= 0) return;
+
+    const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+    // Use a thread-local scratch buffer to avoid allocation every frame.
+    static thread_local std::vector<uint8_t> buf;
+    if (buf.size() != bytes) buf.resize(bytes);
+
+    uint64_t lastId = 0;
+    int gotW = 0, gotH = 0;
+    if (!capture::copyLatestInto(buf.data(), buf.size(), gotW, gotH, lastId)) return;
+    if (gotW <= 0 || gotH <= 0) return;
+
+    const size_t total = static_cast<size_t>(gotW) * static_cast<size_t>(gotH);
+    const int level = static_cast<int>(
+        g_pageBackFlash.brightPixelLevel.value * 255.0f);
+
+    uint64_t bright = 0;
+    uint64_t sum    = 0;
+    uint64_t n      = 0;
+
+    // Step-16 sampling: every 16th pixel. RGBA layout, 4 bytes per pixel.
+    for (size_t i = 0; i < total; i += 16) {
+        const uint8_t* px = buf.data() + i * 4;
+        // RGBA → luma as (R + G + B) / 3
+        const int luma = (static_cast<int>(px[0]) + px[1] + px[2]) / 3;
+        sum += static_cast<uint64_t>(luma);
+        if (luma >= level) ++bright;
+        ++n;
+    }
+
+    if (n > 0) {
+        outBrightFraction = static_cast<float>(
+            static_cast<double>(bright) / static_cast<double>(n));
+        outMeanLuma = static_cast<float>(
+            static_cast<double>(sum) / static_cast<double>(n) / 255.0);
+    }
+}
+
 // ── drawBackFlashSection ────────────────────────────────────────────────────
 
 void drawBackFlashSection(ImDrawList* dl, float x, float& y, float w,
@@ -430,9 +512,6 @@ void drawBackFlashSection(ImDrawList* dl, float x, float& y, float w,
     };
 
     // ── Category list off the model (same fallback as the Aim page) ───────
-    // Cheap — `snapshot()` copies a small struct and a short vector. The
-    // widget reads `itemPtrs` later in this frame, so the sync happens
-    // BEFORE the rows below it are drawn.
     const infer::runtime::Snapshot snap = infer::runtime::snapshot();
     std::vector<std::string> classLabels = snap.classes;
     if (classLabels.empty()) {
@@ -449,41 +528,99 @@ void drawBackFlashSection(ImDrawList* dl, float x, float& y, float w,
     }
     g_pageBackFlash.category.syncFromModel(classLabels);
 
-    // ── Row order (see header): timing → tuning → overlay → filter ──────────
+    // ── Row order: brightness → timing → motion → overlay → filter ──────
 
-    // 1. 背闪延迟 (ms)
+    // 1. 亮度兜底检测 switch
+    widgets::switchButton(dl, wRect(x, y, w, rowSw),
+                          g_pageBackFlash.brightDetect,
+                          "亮度兜底检测", es);
+    y += rowSw + gap;
+
+    // 2. 背闪延迟 (ms)
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
                          g_pageBackFlash.flashDelay,
                          "背闪延迟", 0, es);
     y += rowSl + gap;
 
-    // 2. 复位延迟 (ms)
+    // 3. 复位延迟 (ms)
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
                          g_pageBackFlash.resetDelay,
                          "复位延迟", 0, es);
     y += rowSl + gap;
 
-    // 3. 滑屏距离(px) — total px the finger travels in one sub-action.
+    // 4. 停顿时间 (ms) — pause at the end of swipe, simulating human hesitation
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.settleMs,
+                         "停顿时间", 0, es);
+    y += rowSl + gap;
+
+    // 5. 冷却时间 (ms) — minimum gap between two trigger cycles
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.cooldownMs,
+                         "冷却时间", 0, es);
+    y += rowSl + gap;
+
+    // 6. 滑屏距离(px) — total px the finger travels in one sub-action.
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
                          g_pageBackFlash.slideDistancePx,
                          "滑屏距离(px)", 0, es);
     y += rowSl + gap;
 
-    // 4. 每帧最大移动 — per-frame step cap, paired with the Bezier curve.
+    // 7. 滑屏速度上限 — max speed the finger moves along the curve
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.swipeSpeed,
+                         "滑屏速度上限", 0, es);
+    y += rowSl + gap;
+
+    // 8. 每帧最大移动 — per-frame step cap, safety net for the curve
     widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
                          g_pageBackFlash.maxPerFramePx,
                          "每帧最大移动", 0, es);
     y += rowSl + gap;
 
-    // 5. 触摸区域 toggle — shows/hides the dashed box on screen.
+    // 9. 轨迹不规则度 — multi-harmonic wobble factor (0=straight, 1=wavy)
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.wobble,
+                         "轨迹不规则度", 2, es);
+    y += rowSl + gap;
+
+    // 10. 垂直分量 — vertical pitch ratio of the swipe
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.pitchRatio,
+                         "垂直分量", 2, es);
+    y += rowSl + gap;
+
+    // 11. 随机抖动(px) — per-frame random noise on the finger position
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.jitterPx,
+                         "随机抖动(px)", 1, es);
+    y += rowSl + gap;
+
+    // 12. 亮度阈值 — whiteout mean-brightness trigger level
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.brightThreshold,
+                         "亮度阈值", 2, es);
+    y += rowSl + gap;
+
+    // 13. 高亮像素阈值 — pixel-level brightness threshold
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.brightPixelLevel,
+                         "高亮像素阈值", 2, es);
+    y += rowSl + gap;
+
+    // 14. 高亮占比阈值 — bright pixel ratio to trigger
+    widgets::sliderFloat(dl, wRect(x, y, w, rowSl),
+                         g_pageBackFlash.brightBlobRatio,
+                         "高亮占比阈值", 2, es);
+    y += rowSl + gap;
+
+    // 15. 触摸区域 toggle — shows/hides the dashed box on screen.
     widgets::switchButton(dl, wRect(x, y, w, rowSw),
                           g_pageBackFlash.touchArea.toggle,
                           "触摸区域", es);
     y += rowSw + gap;
 
-    // 6. 闪光类别 multi-select — deferred list (multiSelectList below): same
-    // one-draw-list reason as Aim/Trigger — keeps the open list above any
-    // rows drawn after it (none here, but the pattern stays the same).
+    // 16. 闪光类别 multi-select
     const widgets::Rect catRow = wRect(x, y, w, rowDd);
     widgets::multiSelect(dl, catRow, g_pageBackFlash.category.sel,
                          "闪光类别",
@@ -530,7 +667,7 @@ void drawBackFlashOverlays() {
     }
 }
 
-// ── syncBackFlashPage — the swipe state machine ────────────────────────────
+// ── syncBackFlashPage — the enhanced swipe state machine ───────────────────
 
 void syncBackFlashPage() {
     PageBackFlash& p = g_pageBackFlash;
@@ -546,15 +683,6 @@ void syncBackFlashPage() {
     }
 
     // ── Gates ───────────────────────────────────────────────────────────
-    // Master switch on, injection backend ready, model loaded + worker
-    // running, at least one flash class selected, touch area placed. No
-    // "hold" gate — back-flash is a continuous feature; the synthetic
-    // finger is owned by this state machine for the entire cycle.
-    //
-    // The Kalman tracker is warmed by syncAimPage() running in the SAME
-    // frame (which sees `blockingAim=true` set here first — see the file
-    // header). One frame of staleness in the target pick is acceptable
-    // for a flash that lasts hundreds of milliseconds.
     const infer::runtime::Snapshot snap = infer::runtime::snapshot();
     const bool gatesOpen =
         p.enabled.value &&
@@ -574,11 +702,14 @@ void syncBackFlashPage() {
     const float scx = screenW * 0.5f;
     const float scy = screenH * 0.5f;
 
+    // ── Brightness sampling (every frame, cheap) ────────────────────────
+    if (p.brightDetect.value) {
+        sampleFrameBrightness(p.lastBrightFraction, p.lastMeanLuma);
+    }
+
     // ── Pick the flash target ──────────────────────────────────────────────
     // Nearest confirmed track in the flash-category set; falls back to the
-    // raw detection box when no track is confirmed yet (the track is the
-    // smoothed centre — preferred when available, raw as a safety net so a
-    // first-frame flash is still actionable).
+    // raw detection box when no track is confirmed yet.
     float bestCx = 0.0f, bestCy = 0.0f;
     bool  hasTarget = false;
     float bestDistSq = 1e18f;
@@ -610,101 +741,318 @@ void syncBackFlashPage() {
         }
     }
 
+    // ── Brightness fallback trigger ─────────────────────────────────────
+    // If YOLO didn't find a flash but the screen is bright enough, treat it
+    // as a flash trigger. Direction defaults to a random side since we can't
+    // determine the source from brightness alone.
+    bool brightnessTrigger = false;
+    if (!hasTarget && p.brightDetect.value) {
+        const bool whiteout = (p.lastMeanLuma >= p.brightThreshold.value);
+        const bool brightBlob = (p.lastBrightFraction >= p.brightBlobRatio.value);
+        if (whiteout || brightBlob) {
+            brightnessTrigger = true;
+            // Use random direction when we can't determine flash source
+            bestCx = scx + (randSigned(p) > 0.0f ? -200.0f : 200.0f);
+            bestCy = scy;
+        }
+    }
+
     // ── State machine ─────────────────────────────────────────────────────
-    //
-    // Once a cycle starts (entering WaitFlashDelay) it runs to completion
-    // even if the flash target disappears mid-cycle — cancelling part-way
-    // would leave the synthetic finger mid-gesture, which is the worst of
-    // both worlds. Each phase is purely time-based once entered.
     switch (p.phase) {
         case PageBackFlash::Phase::Idle: {
             p.blockingAim = false;
-            if (!hasTarget) return;
+            if (!hasTarget && !brightnessTrigger) return;
+
+            // ── Cooldown check ─────────────────────────────────────────────
+            if (p.lastTriggerMs > 0) {
+                const int64_t elapsed = now - p.lastTriggerMs;
+                if (elapsed < static_cast<int64_t>(p.cooldownMs.value)) return;
+            }
+
+            // Determine and lock swipe direction at trigger detection
+            const int initialDir = swipeDirection(
+                hasTarget ? bestCx : (scx + (randSigned(p) > 0.0f ? -200.0f : 200.0f)),
+                scx);
+            p.dirSign = static_cast<double>(initialDir);
+
             // ── Begin a cycle ─────────────────────────────────────────────
             p.phase        = PageBackFlash::Phase::WaitFlashDelay;
             p.phaseEnterMs = now;
+            p.cycleStartMs = now;
             p.blockingAim  = true;   // hold the slot from this frame forward
+            p.lastFrameMs  = now;    // init dt tracking
             return;
         }
 
         case PageBackFlash::Phase::WaitFlashDelay: {
             if (now - p.phaseEnterMs < static_cast<int64_t>(p.flashDelay.value)) return;
 
-            // ── Enter Swiping: pick a press point + END, finger DOWN ──────
-            pickPressPoint(p, p.pressX, p.pressY);
-            const int dir = swipeDirection(bestCx, scx);
-            const float dist = std::max(1.0f, p.slideDistancePx.value);
+            // If we have an active target during delay, update direction; otherwise retain locked direction
+            if (hasTarget) {
+                p.dirSign = static_cast<double>(swipeDirection(bestCx, scx));
+            }
+            const int dir = (p.dirSign >= 0.0) ? 1 : -1;
 
-            // END = press ± dist on the swipe axis (Y stays at press.y, so
-            // the slide is horizontal — matches how a player turns a view
-            // with a thumb swipe), plus ±kEndJitterPx on each axis. The
-            // jitter is one-shot: the END is randomised, but every frame
-            // along the Bezier path is deterministic from there.
-            p.swipeEndX = p.pressX + dir * dist + randSigned(p) * kEndJitterPx;
-            p.swipeEndY = p.pressY                     + randSigned(p) * kEndJitterPx;
+            // ── Enter Swiping: pick a press point, init multi-harmonic ────
+            pickPressPoint(p, dir, screenW, screenH, p.pressX, p.pressY);
 
-            p.curStartX = p.pressX;
-            p.curStartY = p.pressY;
-            p.curEndX   = p.swipeEndX;
-            p.curEndY   = p.swipeEndY;
+            // Reset accumulator and waypoints
+            resetCycleState(p);
 
+            // Generate random phases for multi-harmonic curve
+            p.harm1Phase = randPositiveD(p) * 2.0 * kPi;
+            p.harm2Phase = randPositiveD(p) * 2.0 * kPi;
+            p.harm3Phase = randPositiveD(p) * 2.0 * kPi;
+
+            // Vertical drift: ±3% of slide distance
+            const double dist = std::max(1.0,
+                static_cast<double>(p.slideDistancePx.value));
+            p.driftY = randSignedD(p) * dist * 0.03;
+            p.dirSign = static_cast<double>(dir);
+            p.totalForward = dist;
+            p.forwardPos = 0.0;
+
+            // Press finger at the chosen point
             uinput_down(UINPUT_SLOT_PRIMARY, UINPUT_ID_PRIMARY,
                         static_cast<int>(p.pressX),
                         static_cast<int>(p.pressY));
             p.fingerDown = true;
             p.lastX = p.pressX;
             p.lastY = p.pressY;
+            p.lastFrameMs = now;
 
-            armSubAction(p, dist);
-            p.phase = PageBackFlash::Phase::Swiping;
+            // Reserve waypoint storage
+            p.waypointDx.reserve(512);
+            p.waypointDy.reserve(512);
+
+            p.phase        = PageBackFlash::Phase::Swiping;
+            p.phaseEnterMs = now;
             return;
         }
 
         case PageBackFlash::Phase::Swiping: {
-            advanceSubFrame(p);
-            if (subActionDone(p)) {
-                // ── Swipe done — lift, wait for reset ──────────────────────
+            // dt-based speed control: advance along the curve proportionally
+            // to real elapsed time, capped at 100ms to prevent jumps after hitches.
+            const double dtMs = static_cast<double>(
+                std::min(now - p.lastFrameMs, static_cast<int64_t>(100)));
+            const double dt = dtMs / 1000.0;
+            p.lastFrameMs = now;
+
+            const double speed = std::max(100.0,
+                static_cast<double>(p.swipeSpeed.value));
+            const double cap = static_cast<double>(std::max(1.0f, p.maxPerFramePx.value));
+
+            // Bound per-frame progress by maxPerFramePx so high swipeSpeed
+            // cannot prematurely finish the swipe before the finger has physically traveled the distance.
+            const double step = std::min(speed * dt, cap);
+            p.forwardPos = std::min(p.forwardPos + step, p.totalForward);
+
+            const double t = (p.totalForward > 0.0)
+                ? std::min(p.forwardPos / p.totalForward, 1.0)
+                : 1.0;
+
+            // Evaluate multi-harmonic curve at progress t
+            double cx, cy;
+            evalMultiHarmonic(p, t, cx, cy);
+
+            // Target position = press point + curve offset
+            double targetX = static_cast<double>(p.pressX) + cx;
+            double targetY = static_cast<double>(p.pressY) + cy;
+
+            // Add per-frame jitter (only while still in motion, not at end)
+            double jitX = 0.0, jitY = 0.0;
+            if (p.forwardPos < p.totalForward && p.jitterPx.value > 0.0f) {
+                jitX = randSignedD(p) * static_cast<double>(p.jitterPx.value);
+                jitY = randSignedD(p) * static_cast<double>(p.jitterPx.value);
+            }
+
+            // Compute candidate position with jitter
+            float nx = static_cast<float>(targetX + jitX);
+            float ny = static_cast<float>(targetY + jitY);
+
+            // Screen boundary clamping
+            nx = std::clamp(nx, 5.0f, screenW - 5.0f);
+            ny = std::clamp(ny, 5.0f, screenH - 5.0f);
+
+            // Per-frame movement cap check against last position
+            const float capF = static_cast<float>(cap);
+            const float dx = nx - p.lastX, dy = ny - p.lastY;
+            const float d  = std::sqrt(dx * dx + dy * dy);
+            if (d > capF && d > 0.0f) {
+                const float s = capF / d;
+                nx = p.lastX + dx * s;
+                ny = p.lastY + dy * s;
+            }
+
+            // Record the ACTUAL step that was injected into uinput
+            const float actualDx = nx - p.lastX;
+            const float actualDy = ny - p.lastY;
+            if (p.waypointDx.size() < kMaxRecordedSteps) {
+                p.waypointDx.push_back(actualDx);
+                p.waypointDy.push_back(actualDy);
+            }
+
+            p.lastX = nx;
+            p.lastY = ny;
+            p.sentX = static_cast<int>(nx) - static_cast<int>(p.pressX);
+            p.sentY = static_cast<int>(ny) - static_cast<int>(p.pressY);
+
+            uinput_move(UINPUT_SLOT_PRIMARY,
+                        static_cast<int>(nx), static_cast<int>(ny));
+
+            // Check if swipe is complete:
+            // forwardPos reached totalForward AND finger reached within cap of target (or timeout guard)
+            const float clampedTargetX = std::clamp(static_cast<float>(targetX), 5.0f, screenW - 5.0f);
+            const float clampedTargetY = std::clamp(static_cast<float>(targetY), 5.0f, screenH - 5.0f);
+            const float remDx = clampedTargetX - nx;
+            const float remDy = clampedTargetY - ny;
+            const float remD  = std::sqrt(remDx * remDx + remDy * remDy);
+
+            const bool reachedTarget = (p.forwardPos >= p.totalForward - 1e-9) && (remD <= capF);
+            const bool timedOut = (now - p.phaseEnterMs > 3000);
+
+            if (reachedTarget || timedOut) {
+                // Swipe done — lift finger, enter settling
+                p.swipeEndX = p.lastX;
+                p.swipeEndY = p.lastY;
                 uinput_up(UINPUT_SLOT_PRIMARY);
                 p.fingerDown = false;
-                p.phase        = PageBackFlash::Phase::WaitResetDelay;
+                p.phase        = PageBackFlash::Phase::Settling;
                 p.phaseEnterMs = now;
             }
             return;
         }
 
-        case PageBackFlash::Phase::WaitResetDelay: {
-            if (now - p.phaseEnterMs < static_cast<int64_t>(p.resetDelay.value)) return;
+        case PageBackFlash::Phase::Settling: {
+            // Wait settleMs + resetDelay before starting reset.
+            // This simulates a real player pausing momentarily after turning.
+            const int64_t totalWait = static_cast<int64_t>(p.settleMs.value)
+                                    + static_cast<int64_t>(p.resetDelay.value);
+            if (now - p.phaseEnterMs < totalWait) return;
 
-            // ── Enter Resetting: from the post-swipe position back to the
-            // press point, with ±kEndJitterPx random on the END (the press
-            // point itself is the deterministic anchor). Finger DOWN at the
-            // current (post-swipe) position. ────────────────────────────────
-            p.curStartX = p.lastX;
-            p.curStartY = p.lastY;
-            p.curEndX   = p.pressX + randSigned(p) * kEndJitterPx;
-            p.curEndY   = p.pressY + randSigned(p) * kEndJitterPx;
-
+            // ── Enter Resetting: press finger at post-swipe position ──────
             uinput_down(UINPUT_SLOT_PRIMARY, UINPUT_ID_PRIMARY,
-                        static_cast<int>(p.curStartX),
-                        static_cast<int>(p.curStartY));
+                        static_cast<int>(p.swipeEndX),
+                        static_cast<int>(p.swipeEndY));
             p.fingerDown = true;
+            p.lastX = p.swipeEndX;
+            p.lastY = p.swipeEndY;
+            p.lastFrameMs = now;
 
-            const float dist = std::max(1.0f, p.slideDistancePx.value);
-            armSubAction(p, dist);
-            p.phase = PageBackFlash::Phase::Resetting;
+            // Reset playback state
+            p.backIdx   = 0;
+            p.backShift = 0.0;
+            p.backDone  = false;
+
+            p.phase        = PageBackFlash::Phase::Resetting;
+            p.phaseEnterMs = now;
             return;
         }
 
         case PageBackFlash::Phase::Resetting: {
-            advanceSubFrame(p);
-            if (subActionDone(p)) {
-                // ── Cycle done — lift, drop the slot hold, back to Idle ────
-                uinput_up(UINPUT_SLOT_PRIMARY);
-                p.fingerDown = false;
-                p.phase        = PageBackFlash::Phase::Idle;
-                p.phaseEnterMs = 0;
-                p.blockingAim  = false;   // aim may press again next frame
+            // dt-based reverse playback: consume recorded waypoints in reverse
+            // order, moving the finger back toward the press point.
+            const double dtMs = static_cast<double>(
+                std::min(now - p.lastFrameMs, static_cast<int64_t>(100)));
+            const double dt = dtMs / 1000.0;
+            p.lastFrameMs = now;
+
+            const size_t n = p.waypointDx.size();
+
+            // Timeout guard: if resetting takes > 3 seconds, force completion
+            if (now - p.phaseEnterMs > 3000) {
+                p.backDone = true;
             }
+
+            if (p.backDone || p.backIdx >= n) {
+                // ── Cycle done — lift, drop the slot hold ────
+                // Move finger precisely back to press point before lifting
+                uinput_move(UINPUT_SLOT_PRIMARY,
+                            static_cast<int>(p.pressX),
+                            static_cast<int>(p.pressY));
+                uinput_up(UINPUT_SLOT_PRIMARY);
+                p.fingerDown    = false;
+                p.lastTriggerMs = now;
+                p.phase         = PageBackFlash::Phase::Cooldown;
+                p.phaseEnterMs  = now;
+                p.blockingAim   = false;
+                return;
+            }
+
+            // Reverse-playback speed is 15% faster than the swipe speed
+            const double speed = std::max(100.0,
+                static_cast<double>(p.swipeSpeed.value)) * 1.15;
+            const double cap = static_cast<double>(std::max(1.0f, p.maxPerFramePx.value));
+            double budget = std::min(speed * dt, cap);
+            if (budget <= 0.0) budget = 1.0;
+
+            float frameMoveX = 0.0f;
+            float frameMoveY = 0.0f;
+
+            // Consume waypoints in reverse order (LIFO), supporting
+            // cross-tick splitting when a single waypoint is larger than
+            // this frame's budget.
+            while (budget > 1e-9 && p.backIdx < n) {
+                const size_t ri = n - 1 - p.backIdx;
+                const double sx = static_cast<double>(p.waypointDx[ri]);
+                const double sy = static_cast<double>(p.waypointDy[ri]);
+                const double mag = std::sqrt(sx * sx + sy * sy);
+
+                if (mag < 1e-9) {
+                    ++p.backIdx;
+                    p.backShift = 0.0;
+                    continue;
+                }
+
+                const double left = mag - p.backShift;
+                if (left <= 0.0) {
+                    ++p.backIdx;
+                    p.backShift = 0.0;
+                    continue;
+                }
+
+                // Consume as much of this waypoint as the budget allows
+                const double consume = std::min(left, budget);
+                const double frac = consume / mag;
+
+                // Move in the REVERSE direction
+                frameMoveX += static_cast<float>(-sx * frac);
+                frameMoveY += static_cast<float>(-sy * frac);
+
+                p.backShift += consume;
+                budget -= consume;
+
+                if (p.backShift >= mag - 1e-9) {
+                    ++p.backIdx;
+                    p.backShift = 0.0;
+                }
+            }
+
+            p.lastX += frameMoveX;
+            p.lastY += frameMoveY;
+
+            // Clamp to screen boundaries
+            p.lastX = std::clamp(p.lastX, 5.0f, screenW - 5.0f);
+            p.lastY = std::clamp(p.lastY, 5.0f, screenH - 5.0f);
+
+            // Single uinput_move per frame
+            uinput_move(UINPUT_SLOT_PRIMARY,
+                        static_cast<int>(p.lastX),
+                        static_cast<int>(p.lastY));
+
+            if (p.backIdx >= n) {
+                p.backDone = true;
+            }
+            return;
+        }
+
+        case PageBackFlash::Phase::Cooldown: {
+            // Cooldown is handled by the Idle → trigger check, so just
+            // transition back immediately. The cooldown timer is enforced
+            // at the Idle gate.
+            p.phase        = PageBackFlash::Phase::Idle;
+            p.phaseEnterMs = 0;
+            p.blockingAim  = false;
             return;
         }
     }

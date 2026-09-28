@@ -112,6 +112,16 @@ bool resolvePair(model::Engine engine, Runtime& outRuntime, Ep& outEp,
             // misbehave under XNNPACK (dense false detections).
             outEp = Ep::Cpu;
             return true;
+        case model::Engine::OnnxHtp:
+            outRuntime = Runtime::OnnxRuntime;
+            // The QNN EP plugin path: stock ORT plus
+            // libonnxruntime_providers_qnn.so, registered into the OrtEnv by
+            // OrtEngine::load() (see ort_engine.cpp). Availability — Qualcomm
+            // SoC, plugin and QNN runtime present, skel for this arch — is
+            // epAvailable()'s job and the menu already greys on it; like the
+            // LiteRT QnnHtp case above, resolvePair() does not second-guess.
+            outEp = Ep::Htp;
+            return true;
         case model::Engine::QnnHtp:
             outRuntime = Runtime::LiteRT;
             outEp = Ep::Htp;
@@ -174,6 +184,14 @@ bool resolvePair(model::Engine engine, Runtime& outRuntime, Ep& outEp,
             outEp = Ep::Neuron;
             return true;
         // #endif
+        case model::Engine::NcnnCpu:
+            outRuntime = Runtime::Ncnn;
+            outEp = Ep::Cpu;
+            return true;
+        case model::Engine::NcnnGpu:
+            outRuntime = Runtime::Ncnn;
+            outEp = Ep::Vulkan;
+            return true;
         default:
             why = "this model has no runtime selected";
             return false;
@@ -186,7 +204,9 @@ bool resolvePair(model::Engine engine, Runtime& outRuntime, Ep& outEp,
 /// see model_store, so this is the only crossing point.
 ModelSpec toSpec(const model::Entry& e) {
     ModelSpec spec;
-    spec.path       = e.path;
+    spec.path       = (e.kind == model::Kind::Ncnn && !e.binPath.empty())
+                          ? (e.path + ";" + e.binPath)
+                          : e.path;
     spec.classes    = e.classes;
     spec.inputSize  = e.inputSize;
     spec.confidence = e.confidence;
@@ -573,8 +593,10 @@ void pump() {
     if (g_frameBuf.size() != bytes) g_frameBuf.resize(bytes);
 
     int gotW = 0, gotH = 0;
+    uint64_t frameTsNs = 0;
     uint64_t id = g_lastFrameId;
-    if (!capture::copyLatestInto(g_frameBuf.data(), g_frameBuf.size(), gotW, gotH, id)) {
+    if (!capture::copyLatestInto(g_frameBuf.data(), g_frameBuf.size(), gotW, gotH, id,
+                                 &frameTsNs)) {
         return;   // nothing new since last time; not an error
     }
     g_lastFrameId = id;
@@ -584,6 +606,7 @@ void pump() {
     view.width = gotW;
     view.height = gotH;
     view.rowStrideBytes = gotW * 4;   // capture hands out tightly packed rows
+    view.tsNs = frameTsNs;
 
     session().submit(view);
 }

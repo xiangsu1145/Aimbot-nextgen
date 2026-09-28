@@ -258,6 +258,7 @@ object ShellServerEntry {
         // QNN / TFLite stack: TFLite runtime + TFLite delegate + QNN
         // backend + QNN HTP runtime + QNN system layer + QNN HTP extensions.
         val deps = arrayOf(
+            "libomp.so",
             "libtensorflowlite_jni.so",
             "libQnnTFLiteDelegate.so",
             "libqnn_tflite_delegate_jni.so",

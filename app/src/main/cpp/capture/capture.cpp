@@ -23,6 +23,10 @@ std::vector<uint8_t> g_frame;      // latest frame, tightly packed RGBA
 int                g_frameW = 0;
 int                g_frameH = 0;
 uint64_t           g_frameId = 0;
+// CLOCK_MONOTONIC ns at which the producer finished compositing this frame
+// (Image.getTimestamp). 0 = unknown. The one number that lets a consumer say
+// how stale the pixels it is acting on are.
+uint64_t           g_frameTsNs = 0;
 // Kept so a consumer can map a crop-space coordinate back onto the screen. The
 // crop is centred by the producer, but the rounded origin is not something a
 // consumer can recompute without knowing the full screen size — which is the
@@ -99,7 +103,7 @@ void noteFrame() {
 }  // namespace
 
 void pushFrame(const void* rgba, int srcWidth, int srcHeight, int stride,
-               int cropX, int cropY, int side) {
+               int cropX, int cropY, int side, uint64_t tsNs) {
     if (rgba == nullptr || srcWidth <= 0 || srcHeight <= 0 || stride <= 0) return;
     if (cropX < 0 || cropY < 0 || side <= 0) return;
     // Short rows would make the column arithmetic below read past the row.
@@ -146,14 +150,40 @@ void pushFrame(const void* rgba, int srcWidth, int srcHeight, int stride,
         g_frameH = side;
         g_cropX  = cropX;
         g_cropY  = cropY;
+        g_frameTsNs = tsNs;
         ++g_frameId;
         total = ++g_frameTotal;
     }
 
     if (total == 1 || (total % kLogEvery) == 0) {
-        LOGI("frame #%llu %dx%d crop=(%d,%d) of %dx%d stride=%d",
-             (unsigned long long)total, side, side, cropX, cropY,
-             srcWidth, srcHeight, stride);
+        // The queue age at push time: how long between SurfaceFlinger finishing
+        // this frame and our thread picking it up. This is the part of the
+        // sensing latency that used to be invisible; the rest (pump tick,
+        // inference, aim tick) is measured downstream from the same tsNs.
+        long long ageUs = -1;
+        if (tsNs != 0) {
+            const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   Clock::now().time_since_epoch()).count();
+            ageUs = static_cast<long long>(nowNs - static_cast<long long>(tsNs)) / 1000LL;
+            static bool sAgeSanityLogged = false;
+            if ((ageUs < 0 || ageUs > 100000) && !sAgeSanityLogged) {
+                // CLOCK_MONOTONIC base mismatch (some OEMs offset the producer's
+                // timestamp base) or a clock step. Once, loudly — the numbers
+                // after this are not ages and must not be tuned against.
+                LOGI("frame ts base mismatch: age=%lldus — ages unmeasurable", ageUs);
+                sAgeSanityLogged = true;
+            }
+            if (ageUs < 0) ageUs = -1;   // unknown, don't print a lie
+        }
+        if (ageUs >= 0) {
+            LOGI("frame #%llu %dx%d crop=(%d,%d) of %dx%d stride=%d queue_age=%lldus",
+                 (unsigned long long)total, side, side, cropX, cropY,
+                 srcWidth, srcHeight, stride, ageUs);
+        } else {
+            LOGI("frame #%llu %dx%d crop=(%d,%d) of %dx%d stride=%d",
+                 (unsigned long long)total, side, side, cropX, cropY,
+                 srcWidth, srcHeight, stride);
+        }
     }
 }
 
@@ -177,6 +207,7 @@ void invalidateFrames() {
     g_frameW = 0;
     g_frameH = 0;
     g_frame.clear();
+    g_frameTsNs = 0;   // the timestamp belongs to the gone frame, same as its size
     // The crop origin describes where the *gone* frame sat on the *gone* screen.
     // Kept, it would have onResult() translate detections from a dead frame by
     // the offset of a screen that may since have rotated.
@@ -186,7 +217,7 @@ void invalidateFrames() {
 }
 
 bool copyLatestInto(void* dst, size_t dstBytes, int& outW, int& outH,
-                    uint64_t& lastId) {
+                    uint64_t& lastId, uint64_t* outTsNs) {
     if (dst == nullptr) return false;
     std::lock_guard<std::mutex> lock(g_frameMutex);
     if (g_frameId == lastId || g_frameW <= 0 || g_frame.empty()) return false;
@@ -196,6 +227,7 @@ bool copyLatestInto(void* dst, size_t dstBytes, int& outW, int& outH,
     lastId = g_frameId;
     outW   = g_frameW;
     outH   = g_frameH;
+    if (outTsNs != nullptr) *outTsNs = g_frameTsNs;
     return true;
 }
 

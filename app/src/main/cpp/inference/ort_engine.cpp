@@ -25,6 +25,7 @@
 #include "onnxruntime_session_options_config_keys.h"
 
 #include "inference/libpath.h"
+#include "inference/capabilities.h"
 #include "inference/ort_engine.h"
 
 #include <android/log.h>
@@ -104,6 +105,118 @@ const OrtApi* ensureOrt() {
              base->GetVersionString ? base->GetVersionString() : "?", ORT_API_VERSION);
     });
     return g_ortApi;
+}
+
+// ── QNN EP plugin ───────────────────────────────────────────────────────────
+//
+// The QNN EP is a *plugin* EP (onnxruntime-qnn 2.x): stock libonnxruntime.so
+// is untouched, and libonnxruntime_providers_qnn.so is registered into an
+// OrtEnv at session-build time. The plugin dlopens libQnnHtp.so itself —
+// told via the `backend_path` provider option — and libQnnHtp reaches its
+// Stub and Skel through ADSP_LIBRARY_PATH, which ensureQnnStack() sets.
+// The host-side libraries must be resident in this namespace before the
+// registration runs, which ensureQnnStack() guarantees (and what
+// preloadAllDaemonLibraries() normally did at boot; the RTLD_NOLOAD in
+// preload() makes the repeat cheap).
+
+/// Name the EP is registered under — and the EpName() the devices report.
+constexpr const char* kQnnEpName = "QNNExecutionProvider";
+
+/// Residency of the QNN stack, process-wide once. Two things it must NOT do:
+///
+///   * dlopen the per-arch Skel. A Skel is a Hexagon (DSP) ELF — the host
+///     linker refuses it, every time. The boot preload in
+///     preloadAllDaemonLibraries() gets away with listing the Skels only
+///     because it is best-effort and logs the failure; a strict preload like
+///     this one would die on the first Skel entry and take the whole backend
+///     with it. The Skel is the DSP driver's business: it is located through
+///     ADSP_LIBRARY_PATH and loaded onto the Hexagon, not onto this process.
+///   * rely on ADSP_LIBRARY_PATH being set for us. On the LiteRT path
+///     Qualcomm's delegate JNI sets it before libQnnHtp initialises; there is
+///     no such JNI under the EP plugin, so we set it ourselves — the library
+///     directory (where the Skels and Stubs are) plus the "native_lib_path"
+///     token the DSP loader expands to the APK's own lib dir.
+bool ensureQnnStack(std::string* error) {
+    static std::once_flag once;
+    static bool          ok    = false;
+    static std::string   why;
+    std::call_once(once, [&] {
+        std::string step;
+        // Before libQnnHtp.so loads: this is what lets it find its Stub (host
+        // side) and its Skel (DSP side) without any delegate JNI to do it.
+        const std::string adsp = std::string(libraryDir()) + ";native_lib_path";
+        setenv("ADSP_LIBRARY_PATH", adsp.c_str(), /*overwrite*/ 1);
+
+        const char* const kStack[] = {
+            "libQnnSystem.so",
+            "libQnnHtp.so",
+            "libQnnHtpPrepare.so",
+            "libQnnHtpNetRunExtensions.so",
+            "libonnxruntime_providers_qnn.so",
+            nullptr,
+        };
+        for (int i = 0; kStack[i] != nullptr; ++i) {
+            if (preload(kStack[i], &step) == nullptr) {
+                why = "QNN stack preload failed at " + std::string(kStack[i]) +
+                      ": " + step;
+                LOGW("%s", why.c_str());
+                return;
+            }
+        }
+        ok = true;
+    });
+    if (error != nullptr && !ok) *error = why;
+    return ok;
+}
+
+/// Registers the QNN EP plugin into one OrtEnv and appends it to the session
+/// options with the two options this project sets.
+///
+/// Registration is per-Env and the Env here is per-Impl, so this runs on every
+/// load() that asks for HTP. That is deliberate: a call_once on the
+/// *registration* would silently stop working the moment a second load created
+/// a fresh Env without the EP attached — a bug that would show up as "worked
+/// once, then CPU", which is the worst kind of failure to bisect.
+bool attachQnnEp(Ort::Env& env, Ort::SessionOptions& so, std::string* error) {
+    std::string stackErr;
+    if (!ensureQnnStack(&stackErr)) {
+        if (error) *error = stackErr;
+        return false;
+    }
+
+    try {
+        const std::string pluginPath = libraryPath("libonnxruntime_providers_qnn.so");
+        env.RegisterExecutionProviderLibrary(kQnnEpName, pluginPath);
+
+        std::vector<Ort::ConstEpDevice> qnnDevices;
+        for (const Ort::ConstEpDevice& d : env.GetEpDevices()) {
+            if (std::strcmp(d.EpName(), kQnnEpName) == 0) {
+                qnnDevices.push_back(d);
+            }
+        }
+        if (qnnDevices.empty()) {
+            if (error) {
+                *error = "QNN EP registered but exposed no device — the plugin "
+                         "and the bundled QNN runtime do not agree on the QNN "
+                         "interface version";
+            }
+            return false;
+        }
+
+        // Only two options, on purpose. JIT (on-device compile) needs no
+        // ep.context_* entries and no soc_model — the runtime probes the local
+        // SoC itself. burst is the whole point in a realtime aiming loop.
+        const std::string htpPath = libraryPath("libQnnHtp.so");
+        so.AppendExecutionProvider_V2(env, qnnDevices,
+                                      {{"backend_path",         htpPath},
+                                       {"htp_performance_mode", "burst"}});
+        LOGI("QNN EP attached: %zu device(s), backend %s, perf burst",
+             qnnDevices.size(), htpPath.c_str());
+        return true;
+    } catch (const Ort::Exception& e) {
+        if (error) *error = std::string("QNN EP registration failed: ") + e.what();
+        return false;
+    }
 }
 
 }  // namespace
@@ -272,7 +385,11 @@ int countHead(const float* data, int anchors, int channels, bool channelsFirst,
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
 OrtEngine::OrtEngine(Ep ep) : ep_(ep) {
-    activeName_ = (ep == Ep::Xnnpack) ? "ONNX Runtime / XNNPACK" : "ONNX Runtime / CPU";
+    switch (ep) {
+        case Ep::Xnnpack: activeName_ = "ONNX Runtime / XNNPACK"; break;
+        case Ep::Htp:     activeName_ = "ONNX Runtime / QNN HTP"; break;
+        default:          activeName_ = "ONNX Runtime / CPU";     break;
+    }
     status_ = Status::good();
 }
 
@@ -330,8 +447,23 @@ Status OrtEngine::load(const ModelSpec& spec) {
             so.SetInterOpNumThreads(1);
         }
 
-        bool xnnpackActive = false;
-        if (ep_ == Ep::Xnnpack) {
+        const char* epTag = "CPU";   // for the load log line
+        if (ep_ == Ep::Htp) {
+            // QNN EP must be attached to the options BEFORE the session is
+            // constructed — the JIT compile happens inside the Ort::Session
+            // constructor and can take seconds to tens of seconds on the HTP.
+            // This whole load() already runs on the engine worker, not the
+            // render thread, so the stall is the progress bar's problem, not
+            // the frame loop's. A failure here IS fatal for this load: unlike
+            // XNNPACK there is no meaningful silent fallback to CPU when the
+            // user explicitly asked for the NPU.
+            std::string epErr;
+            if (!attachQnnEp(impl->env, so, &epErr)) {
+                return status_ = Status::bad(epErr.empty()
+                    ? "QNN EP could not be attached" : epErr);
+            }
+            epTag = "QNN HTP";
+        } else if (ep_ == Ep::Xnnpack) {
             // XNNPACK keeps its own thread pool, and the ORT documentation
             // recommends also setting the ORT intra-op pool to a single thread
             // and disabling spinning, so the two do not fight over the same
@@ -351,13 +483,14 @@ Status OrtEngine::load(const ModelSpec& spec) {
                 threads > 0 ? threads : 4);
             try {
                 so.AppendExecutionProvider("XNNPACK", {{"intra_op_num_threads", xnnThreads}});
-                xnnpackActive = true;
+                epTag = "XNNPACK";
             } catch (const std::exception& e) {
                 // Not fatal: the CPU provider is always there, so a build of ORT
                 // without XNNPACK still runs the model. Said out loud because
                 // activeName() would otherwise keep advertising it.
                 LOGW("XNNPACK EP refused (%s) — falling back to the CPU provider", e.what());
                 activeName_ = "ONNX Runtime / CPU";
+                epTag = "CPU";
             }
         }
 
@@ -537,7 +670,7 @@ Status OrtEngine::load(const ModelSpec& spec) {
              dtypeName(impl_->inType), impl_->outShapeText.c_str(),
              dtypeName(impl_->outType), impl_->post.numClasses, impl_->anchors,
              impl_->channelsFirst ? "channels-first" : "rows",
-             xnnpackActive ? "XNNPACK" : "CPU", loadMs);
+             epTag, loadMs);
 
         status_ = Status::good();
         timing_ = Timing{};

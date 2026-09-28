@@ -78,6 +78,28 @@ set(NATIVE_SOURCES
     ui/gui/sections/touch_section.cpp       # Touch page (触摸)
     ui/gui/sections/capture_section.cpp     # Capture page + live preview
     ui/gui/sections/settings_section.cpp    # Settings page (设置)
+    ui/gui/sections/recoil_section.cpp      # Recoil page (压枪) + fire area + progress card
+    ui/gui/ime.cpp                  # the overlay's own keyboard (profile names, Chinese)
+    pinyin/pinyinime.cpp            # Google Pinyin engine (AOSP PinyinIME) — the
+    pinyin/dicttrie.cpp             #   keyboard's candidates come from a real
+    pinyin/dictlist.cpp             #   sentence decoder now, not a syllable table
+    pinyin/dictbuilder.cpp          #   (linked because dictdef.h defines ___BUILD_MODEL___)
+    pinyin/lpicache.cpp
+    pinyin/matrixsearch.cpp
+    pinyin/ngram.cpp
+    pinyin/searchutility.cpp
+    pinyin/spellingtable.cpp
+    pinyin/spellingtrie.cpp
+    pinyin/splparser.cpp
+    pinyin/userdict.cpp
+    pinyin/utf16char.cpp
+    pinyin/utf16reader.cpp
+    pinyin/mystdlib.cpp
+    tracking/recoil_profile.cpp     # bullet-pattern profile + the burst player
+    tracking/recoil_recorder.cpp    # marker tracking + on-device pattern analysis
+    tracking/crosshair_recoil.cpp   # crosshair recognition + PID recoil mode
+    tracking/valorant_recoil.cpp    # Valorant smart recoil engine
+    tracking/tuning_server.cpp      # TCP tuning server & PID telemetry
     config/config_manager.cpp         # page parameters <-> config.json
     capture/capture.cpp             # frame hand-off between the capture thread and the renderer
     inference/model_store.cpp       # the Add-Model page's persistent model list
@@ -88,6 +110,7 @@ set(NATIVE_SOURCES
     inference/capabilities.cpp      # what this device is, described not decided
     inference/model_type.cpp        # file-level dtype probe (ONNX + TFLite)
     inference/ort_engine.cpp        # ONNX Runtime: XNNPACK and plain CPU
+    inference/ncnn_engine.cpp       # Tencent NCNN: CPU and Vulkan GPU
     inference/litert_engine.cpp     # LiteRT (TFLite): CPU/XNNPACK/NNAPI/GPU delegates
     inference/litert_npu_engine.cpp # LiteRT 2.x: vendor NPU dispatch (MediaTek/Qualcomm)
     # inference/neuron_delegate.cpp / inference/neuron_engine.cpp are added
@@ -294,6 +317,43 @@ target_link_libraries(${PROJECT_NAME}
     libQnnSystem
     libQnnHtpNetRunExtensions
 )
+
+# ── NCNN runtime (CPU + Vulkan GPU) ──────────────────────────────────────
+set(NCNN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ncnn/${ANDROID_ABI})
+if(EXISTS ${NCNN_DIR}/lib/libncnn.a)
+    add_library(ncnn STATIC IMPORTED)
+    set_target_properties(ncnn PROPERTIES
+        IMPORTED_LOCATION ${NCNN_DIR}/lib/libncnn.a)
+
+    macro(add_glslang_lib basename)
+        if(EXISTS ${NCNN_DIR}/lib/lib${basename}.a)
+            add_library(${basename} STATIC IMPORTED)
+            set_target_properties(${basename} PROPERTIES
+                IMPORTED_LOCATION ${NCNN_DIR}/lib/lib${basename}.a)
+            list(APPEND GLSLANG_LIBS ${basename})
+        endif()
+    endmacro()
+
+    set(GLSLANG_LIBS "")
+    add_glslang_lib(glslang)
+    add_glslang_lib(SPIRV)
+    add_glslang_lib(glslang-default-resource-limits)
+    add_glslang_lib(MachineIndependent)
+    add_glslang_lib(OSDependent)
+    add_glslang_lib(OGLCompiler)
+    add_glslang_lib(GenericCodeGen)
+
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(${PROJECT_NAME} OpenMP::OpenMP_CXX)
+    endif()
+
+    target_include_directories(${PROJECT_NAME} PRIVATE ${NCNN_DIR}/include)
+    target_link_libraries(${PROJECT_NAME}
+        ncnn
+        ${GLSLANG_LIBS}
+    )
+endif()
 
 # ── Vendored third-party headers ─────────────────────────────────────────
 # No libraries are linked here yet; this only puts the headers on the search

@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -103,6 +104,20 @@ int g_rotation = 0;                    // 0..3
 
 int g_maxX = 0, g_maxY = 0;            // panel ABS range (reference panel)
 bool g_refHasSlot = false;             // reference panel protocol (diagnostics)
+
+// ── Mirror view offset (压枪) ────────────────────────────────────────────────
+//
+// Written by the render thread, read by the reader thread, so everything here
+// is atomic rather than mutex-guarded: the reader's own state lives under
+// g_mutex and taking it from a 120 Hz render loop to publish two floats would
+// serialise the two against each other for no reason. See reader_set_view_offset
+// in touch_reader.h for what it is for.
+std::atomic<bool>  g_vofOn{false};
+std::atomic<int>   g_vofRect[4] = {};   // x, y, w, h in screen px
+std::atomic<bool>  g_vofArmed{false};   // rect has been set at least once
+std::atomic<float> g_vofDx{0.0f};
+std::atomic<float> g_vofDy{0.0f};
+int                g_vofCount = 0;      // fingers displaced in the last mirror
 
 // Protocol of every open panel. Decoding is per device, because one phone can
 // in principle expose both a type-A and a type-B node and each has to be parsed
@@ -248,8 +263,45 @@ void panelToScreen(int rawX, int rawY, float* outX, float* outY) {
     }
 }
 
-void clearFingerState() {
-    for (int i = 0; i < kMaxSlots; ++i) {
+/// Screen coordinates -> panel coordinates: the exact inverse of panelToScreen.
+///
+/// Needed by the mirror view offset, which decides where a finger should be in
+/// SCREEN space (that is the space its owner reasons in) and then has to say the
+/// same thing in panel space, because that is what the device is written with.
+/// Deriving it instead of offsetting both spaces separately is what keeps the
+/// two backends from disagreeing by a rotation-dependent amount — and the
+/// rotation is not always 0, so that difference would be a silent skew.
+void screenToPanel(float sx, float sy, int* outRX, int* outRY) {
+    float px = 0.0f, py = 0.0f;
+    switch (g_rotation) {
+        case 1:  // ROTATION_90
+            px = static_cast<float>(g_portraitW) - sy;
+            py = sx;
+            break;
+        case 2:  // ROTATION_180
+            px = static_cast<float>(g_portraitW) - sx;
+            py = static_cast<float>(g_portraitH) - sy;
+            break;
+        case 3:  // ROTATION_270
+            px = sy;
+            py = static_cast<float>(g_portraitH) - sx;
+            break;
+        default:  // ROTATION_0
+            px = sx;
+            py = sy;
+            break;
+    }
+    int rx = (g_portraitW > 0) ? static_cast<int>(px * g_maxX / g_portraitW + 0.5f)
+                               : static_cast<int>(px + 0.5f);
+    int ry = (g_portraitH > 0) ? static_cast<int>(py * g_maxY / g_portraitH + 0.5f)
+                               : static_cast<int>(py + 0.5f);
+    if (g_maxX > 0) rx = std::clamp(rx, 0, g_maxX);
+    if (g_maxY > 0) ry = std::clamp(ry, 0, g_maxY);
+    *outRX = rx;
+    *outRY = ry;
+}
+
+void clearFingerState() {    for (int i = 0; i < kMaxSlots; ++i) {
         g_slotId[i] = -1;
         g_slotX[i] = 0;
         g_slotY[i] = 0;
@@ -1006,6 +1058,58 @@ void publishPointers(bool mirror) {
     }
 
     if (!mirror) return;
+
+    // ── Mirror view offset (压枪) ────────────────────────────────────────────
+    //
+    // Displaces the mirrors of the fingers sitting inside the published rect,
+    // which is how the recoil compensation rotates the view when the aimbot is
+    // NOT driving: the look contact is the player's own thumb, so the only place
+    // to add a displacement is on its way out. Done here rather than in
+    // uinput_mirror_* so it applies before EITHER encoding is built, and the
+    // raw side is re-derived from the shifted screen point instead of being
+    // offset in parallel — see screenToPanel().
+    //
+    // The offset is absolute (the whole current-burst displacement), so
+    // applying it fresh every frame cannot accumulate.
+    {
+        g_vofCount = 0;
+        const float odx = g_vofDx.load(std::memory_order_relaxed);
+        const float ody = g_vofDy.load(std::memory_order_relaxed);
+        if (g_vofOn.load(std::memory_order_relaxed) &&
+            (odx != 0.0f || ody != 0.0f)) {
+            const int rx = g_vofRect[0].load(std::memory_order_relaxed);
+            const int ry = g_vofRect[1].load(std::memory_order_relaxed);
+            const int rw = g_vofRect[2].load(std::memory_order_relaxed);
+            const int rh = g_vofRect[3].load(std::memory_order_relaxed);
+            const bool haveRect = g_vofArmed.load(std::memory_order_relaxed);
+
+            auto insideRect = [&](int x, int y) {
+                if (!haveRect) return true;   // no rect published: shift every finger
+                return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+            };
+            auto shiftOne = [&](int* sx, int* sy, int* rawX, int* rawY) {
+                if (!insideRect(*sx, *sy)) return;
+                const float nsx = static_cast<float>(*sx) + odx;
+                const float nsy = static_cast<float>(*sy) + ody;
+                int nrx = *rawX, nry = *rawY;
+                screenToPanel(nsx, nsy, &nrx, &nry);
+                *sx = static_cast<int>(nsx);
+                *sy = static_cast<int>(nsy);
+                *rawX = nrx;
+                *rawY = nry;
+                ++g_vofCount;
+            };
+
+            for (int i = 0; i < n; ++i) shiftOne(&xs[i], &ys[i], &rawXs[i], &rawYs[i]);
+            if (useSlotsDirect) {
+                for (int k = 0; k < kMaxSlots; ++k) {
+                    if (slotIds[k] < 0) continue;
+                    shiftOne(&slotXs[k], &slotYs[k], &slotRawXs[k], &slotRawYs[k]);
+                }
+            }
+        }
+    }
+
     if (swallow && !g_passThrough) {
         uinput_mirror_clear();
     } else if (useSlotsDirect) {
@@ -1328,6 +1432,31 @@ extern "C" void reader_set_point_guard(const int* rect, bool enabled, int keepId
 extern "C" bool reader_get_point_guard(void) { return g_guardOn; }
 
 extern "C" int reader_get_point_guard_count(void) { return g_guardCount; }
+
+extern "C" void reader_set_view_offset(const int* rect, float dx, float dy) {
+    if (rect != nullptr) {
+        // Published from the render thread every frame while a burst is live,
+        // so the rect has to be a copy rather than a pointer we keep.
+        g_vofRect[0].store(rect[0], std::memory_order_relaxed);
+        g_vofRect[1].store(rect[1], std::memory_order_relaxed);
+        g_vofRect[2].store(rect[2], std::memory_order_relaxed);
+        g_vofRect[3].store(rect[3], std::memory_order_relaxed);
+        g_vofArmed.store(true, std::memory_order_relaxed);
+    }
+    if (dx == 0.0f && dy == 0.0f) {
+        g_vofDx.store(0.0f, std::memory_order_relaxed);
+        g_vofDy.store(0.0f, std::memory_order_relaxed);
+        g_vofOn.store(false, std::memory_order_relaxed);
+        return;
+    }
+    g_vofDx.store(dx, std::memory_order_relaxed);
+    g_vofDy.store(dy, std::memory_order_relaxed);
+    // Armed last: the reader must never see a non-zero displacement carrying a
+    // range from the previous burst.
+    g_vofOn.store(true, std::memory_order_relaxed);
+}
+
+extern "C" int reader_get_view_offset_count(void) { return g_vofCount; }
 
 extern "C" bool reader_is_pointer_swallowed(int id) {
     std::lock_guard<std::mutex> lock(g_mutex);

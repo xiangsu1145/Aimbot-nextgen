@@ -55,6 +55,13 @@ struct FrameView {
     /// every consumer that assumes tight packing is a latent horizontal smear.
     int rowStrideBytes = 0;
 
+    /// CLOCK_MONOTONIC ns at which the producer finished compositing this
+    /// frame (capture::pushFrame stored it). 0 = unknown. Rides through the
+    /// whole pipeline so a result can be age-stamped: the difference between
+    /// "now" and this is the sensing latency the loop has until now been
+    /// compensating for blind.
+    uint64_t tsNs = 0;
+
     bool valid() const {
         return pixels != nullptr && width > 0 && height > 0 &&
                rowStrideBytes >= width * 4;
@@ -129,6 +136,12 @@ struct Timing {
     float preMs   = 0.0f;
     float inferMs = 0.0f;
     float postMs  = 0.0f;
+
+    /// CLOCK_MONOTONIC ns of the frame these numbers were earned on — the
+    /// FrameView's tsNs carried through the mailbox. 0 when the producer had
+    /// no timestamp. This is what lets the aim loop compute the age of the
+    /// detections it is about to act on, rather than guessing it in frames.
+    uint64_t frameTsNs = 0;
 
     float totalMs() const { return preMs + inferMs + postMs; }
 };
