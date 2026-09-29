@@ -579,6 +579,13 @@ constexpr float kConvBrakeMinMult  = 0.40f;
 /// supposed to smooth.
 constexpr float kConvBrakeErrFloor = 1.0f;
 
+// ── Overshoot Feedforward & Integral suppression ───────────────────────────
+// Beyond 1.0 px of error, any feedforward or integral component that pushes in
+// the direction of the overshoot (away from target) is suppressed to zero and
+// prediction memory is scaled down, preventing forward momentum from fighting
+// the restoring P and braking D terms.
+constexpr float kOvershootFloorPx  = 1.0f;
+
 // ── P saturation, the port of his normalizedError clamp ────────────────────
 //
 // His P term is `clamp(error · outputGain / 5, ±3)` — at his default gain the
@@ -911,6 +918,33 @@ public:
         // on this term — see the note where kFfTrustFloor used to be.
         float ff = (lookahead_ * predGain_ * ad.predScale / kSensFrozen) * vel;
         ff = clampRange(ff, -kFfLimitPx, kFfLimitPx);
+
+        // ── Overshoot Feedforward & Integral suppression ───────────────────
+        // If error exceeded the target center by >= kOvershootFloorPx (1.0px),
+        // any feedforward or integral component pushing in the overshoot direction
+        // (i.e. opposing the error-restoring direction) is suppressed to 0, and
+        // the prediction velocity memory is scaled down to prevent overshoot windup.
+        if (e <= -kOvershootFloorPx) {
+            if (ff > 0.0f) {
+                ff = 0.0f;
+                scalePredictionMemory(0.5f);
+            }
+            if (iOut > 0.0f) {
+                iOut = 0.0f;
+                integral_ = 0.0f;
+                iGain_ = 0.0f;
+            }
+        } else if (e >= kOvershootFloorPx) {
+            if (ff < 0.0f) {
+                ff = 0.0f;
+                scalePredictionMemory(0.5f);
+            }
+            if (iOut < 0.0f) {
+                iOut = 0.0f;
+                integral_ = 0.0f;
+                iGain_ = 0.0f;
+            }
+        }
 
         // Sub-pixel chatter only. NOT the "terms whose steady state is zero"
         // deadband this used to be — neither of these terms has a zero steady
