@@ -174,6 +174,18 @@ struct AimController {
         pidY.setParams(kp, ki, kd, outSmooth, ff);
     }
 
+    /// 设置全链路物理延迟（秒，克里斯控制器延迟补偿接口）
+    void setLatencySeconds(float latencySeconds) {
+        pidX.setLatencySeconds(latencySeconds);
+        pidY.setLatencySeconds(latencySeconds);
+    }
+
+    /// 设置延迟补偿帧数（按 120Hz 计算）
+    void setLatencyFrames(float frames) {
+        pidX.setLatencyFrames(frames);
+        pidY.setLatencyFrames(frames);
+    }
+
     /// The engaged target's box width in screen px. Feeds the jump thresholds,
     /// which are expressed as a fraction of a target rather than as a fixed
     /// number of pixels so a distant 20 px box and a contact-range 300 px box
@@ -682,13 +694,12 @@ struct PageAim {
     /// path — `setpoint += boxVelocity · τ`, and the box's screen velocity
     /// contains our own output — and the reference controller has no lead at all:
     /// the lookahead that a moving target needs is the prediction term's job now,
-    /// and doing it twice is how the round-17 "sits beside the box" fault and the
-    /// round-19c "only shakes while actually driving" fault were produced. It
-    /// also shifts what the loop calls "arrived", which is the last thing that
-    /// should be in play while a "the aim stops driving when it gets there"
-    /// report is being chased. Off by default; the slider is still there for
-    /// anyone who measures a benefit.
-    widgets::SliderState aimDelayFrames{0.0f, 0.0f, 5.0f, 0.05f};
+    /// 延迟补偿（帧数）：对齐克里斯控制器的物理延迟开环前瞻机制。
+    /// 计算全链路图像截屏 + 推理 + 渲染 + 触控注入的真实滞后，并在前馈项中注入
+    /// Δx = v * τ + 0.5 * a * τ^2 的物理位移前瞻，彻底解决跟枪滞后半身位的问题。
+    /// 不再修改目标坐标点（避免脱靶振荡与框旁死锁），当滑块设为 0 时，系统将自动
+    /// 按实际采集年龄 (g_detAgeMs) 进行动态前瞻补偿。推荐 1.0 ~ 2.5 帧。
+    widgets::SliderState aimDelayFrames{1.5f, 0.0f, 5.0f, 0.05f};
 
     // 丢框预测帧数 (trackPredictHoldFrames) MOVED TO THE SETTINGS PAGE in round
     // 18 — see settings_section.h, which now owns the slider and the note. It is

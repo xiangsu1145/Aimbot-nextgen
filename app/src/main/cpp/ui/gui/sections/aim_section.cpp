@@ -1680,6 +1680,15 @@ static void syncAimPageInner() {
         p.kp.value, p.ki.value, p.kd.value, p.outSmooth.value,
         p.ffGain.value);
 
+    // 延迟补偿（克里斯控制器模式）：
+    // 若用户设置了 aimDelayFrames > 0，则优先采用滑块设定的补偿帧数；
+    // 若用户设为 0，且系统存在真实端到端采样延迟 (g_detAgeMs > 0)，则自动根据真实延迟换算帧数！
+    float effectiveDelayFrames = p.aimDelayFrames.value;
+    if (effectiveDelayFrames <= 0.001f && g_detAgeMs > 0.0f) {
+        effectiveDelayFrames = std::clamp(g_detAgeMs / 8.333f, 0.0f, 4.5f);
+    }
+    p.touchAim.aim.setLatencyFrames(effectiveDelayFrames);
+
     // ── Decide whether the aim loop may fire ────────────────────────────────
     //   * master switch on
     //   * an injection backend is up — asked of the injector, NOT of uinput.
@@ -2026,25 +2035,12 @@ static void syncAimPageInner() {
     // by an estimate that could be wrong in either direction. What this filter
     // removes is the part of it that lives above the target's own bandwidth, which
     // is where the oscillation is.
-    static float leadVelX = 0.0f;
-    static float leadVelY = 0.0f;
-    static int   leadVelId = -1;
-    if (hasTarget && p.aimDelayFrames.value > 0.0f) {
-        const float dtl = std::clamp(io.DeltaTime, 1.0f / 2000.0f, 0.2f);
-        const float av  = dtl / (dtl + kLeadVelTauSec);
-        if (bestId != leadVelId) {          // new track: no history, take the sample
-            leadVelX  = bestVelX;
-            leadVelY  = bestVelY;
-            leadVelId = bestId;
-        } else {
-            leadVelX += (bestVelX - leadVelX) * av;
-            leadVelY += (bestVelY - leadVelY) * av;
-        }
-        target.x += leadVelX * p.aimDelayFrames.value;
-        target.y += leadVelY * p.aimDelayFrames.value;
-    } else {
-        leadVelId = -1;                     // lead off: do not carry a stale velocity in
-    }
+    // ── 延迟补偿（克里斯控制器重构）────────────────────────────────────────
+    // 关键修正：不再在此处修改目标 target 坐标（即不再在闭环误差输入端加相位提前量）。
+    // 旧版 target.x += leadVel * aimDelayFrames 会将准星稳态平衡点拉到框外，形成微分延迟自激环，
+    // 导致“准心锁在框旁边”与“不停剧烈抖动”；
+    // 现已对齐克里斯控制器架构，将延迟补偿移至 PredictivePid 内部作为开环运动学位移前瞻直接注入前馈输出，
+    // 保证闭环误差 e 始终对准真实目标框中心，消除跟踪滞后的同时彻底杜绝自激振荡！
 
     // ── Aim deadzone: 0.0 = move onto the target CENTRE; 1.0 = stop with the
     // crosshair anywhere inside the box. Distance- and resolution-independent,

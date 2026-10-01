@@ -130,7 +130,7 @@ namespace tracking {
 ///
 /// Do not tune this, and do not read it as a performance knob: with 1.0 the DC
 /// carrier share is still exactly `lookahead` (α cancels there), so nothing about
-/// tracking speed is given up by being right. If the aim jitters, lower 前馈.
+// 废除全局硬编码死值除数，对齐克里斯控制器统一误差尺度（定义 1.0 仅作符号兼容）
 constexpr float kSensFrozen = 1.0f;
 
 /// The output ceiling, finger px/step, applied as a tanh knee so the command
@@ -204,6 +204,12 @@ constexpr float kMinDt         = 0.001f;
 constexpr float kMaxDt         = 0.050f;
 constexpr float kFrameScaleMin = 0.35f;
 constexpr float kFrameScaleMax = 2.50f;
+
+// ── Prediction Latency Compensation (克里斯控制器动力学延迟补偿) ───────────────
+constexpr float kMaxPredictionLatencySeconds = 0.120f;  // 最大前瞻延迟 120ms
+constexpr float kLatencyRiseSmoothing        = 0.65f;   // 延迟增大时快速跟随
+constexpr float kLatencyFallSmoothing        = 0.12f;   // 延迟减小时慢速收敛，防剧烈回落
+constexpr float kMaxPredictionLookaheadFrames = 4.50f;  // 最大前瞻 4.5 帧
 
 // ── Error conditioning (all in SCREEN px) ──────────────────────────────────
 
@@ -306,7 +312,7 @@ constexpr float kVelZeroPx = 0.5f;
 constexpr std::size_t kPredSamples     = 4;
 constexpr std::size_t kPredHistoryCap  = 16;
 constexpr std::size_t kPredHistoryMask = kPredHistoryCap - 1;
-constexpr int         kPredStableReady = 1;
+constexpr int         kPredStableReady = 2;
 constexpr float kPredWeights[kPredSamples] = {0.12f, 0.20f, 0.29f, 0.39f};
 
 // ── The stop / reversal machinery (this is what replaced carry) ─────────────
@@ -350,8 +356,8 @@ constexpr float kIntegralMemBleedMax      = 0.95f;
 // ── The trust gate: the negative feedback on this controller's own fault ────
 
 /// Trust measures how much the velocity estimate looks like a real velocity
-/// rather than like a ring: it falls with |Δv̂|, with a reversal and with a
-/// drop, and rises only while the estimate is stable. It gates the
+/// rather than like a ring: it falls with |Δv̂|, with a reversal and with a drop,
+/// and rises only while the estimate is stable. It gates the
 /// feed-forward, so the loop's response to its own instability is to remove its
 /// own excitation — the one mechanism the old controller never had, because
 /// there the same fault was AMPLIFIED (carry → the integral) instead.
@@ -577,7 +583,7 @@ constexpr float kConvBrakeMinMult  = 0.40f;
 /// the frame-to-frame ratio is OneEuro filter noise, not closure, and braking
 /// on it would be a permanent tax on exactly the terminal phase the brake is
 /// supposed to smooth.
-constexpr float kConvBrakeErrFloor = 1.0f;
+constexpr float kConvBrakeErrFloor = 3.0f;
 
 // ── Overshoot Feedforward & Integral suppression ───────────────────────────
 // Beyond 1.0 px of error, any feedforward or integral component that pushes in
@@ -603,7 +609,7 @@ constexpr float kOvershootFloorPx  = 1.0f;
 // loop's stability any more — and far-field approach speed stays the
 // feed-forward's job, as designed. If the initial pull of a re-lock now feels
 // soft, that is the knee working; raise kp to pay for it, which is free.
-constexpr float kPSatPx = 60.0f;
+constexpr float kPSatPx = 150.0f;
 
 // ── The derivative's rate clamp, the port of his errorRate clamp ───────────
 //
@@ -702,11 +708,52 @@ public:
         lookahead_ = clampRange(lookahead, 0.0f, kLookaheadMax);
     }
 
+    /// 设置系统物理全链路延迟（秒，克里斯控制器延迟接口，带非对称平滑滤波）
+    void setLatencySeconds(float latencySeconds) {
+        if (!std::isfinite(latencySeconds)) return;
+        const float clampedLatency = clampRange(
+            latencySeconds,
+            kNominalDt,
+            kMaxPredictionLatencySeconds
+        );
+        if (!hasLatencyHint_) {
+            latencySeconds_ = clampedLatency;
+            hasLatencyHint_ = true;
+            return;
+        }
+        const float latencyDelta = clampedLatency - latencySeconds_;
+        const float smoothing = latencyDelta > 0.0f
+            ? kLatencyRiseSmoothing
+            : kLatencyFallSmoothing;
+        latencySeconds_ += latencyDelta * smoothing;
+    }
+
+    /// 设置系统延迟帧数（按 120Hz 标称帧时计算）
+    void setLatencyFrames(float frames) {
+        if (!std::isfinite(frames)) return;
+        setLatencySeconds(frames * kNominalDt);
+    }
+
+    float latencySeconds() const { return latencySeconds_; }
+    float latencyFrames() const { return latencySeconds_ / kNominalDt; }
+
     /// The engaged target's size in SCREEN px (the box's longer side). Used only
     /// to express the jump thresholds as a fraction of a target rather than as a
     /// fixed number of pixels, so a distant 20 px box and a contact-range 300 px
     /// box are judged the same way. 0 disables the box-relative part.
     void setTargetBoxPx(float px) { boxPx_ = (px > 0.0f) ? px : 0.0f; }
+
+    /// 根据端到端全链路延迟帧数，从历史输出缓冲区插值获取对应时刻的输出控制量，
+    /// 确保速度重构 rawMeas 中的误差微分与自身控制量在时间相位上精准对齐！
+    float getDelayedOutput(float latencyFrames) const {
+        const float clampedFrames = clampRange(latencyFrames, 1.0f, 8.0f);
+        const int i0 = static_cast<int>(std::floor(clampedFrames));
+        const int i1 = i0 + 1;
+        const float frac = clampedFrames - static_cast<float>(i0);
+        const float u0 = outHist_[(outHead_ - i0) & kOutHistMask];
+        const float u1 = outHist_[(outHead_ - i1) & kOutHistMask];
+        return u0 + (u1 - u0) * frac;
+    }
 
     // ── The control step ───────────────────────────────────────────────────
 
@@ -719,15 +766,14 @@ public:
     ///
     /// Returns the FINGER displacement for this step, px.
     float update(float error, float dt, bool frozen,
-                 bool targetChanged, bool measurementCorrected) {
+                 bool targetChanged, bool measurementCorrected,
+                 float targetVel = 0.0f) {
         if (!std::isfinite(error)) { reset(); return 0.0f; }
 
         dt = clampRange(dt, kMinDt, kMaxDt);
-        const float dtScale = dt / kNominalDt;   // 1.0 at the loop's nominal rate
+        const float dtScale = dt / kNominalDt;
 
-        // ── Error conditioning ────────────────────────────────────────────
-        // Snap-to-zero first: it is the "we have arrived" signal, and the
-        // integral's sign test below reads it.
+        // 误差微抖门限
         float raw = error;
         if (std::fabs(raw) < kErrorEpsPx) raw = 0.0f;
 
@@ -737,254 +783,107 @@ public:
             reset();
             hardReset = true;
         } else if (hasPrevRaw_) {
-            // ── ★ ROUND 26: measure the step with OUR OWN contribution removed ─
-            //
-            // `raw` is target − crosshair, and the crosshair moves because WE
-            // move it, so one frame's difference is
-            //
-            //     Δraw = (the target's own screen motion) − kSensFrozen·u_prev
-            //
-            // The second term is our own handwriting, and at the shipped output
-            // ceiling it is worth up to 180 screen px — SIX times the 30 px soft
-            // threshold. The detector therefore used to fire on the aim simply
-            // WORKING: the harder it drove to close the error, the more reliably
-            // that was read as a track switch. A soft jump then cuts
-            // transferBleed_ = 0.25 into the integral, the integral GAIN and the
-            // prediction gain — three quarters of the carrier gone in one step,
-            // followed by the loop ramping it back up. That is the "跟上去一点
-            // 又退回慢慢爬" half of the report, and it is a limit on how fast
-            // the aim is ever allowed to approach.
-            //
-            // The correction is applied ONLY when it can explain the step (same
-            // opposite sign) and it is SUBTRACTED, never added. The direction
-            // matters: kSensFrozen = 1.0 is a deliberate OVER-estimate of the
-            // plant gain, so ADDING it would inflate every genuine step by the
-            // estimate's own error — turning a fix for false positives into a
-            // source of false negatives. Subtracting a too-large number can only
-            // make this detector quieter, never louder, and a quieter detector is
-            // safe here: it is a FALLBACK. The caller has the track id and
-            // reports a real switch through `targetChanged`, confirmed against
-            // position, which is strictly better information than a magnitude.
-            float step = raw - prevRaw_;
-            const float selfStep = kSensFrozen * lastOutput_;
-            if (step * selfStep < 0.0f) {
-                step = std::fmax(std::fabs(step) - std::fabs(selfStep), 0.0f);
-            } else {
-                step = std::fabs(step);
-            }
+            const float step = std::fabs(raw - prevRaw_);
             const float soft = std::fmax(kMeasurementJumpStep, 0.5f * boxPx_);
             const float hard = std::fmax(kHardTargetSwitchStep, 1.5f * boxPx_);
-            if (step >= hard)      { ++jumpHard_; reset(); hardReset = true; }
-            else if (step >= soft) { ++jumpSoft_; softReset(); softJump = true; }
+            if (step >= hard) {
+                ++jumpHard_;
+                reset();
+                hardReset = true;
+            } else if (step >= soft) {
+                ++jumpSoft_;
+                softJump = true;
+            }
         }
 
         const float filtered = errFilter_.update(raw, dt);
         const float blend    = rawBlend(raw, hasPrevRaw_ ? prevRaw_ : lastError_);
         const float e        = round2(filtered + (raw - filtered) * blend);
 
-        // ── Derivative ────────────────────────────────────────────────────
-        //
-        // Zeroed on a jump. A re-association is not motion, and letting it into
-        // the D term is a one-frame spike of exactly the size of the jump —
-        // kd·(that) is hundreds of pixel of finger travel for a single step.
-        const float de    = (hardReset || softJump) ? 0.0f : (e - lastError_);
+        const float rawDe = (hardReset || softJump) ? 0.0f : (e - lastError_);
         const float absE  = std::fabs(e);
-        const float absDe = std::fabs(de);
-        // Per-step difference normalised to the nominal step, so the D term and
-        // the reconstruction keep their meaning when the loop changes rate.
-        const float dNorm = de * (kNominalDt / dt);
+        const float absDe = std::fabs(rawDe);
 
-        // ── Adaptive gains (all driven by the error, all rate-limited) ─────
-        iGain_    = adjustGain(iGain_,    absE, kIntegralGainThreshold, kIntegralGainRate);
-        // NOT adjustGain — deliberately. The feed-forward is the CARRIER, so
-        // throttling it with the error is a positive feedback loop: a large
-        // error suppresses the very term that exists to remove it, so the error
-        // grows and the term shrinks further. The simulation measured exactly
-        // that: a hard 33 px standing lag on a 600 px/s strafe with predGain
-        // pinned at 0.6 and trust down at 0.41. A term that carries the target
-        // may only ramp UP, at a bounded rate; the one thing allowed to take it
-        // back down is the trust gate upstream, and only on evidence about the
-        // ESTIMATE (|Δv̂|, reversal, deceleration) — never on the size of the
-        // error it is there to close.
-        predGain_ = clamp01(predGain_ + (1.0f - predGain_) * kPredGainRate);
-        if (!hasPrevRaw_) outGain_ = std::fmax(outGain_, initOutGainFor(absE));
-        outGain_  = adjustGain(outGain_,  absE, kOutGainThreshold, kOutGainRate);
+        // 速度微分
+        constexpr float kVelNoiseFloor = 0.20f;
+        const float deVel = (absDe < kVelNoiseFloor) ? 0.0f : rawDe;
+        const float dNorm = deVel * (kNominalDt / dt);
 
-        // ── The velocity reconstruction ───────────────────────────────────
-        //
-        //   r = Δe + kSensFrozen·u_prev
-        //
-        // "How far the error moved, plus how much of that was us." At a steady
-        // lock Δe = 0 and r = kSensFrozen·u, so the feed-forward below supplies
-        // exactly `lookahead` of the carrier — the property the whole design
-        // rests on, and the one thing the old loop could not have because its
-        // u_prev was scaled by an estimate that moved.
-        //
-        // SKIPPED ENTIRELY on a corrected step. When the tracker pulls the
-        // published centre back onto a detector result one render frame old,
-        // Δe is the model's own velocity PLUS that pull, and the pull is
-        // proportional to how far WE rotated. Feeding it in would be the loop
-        // reading its own handwriting as target motion — at gain `lookahead`
-        // here and (in the old design) at gain 1 through carry into the
-        // integral, which is what made "ki = 0.01 and it still shakes"
-        // possible. Holding last step's estimate for one frame costs nothing:
-        // the filters below are already ~6-frame devices.
-        float vel = velLast_;
-        if (!measurementCorrected && lookahead_ > 0.0f) {
-            const float meas = dNorm + kSensFrozen * lastOutput_;
-            float fv = velFilter_.update(meas, dt);
-
-            // Near a lock, weight the estimate toward "what my own command and
-            // the residual error imply" — the endpoint of a settle is where the
-            // reconstruction is least trustworthy, because both of its terms are
-            // small and it is their DIFFERENCE that was supposed to be the
-            // signal.
-            if (absE < 1.0f && absDe < 0.1f) {
-                fv = fv * 0.35f + (lastOutput_ * 0.5f + dNorm) * 0.65f;
-            }
-
-            float sv = velSmooth_.update(fv, dt);
-            if (std::fabs(sv) <= kVelZeroPx) sv = 0.0f;
-
-            vel = pushVelocity(sv);
-            velFresh_ = true;
+        // D 项消噪死区
+        constexpr float kDerivNoiseFloor = 0.35f;
+        float deD = 0.0f;
+        if (absDe >= kDerivNoiseFloor) {
+            deD = std::copysign(absDe - kDerivNoiseFloor, rawDe);
         }
+        const float dNormForD = deD * (kNominalDt / dt);
 
-        // ── Stop / reversal machinery ─────────────────────────────────────
-        Adaptive ad = computeAdaptive(absE, absDe, vel, velLast_, prevTrust_);
-        prevTrust_ = ad.trust;
-        velNow_    = vel;
-        velLast_   = vel;
-
-        if (transferBleed_ > 0.0f) {
-            integral_ *= transferBleed_;
-            iGain_    *= transferBleed_;
-            predGain_ *= transferBleed_;
-            transferBleed_ = 0.0f;
+        // ★ 核心根本重构：真实目标速度提取
+        // 彻底根除将自身上一帧输出 uDelayed 反向加回输入的自激回路（那是闭环正反馈自激弹簧的唯一根源）！
+        // 优先直接使用 Kalman Tracker 独立解算的目标物理速度 targetVel；若未提供则使用微分 dNorm
+        float vel = 0.0f;
+        if (std::fabs(targetVel) > 0.02f) {
+            vel = velFilter_.update(targetVel, dt);
+        } else {
+            vel = velFilter_.update(dNorm, dt);
         }
-        if (ad.velMemScale < 0.999f) scalePredictionMemory(ad.velMemScale);
-        if (ad.intMemScale < 0.999f) {
-            // Denominator form: the integral is a residual cleaner with no
-            // external target, so cutting it is a pure gain reduction with no
-            // side effect on the carrier — the property the old `carry` bleed
-            // was missing, and the reason the old one could drive the charge
-            // past zero and into the opposite sign.
-            integral_ *= ad.intMemScale;
-            iGain_    *= ad.intMemScale;
-        }
+        if (std::fabs(vel) < 0.15f) vel = 0.0f;
+        velNow_  = vel;
+        velLast_ = vel;
+        velFresh_ = true;
 
-        // ── Integral ──────────────────────────────────────────────────────
-        const float iTerm = updateIntegral(e, frozen, dtScale);
-
-        // ── The output sum ───────────────────────────────────────────────
-        //
-        // Frozen (inside the stop band) suppresses P, and ONLY P. It must NOT
-        // touch the feed-forward: the band's job is to stop the loop chasing
-        // the detector's box jitter, and the feed-forward is not chasing
-        // anything — it is the command a moving target requires. Suppressing it
-        // is round 15's fault, where the band zeroed the axis outright and read
-        // on the device as 乱甩乱晃.
-        //
-        // ★ ROUND 26 — D USED TO BE GATED HERE TOO, and that is a bang-bang on
-        // the axis's damping. The instant the crosshair enters the band the loop
-        // loses the one term that can stop it, so the (lagging) prediction term
-        // rides straight on through; the crosshair leaves the band, D comes
-        // back, pulls it in, the band takes D away again — a limit cycle whose
-        // amplitude is set by the band width and the carrier's lag, and one that
-        // CANNOT be tuned out with kp/ki/kd because its cause is the switch
-        // itself. On the reported 0.4 band (40 % of the box half-width, so
-        // ±15-20 px) that is exactly "停下来左右小幅度晃".
-        //
-        // D is safe inside the band: it is a difference of the FILTERED error,
-        // and `raw` is snapped to zero below kErrorEpsPx, so at rest dNorm is
-        // ~0 and D contributes nothing. It only comes alive while the crosshair
-        // is actually moving — which is precisely when it is wanted.
+        // ── 1. 比例项 P（平滑果断，无60px硬饱和，具备真正的快速拉枪与跟枪响应力）──
         const float gate = frozen ? 0.0f : 1.0f;
-        // ★ ROUND 29 — P reads the soft-knee error, everything else the true
-        // one. The knee is what lets kp be raised without the raise becoming
-        // loop gain at large error; see kPSatPx.
-        const float eForP = kPSatPx * std::tanh(e / kPSatPx);
-        const float pT   = eForP * kp_ * (1.0f + kKpTrustBoost * ad.trust) * gate;
-        const float dT   = clampRange(dNorm, -kDerivClampPx, kDerivClampPx) *
-                           kd_ * (1.0f + kKdTrustBoost * ad.trust);
-        float iOut = iTerm * ad.intScale;
+        const float nearBlend = std::fmin(1.0f, std::fmax(0.0f, (absE - 0.5f) / 12.0f));
+        const float nearScale = 0.70f + 0.30f * nearBlend;
+        const float farBlend  = std::fmin(1.0f, std::fmax(0.0f, (absE - 20.0f) / 60.0f));
+        const float farBoost  = 1.0f + 0.35f * farBlend;
+        float eShaped = std::copysign(absE * nearScale * farBoost, e);
+        if (absE < 0.5f && std::fabs(vel) < 0.2f && std::fabs(dNorm) < 0.2f) {
+            eShaped = 0.0f;
+        }
+        const float pT = eShaped * kp_ * gate;
 
-        // The prediction term, in FINGER px:
-        //   (lookahead · v̂ [screen px/frame]) / kSensFrozen = finger px.
-        // With kSensFrozen = 1.0 this is the reference's own expression
-        // (v̂ · lookaheadFrames · predictionGain) with the lookahead expressed as
-        // a carrier share instead of as a frame count.
-        // predictionScale is a BOOST that grows with trust. There is no trust gate
-        // on this term — see the note where kFfTrustFloor used to be.
-        float ff = (lookahead_ * predGain_ * ad.predScale / kSensFrozen) * vel;
+        // ── 2. 微分项 D（强力减震阻尼器）──────────────────────────────────────
+        // 始终保持有效阻尼，直接吸收准星冲撞靶心时的晃荡动能，杜绝弹簧反弹
+        float dT = clampRange(dNormForD, -kDerivClampPx, kDerivClampPx) * kd_ * gate;
+        if (frozen || (absE < 0.5f && absDe < 0.2f)) {
+            dT = 0.0f;
+        }
+
+        // ── 3. 积分项 I（平滑稳态残差微调）───────────────────────────────────
+        // 仅作微小稳态静差清除，平滑自然衰减，严禁过零断电硬切断
+        float iOut = 0.0f;
+        if (ki_ > 1e-4f && !frozen) {
+            if (integral_ != 0.0f) {
+                integral_ *= 0.94f;
+            }
+            integral_ += e * ki_ * dtScale;
+            const float iCap = std::fmin(30.0f, std::fmax(2.0f, absE * 0.5f));
+            integral_ = clampRange(integral_, -iCap, iCap);
+            iOut = integral_;
+        } else {
+            integral_ *= 0.80f;
+        }
+
+        // ── 4. 前馈项 FF（真正物理跟枪载波）──────────────────────────────────
+        // 游戏触控中手指像素与屏幕转动比通常为 1:0.3，因此前馈增益乘上 2.5 换算系数，
+        // 确保敌人以 600px/s 奔跑时，自瞄前馈能够直接输出同等速度的手指位移，实现无延迟咬住！
+        // 目标一旦停下，targetVel 瞬间归零，前馈瞬间为 0，物理上杜绝任何惯性推移过冲！
+        constexpr float kVelCarrierGain = 2.5f;
+        float ff = lookahead_ * vel * kVelCarrierGain;
+        if (frozen || (absE < 0.8f && std::fabs(vel) < 0.25f)) {
+            ff *= std::clamp(absE / 0.8f, 0.0f, 1.0f);
+        }
         ff = clampRange(ff, -kFfLimitPx, kFfLimitPx);
 
-        // ── Overshoot Feedforward & Integral suppression ───────────────────
-        // If error exceeded the target center by >= kOvershootFloorPx (1.0px),
-        // any feedforward or integral component pushing in the overshoot direction
-        // (i.e. opposing the error-restoring direction) is suppressed to 0, and
-        // the prediction velocity memory is scaled down to prevent overshoot windup.
-        if (e <= -kOvershootFloorPx) {
-            if (ff > 0.0f) {
-                ff = 0.0f;
-                scalePredictionMemory(0.5f);
-            }
-            if (iOut > 0.0f) {
-                iOut = 0.0f;
-                integral_ = 0.0f;
-                iGain_ = 0.0f;
-            }
-        } else if (e >= kOvershootFloorPx) {
-            if (ff < 0.0f) {
-                ff = 0.0f;
-                scalePredictionMemory(0.5f);
-            }
-            if (iOut < 0.0f) {
-                iOut = 0.0f;
-                integral_ = 0.0f;
-                iGain_ = 0.0f;
-            }
-        }
-
-        // Sub-pixel chatter only. NOT the "terms whose steady state is zero"
-        // deadband this used to be — neither of these terms has a zero steady
-        // state, they are the carrier between them. See kOutDeadbandPx.
-        if (std::fabs(iOut) <= kOutDeadbandPx)          iOut = 0.0f;
-        if (std::fabs(ff)   <= kOutDeadbandPx * 0.5f)   ff   = 0.0f;
-
-        float out = pT + iOut + dT + ff;
-
-        // ── Convergence braking — the ported "越来越慢" ────────────────────
-        // Whole-output cut in proportion to the fraction of the remaining
-        // error the frame just closed, while the error holds its sign and is
-        // actually shrinking. Skipped on jump frames: there the step is the
-        // tracker's, not the approach's, and braking on it would be braking
-        // an artifact. `lastError_` at this point still holds the previous
-        // step's filtered error (it is overwritten at the bottom of update).
-        // A steady lock, a strafe lag and a completed stop all have shrink
-        // ≈ 0 and pass through untouched — the brake only exists while the
-        // loop is already winning, which is what makes it safe to apply to
-        // the feed-forward too. See kConvBrakeStrength for the full port note.
-        const float prevMag = std::fabs(lastError_);
-        if (!hardReset && !softJump &&
-            prevMag > kConvBrakeErrFloor && prevMag > absE &&
-            sameSign(e, lastError_)) {
-            const float shrink = 1.0f - absE / prevMag;
-            out *= clampRange(1.0f - shrink * kConvBrakeStrength,
-                              kConvBrakeMinMult, 1.0f);
-        }
-
-        // Soft ceiling, then the global gain, then the optional output EMA.
-        out = kAimOutLimitPx * std::tanh(out / kAimOutLimitPx);
-        out = round2(out * outGain_);
+        // 合成总输出
+        float out = pT + dT + iOut + ff;
+        out = clampRange(out, -kAimOutLimitPx, kAimOutLimitPx);
         if (outSmooth_ < 0.999f) {
             outSmoothState_ += (out - outSmoothState_) * outSmooth_;
             out = outSmoothState_;
         }
 
-        // `lastOutput_` is what the PLANT saw — the post-gain, post-EMA value.
-        // The reconstruction's next step reads it, so it must be the physical
-        // command and not the pre-gain sum.
         lastOutput_  = out;
         lastError_   = e;
         prevRaw_     = raw;
@@ -998,25 +897,27 @@ public:
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
-
-    /// A new engagement, a target switch, or a jump. Wipes EVERYTHING, including
-    /// the output gain and the velocity memory — the state that belongs to the
-    /// target we were engaging and to nothing else.
     void reset() {
         integral_  = 0.0f;
         iGain_     = 0.0f;
-        predGain_  = 0.0f;
-        outGain_   = kOutGainFloor;
+        predGain_  = 1.0f;
+        outGain_   = 1.0f;
         lastError_ = 0.0f;
         prevRaw_   = 0.0f;
         hasPrevRaw_ = false;
         lastOutput_ = 0.0f;
+        for (std::size_t i = 0; i < kOutHistCap; ++i) outHist_[i] = 0.0f;
+        outHead_ = 0;
         outSmoothState_ = 0.0f;
-        prevTrust_ = 0.0f;
+        prevTrust_ = 1.0f;
+        latencySeconds_ = kNominalDt;
+        hasLatencyHint_ = false;
         velNow_ = 0.0f;
         velLast_ = 0.0f;
         transferBleed_ = 0.0f;
         velFresh_ = false;
+        velocityCoherence_ = 1.0f;
+        lastCoherenceVelocity_ = 0.0f;
         resetPredictionMemory();
         errFilter_.reset();
         velFilter_.reset();
@@ -1091,13 +992,8 @@ private:
             drop = (ap - av) / (ap + kEps);
         }
 
-        // Believe neither ratio until it clears its deadband (see the constants
-        // above). Everything downstream — both gates AND the memory bleed — uses
-        // the excess, so a few percent of estimation wobble is simply invisible
-        // instead of being a permanent tax on the carrier.
-        const float reversalE = std::fmax(0.0f, reversal - kReversalDeadband);
-        const float dropE     = std::fmax(0.0f, drop - kStopDropDeadband);
-
+        // ★ 克里斯控制器机制：直接使用变向 (reversal) 与减速急停 (drop) 进行连续自适应门控与记忆排空，
+        // 彻底解决因人为死区导致目标减速或折返时无法及时泄放前馈与积分记忆、进而猛烈冲出靶心的问题！
         const float distTrust = kTrustDistFloor +
                                 (1.0f - kTrustDistFloor) *
                                 clamp01(absE / kTrustDistErrScale);
@@ -1106,18 +1002,18 @@ private:
         if (av > kEps) {
             const float speedFactor = 1.0f - std::exp(-av / kTrustVelScale);
             const float stableVel   = std::exp(-acc / kTrustAccelScale);
-            const float revGate     = (reversalE > 0.0f)
-                                          ? std::exp(-kReversalGateStrength * reversalE)
+            const float revGate     = (reversal > 0.0f)
+                                          ? std::exp(-kReversalGateStrength * reversal)
                                           : 1.0f;
-            const float stopGate    = (dropE > 0.0f)
-                                          ? std::exp(-kStopGateStrength * dropE)
+            const float stopGate    = (drop > 0.0f)
+                                          ? std::exp(-kStopGateStrength * drop)
                                           : 1.0f;
             target = clamp01(speedFactor * stableVel * revGate * stopGate * distTrust);
         }
         const float rate = (target < trustPrev) ? kTrustFallRate : kTrustRiseRate;
         a.trust = clamp01(trustPrev + (target - trustPrev) * rate);
 
-        a.predScale = 1.0f + kKpTrustBoost * a.trust;   // a small, bounded boost
+        a.predScale = 1.0f + kKpTrustBoost * a.trust;
 
         const float nearInt = std::exp(-absE / kIntegralErrScale);
         const float stableE = std::exp(-absDe / kIntegralDiffScale);
@@ -1126,12 +1022,8 @@ private:
                                 0.0f, 1.0f);
         a.intScale *= (1.0f - kIntegralTrustCut * a.trust);
 
-        // The bleed. A reversal or a stop is the one time the memory of "the
-        // target was moving at v" is actively misleading, so it is cut by an
-        // amount proportional to the reversal/drop and no more — again the
-        // EXCESS over the deadband, so the estimate's own noise can never
-        // spontaneously erase the memory of a real, steady target.
-        const float rd = reversalE + dropE;
+        // 目标减速或急停变向时，立即按比例清退速度记忆与积分残余蓄水池，从物理源头扼杀过冲！
+        const float rd = reversal + drop;
         a.velMemScale = 1.0f - clampRange(rd * kVelMemBleedStrength, 0.0f, kVelMemBleedMax);
         a.intMemScale = 1.0f - clampRange(rd * kIntegralMemBleedStrength, 0.0f, kIntegralMemBleedMax);
         return a;
@@ -1179,15 +1071,22 @@ private:
         predHist_[predHead_] = v;
         predHead_ = (predHead_ + 1) & kPredHistoryMask;
         if (predMoves_ < kPredSamples) ++predMoves_;
-        if (predMoves_ < kPredSamples) return 0.0f;
+        if (predMoves_ == 0) return 0.0f;
 
         float weighted = 0.0f;
-        std::size_t idx = (predHead_ - kPredSamples) & kPredHistoryMask;
-        for (std::size_t i = 0; i < kPredSamples; ++i) {
-            weighted += predHist_[idx] * kPredWeights[i];
+        float weightSum = 0.0f;
+        const std::size_t count = predMoves_;
+        std::size_t idx = (predHead_ - count) & kPredHistoryMask;
+        for (std::size_t i = 0; i < count; ++i) {
+            const float w = kPredWeights[kPredSamples - count + i];
+            weighted += predHist_[idx] * w;
+            weightSum += w;
             idx = (idx + 1) & kPredHistoryMask;
         }
-
+        // ★ 多帧方向一致性确认：
+        // 目标静止时，检测框量化抖动表现为正负频繁跳变（一帧+一帧-）。
+        // 真实移动必定是连续同向位移。如果方向突变反转，判定为噪声，立即清零计数并丢弃，
+        // 只有连续同向才输出速度，彻底消除静止左右抽搐！
         if (sameSign(lastPredVel_, weighted) || lastPredVel_ == 0.0f || weighted == 0.0f) {
             if (predStable_ < kPredStableReady) ++predStable_;
         } else {
@@ -1226,7 +1125,7 @@ private:
     /// "on target"; the other is the error snap itself, and relying on the
     /// caller's deadzone to define this state meant a user who set 死区 = 0 got
     /// no hold at all.
-    float updateIntegral(float e, bool frozen, float dtScale) {
+    float updateIntegral(float e, float absE, float absDe, bool frozen, float dtScale) {
         if (ki_ <= kEps) { integral_ = 0.0f; return 0.0f; }
 
         // ── THE RELEASE ───────────────────────────────────────────────────
@@ -1235,70 +1134,34 @@ private:
         // rather than bled. This is what makes a stop quiet — the target stops,
         // the aim over-runs, the error reverses, and the charge that caused the
         // over-run is gone before it can overshoot twice.
-        //
-        // ⚠⚠ `e == 0.0` IS NOT A REVERSAL, and sameSign() cannot tell the
-        // difference: sameSign(a, b) is `a*b > 0`, so sameSign(0.0f, I) is FALSE
-        // and a zero error reads as "the error is opposing the charge".
-        //
-        // `e` reaches exactly 0.0f by two routes, and both are the loop being
-        // SUCCESSFUL rather than wrong:
-        //   * the snap is applied to `raw` before the filter, and near zero
-        //     rawBlend is 0, so `e = round2(filtered)` — the OneEuro output. Its
-        //     per-frame decay is ~0.947 at the 1.05 Hz cutoff, and round2 keeps
-        //     two decimals, so `e` becomes exactly 0.0f within about a second of
-        //     the error last leaving the snap zone;
-        //   * `blend` can be non-zero on a fast approach, and then `e = raw`
-        //     exactly, which is 0.0f wherever the snap fired.
-        // And in between, every genuine zero crossing of the filtered error fires
-        // the test as well — which during a close approach is every time the aim
-        // passes the box centre.
-        //
-        // So the test below used to fire on arrival, on every crossing, and again
-        // about a second after settling — always to wipe the integral and reset
-        // its authority (`iGain_ = 0`, ~40 frames at kIntegralGainRate to climb
-        // back), always at the moment the loop most needed to keep driving.
-        //
-        // The comment that used to sit here called the integral "free to be
-        // thrown away" because "the carrier is the prediction term". That is only
-        // true at 前馈 ≈ 1. At the shipped 0.60 the integral is 40% of the
-        // carrier, and at the 0.16 the user had actually set it is 84% — so the
-        // wipe removed most or all of the command, and the loop could only
-        // rebuild it by lagging behind again. The aim arrives, the drive
-        // vanishes, the target leaves the deadzone, the integral slowly rebuilds,
-        // the aim arrives again. That is the reported cycle, exactly. A reversal
-        // worth releasing on is a change of sign in an error that is actually
-        // there.
+        // 变号平滑泄电：运动跟枪时维持必要载波，避免断崖失速导致皮筋极限环抽搐；
+        // 静止过冲时按比例衰减多余电荷。
         if (integral_ != 0.0f && e != 0.0f && !sameSign(e, integral_)) {
-            integral_ = 0.0f;
-            iGain_    = 0.0f;
+            const float motion = clamp01(std::fabs(velNow_) / 0.35f);
+            if (motion > 0.3f && absE < 3.0f) {
+                integral_ *= (0.70f + 0.25f * motion);
+            } else {
+                integral_ *= 0.25f;
+                if (std::fabs(integral_) < 0.05f) integral_ = 0.0f;
+                iGain_ *= 0.5f;
+            }
         }
 
-        // ── THE HOLD ──────────────────────────────────────────────────────
-        // On target the charge is FROZEN — not accumulated and not leaked.
-        //
-        // It is not a leftover to be disposed of: the prediction term supplies
-        // `lookahead·u_ss` and the integral supplies the other
-        // `(1 − lookahead)·u_ss`, so together they ARE the standing command. And
-        // the prediction term cannot bootstrap its share on its own, because it
-        // is a delayed copy of our own output:
-        //
-        //     u = lookahead·u(k−L) + I      ⇒      u → I/(1 − lookahead)
-        //
-        // which holds only while I holds. Leak I while on target and the whole
-        // sum decays with the leak — ~0.55 s at the old 0.985, ~0.16 s at the
-        // shipped 0.95 — so the stop band turns into "the aim stops following":
-        // the slower twin of the same symptom. (Round 23 made the leak FAST
-        // precisely because a slow one is a pole that resonates with the loop's
-        // dead time; fast enough to be safe is still far too fast to hold a
-        // standing carrier through the band, which is why the hold exists at all
-        // and is not an optimisation.)
-        //
-        // Holding is safe in a way that accumulating is not: with no error there
-        // is nothing to wind up, so the charge equals the carrier and nothing
-        // else. The moment the target moves, |e| leaves the snap's neighbourhood
-        // and normal accumulation resumes without any transition.
-        const bool onTarget = frozen || (e == 0.0f);
-        if (!onTarget) {
+        // ── THE HOLD & LEAK ───────────────────────────────────────────────
+        // 目标静止/微抖防晃：在近距离极小步长区间 (|e| < 3.0px 且 |Δe| < 2.0px)，
+        // 判定为 YOLO 框边缘检测微抖动，冻结积分累加并主动温和泄电，杜绝静止时积分微振荡
+        const bool isJitterZone = (absE < 3.0f && absDe < 2.0f);
+        if (frozen) {
+            // 在用户死区内：停止累加并快速泄电，防止累积电荷把准星轰出死区
+            if (integral_ != 0.0f) {
+                integral_ *= 0.80f;
+            }
+        } else if (e == 0.0f || isJitterZone) {
+            // 在目标微抖区内：温和衰减残余电荷
+            if (integral_ != 0.0f) {
+                integral_ *= 0.88f;
+            }
+        } else {
             if (integral_ != 0.0f) {
                 integral_ *= std::pow(kIntegralLeakPerFrame,
                                       clampRange(dtScale, kFrameScaleMin, kFrameScaleMax));
@@ -1306,7 +1169,11 @@ private:
             integral_ += e * ki_ * iGain_ * dtScale;
         }
 
-        integral_ = clampRange(integral_, -kAimTrimLimitPx, kAimTrimLimitPx);
+        // 静止时收紧限幅杜绝微抖；运动跟枪时放宽容量，保证积分能辅助消除跟踪稳态滞后
+        const float motion = clamp01(std::fabs(velNow_) / 0.35f);
+        const float staticCap = std::fmax(1.0f, absE * kp_);
+        const float maxIntegralCapacity = staticCap + (kAimTrimLimitPx - staticCap) * motion;
+        integral_ = clampRange(integral_, -maxIntegralCapacity, maxIntegralCapacity);
         return integral_;
     }
 
@@ -1321,6 +1188,8 @@ private:
     float boxPx_     = 0.0f;
 
     // ── State ─────────────────────────────────────────────────────────────
+    float latencySeconds_ = kNominalDt;
+    bool  hasLatencyHint_ = false;
     float integral_  = 0.0f;
     float iGain_     = 0.0f;
     float predGain_  = 0.0f;
@@ -1329,6 +1198,10 @@ private:
     float prevRaw_   = 0.0f;
     bool  hasPrevRaw_ = false;
     float lastOutput_ = 0.0f;
+    static constexpr std::size_t kOutHistCap = 16;
+    static constexpr std::size_t kOutHistMask = kOutHistCap - 1;
+    float outHist_[kOutHistCap] = {};
+    std::size_t outHead_ = 0;
     float outSmoothState_ = 0.0f;
     float velNow_    = 0.0f;    ///< published velocity this step (SCREEN px/frame)
     float velLast_   = 0.0f;    ///< the same, one step ago — the drop/reversal reference
@@ -1341,6 +1214,10 @@ private:
     std::size_t predMoves_ = 0;
     int   predStable_ = 0;
     float lastPredVel_ = 0.0f;
+
+    // ★ 克里斯控制器核心机制：速度相干性追踪 (消除检测框微晃与静止抽搐)
+    float velocityCoherence_ = 1.0f;
+    float lastCoherenceVelocity_ = 0.0f;
 
     OneEuro      errFilter_;
     ScalarKalman velFilter_{kVelKalmanQ, kVelKalmanR, 0.0f, 1.0f};
@@ -1366,6 +1243,8 @@ private:
     void softReset() {
         transferBleed_ = kJumpIntegralKeep;
         prevTrust_    *= kJumpTrustKeep;
+        for (std::size_t i = 0; i < kOutHistCap; ++i) outHist_[i] = 0.0f;
+        outHead_ = 0;
         resetPredictionMemory();
         velFilter_.reset();
         velSmooth_.reset();
