@@ -185,6 +185,16 @@ const char* const kLiteRtQnn[] = {
     "libQnnHtpV75Skel.so",
     "libQnnHtpV79Skel.so",
     "libQnnHtpV81Skel.so",
+    // v66 (SD865/870) has no HTP backend in QAIRT 2.50 — that Hexagon runs
+    // the QnnDsp backend instead (selected in litert_engine.cpp when
+    // capabilities() reports arch 66). The two Stubs are host-side and
+    // dlopen normally; the Skel is a Hexagon ELF the host linker refuses,
+    // listed for the same best-effort-boot-preload reason as the HTP Skels
+    // above — the DSP driver locates it through ADSP_LIBRARY_PATH, which
+    // the delegate builds from skel_library_dir.
+    "libQnnDspV66Stub.so",
+    "libQnnDspV66CalculatorStub.so",
+    "libQnnDspV66Skel.so",
     "libQnnHtpPrepare.so",
     "libQnnHtpOptraceProfilingReader.so",
     "libQnnHtpProfilingReader.so",

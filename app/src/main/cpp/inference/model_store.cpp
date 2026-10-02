@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include "inference/model_store.h"
 
+#include "inference/capabilities.h"
 #include "inference/model_type.h"
 
 #include <android/log.h>
@@ -347,7 +348,11 @@ const char* engineLabel(Engine engine) {
         case Engine::OnnxRuntime:   return "ONNX Runtime · XNNPACK";
         case Engine::OnnxCpu:       return "普通 CPU";
         case Engine::OnnxHtp:       return "ONNX Runtime · QNN HTP";
-        case Engine::QnnHtp:        return "QNN HTP";
+        case Engine::QnnHtp:
+            // On v66 (SD865/870) this entry runs the QnnDsp backend, not
+            // HTP — the label follows the silicon, so a failure there gets
+            // reported against the right backend instead of "HTP bug".
+            return infer::capabilities().htpArch == 66 ? "QNN DSP" : "QNN HTP";
         case Engine::Nnapi:         return "NNAPI";
         case Engine::Cpu:           return "CPU";
         case Engine::TfliteXnnpack: return "XNNPACK";

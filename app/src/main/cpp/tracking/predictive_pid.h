@@ -804,6 +804,7 @@ public:
         const float absE  = std::fabs(e);
         const float absDe = std::fabs(rawDe);
 
+
         // 速度微分
         constexpr float kVelNoiseFloor = 0.20f;
         const float deVel = (absDe < kVelNoiseFloor) ? 0.0f : rawDe;
@@ -841,7 +842,12 @@ public:
         if (absE < 0.5f && std::fabs(vel) < 0.2f && std::fabs(dNorm) < 0.2f) {
             eShaped = 0.0f;
         }
-        const float pT = eShaped * kp_ * gate;
+        // ★ P 软饱和（自 4c94f4a 存档点活代码原样移植）：eForP = kPSatPx·tanh。
+        // 线性区（<~60px）与原式一致；大误差渐近 kPSatPx——快速滑动后跟踪器
+        // 会按自身速度模型把发布中心朝滑动方向外推若干帧（"鬼影"），无饱和的
+        // 线性 P 会以几十 px/帧追鬼影（读作"往滑动方向甩飞"），饱和后 ~9px/帧，
+        // 检测修正帧一到就被拉回。
+        const float pT = kPSatPx * std::tanh(eShaped / kPSatPx) * kp_ * gate;
 
         // ── 2. 微分项 D（强力减震阻尼器）──────────────────────────────────────
         // 始终保持有效阻尼，直接吸收准星冲撞靶心时的晃荡动能，杜绝弹簧反弹
@@ -851,13 +857,32 @@ public:
         }
 
         // ── 3. 积分项 I（平滑稳态残差微调）───────────────────────────────────
-        // 仅作微小稳态静差清除，平滑自然衰减，严禁过零断电硬切断
+        // 仅作微小稳态静差清除，平滑自然衰减，严禁过零断电硬切断。
+        // ★ 变号泄放 + 近距微抖区冻结：自 4c94f4a 存档点的 updateIntegral 原样
+        // 移植回活路径——误差变号（已越过目标）时电荷是向外推的能量，按运动
+        // 状态泄放；|e|<3px 且无真实运动的微抖区冻结累加，防静止积分抖动。
         float iOut = 0.0f;
         if (ki_ > 1e-4f && !frozen) {
-            if (integral_ != 0.0f) {
-                integral_ *= 0.94f;
+            if (integral_ != 0.0f && e != 0.0f && !sameSign(e, integral_)) {
+                const float motion = clamp01(std::fabs(velNow_) / 0.35f);
+                if (motion > 0.3f && absE < 3.0f) {
+                    integral_ *= (0.70f + 0.25f * motion);
+                } else {
+                    integral_ *= 0.25f;
+                    if (std::fabs(integral_) < 0.05f) integral_ = 0.0f;
+                }
             }
-            integral_ += e * ki_ * dtScale;
+            if (absE < 3.0f && absDe < 2.0f) {
+                integral_ *= 0.88f;
+            } else {
+                if (integral_ != 0.0f) {
+                    integral_ *= 0.94f;
+                }
+                // ki 直进：滑块标称值即实际生效值（参数不撒谎）。静止不抖由
+                // 上面的微抖区负责，甩出由过冲方向抑制（变号即排空）与相对
+                // 限幅负责——不在积分增益里藏衰减系数。
+                integral_ += e * ki_ * dtScale;
+            }
             const float iCap = std::fmin(30.0f, std::fmax(2.0f, absE * 0.5f));
             integral_ = clampRange(integral_, -iCap, iCap);
             iOut = integral_;
@@ -876,9 +901,51 @@ public:
         }
         ff = clampRange(ff, -kFfLimitPx, kFfLimitPx);
 
+        // ── 过冲方向抑制（★ 自 4c94f4a 存档点活代码原样移植）────────────────
+        // 误差越过目标 ≥1px 后，任何仍朝"远离目标"方向推的前馈分量清零、
+        // 速度记忆减半，积分分量清零且电荷排空——过冲发生后它们只会把准星
+        // 往外甩（"有时候甩出去"的来源就是本文件此前缺了这段）。
+        // 误差未越过的正常逼近侧不受影响，跟枪载波保持原样。
+        if (e <= -kOvershootFloorPx) {
+            if (ff > 0.0f) {
+                ff = 0.0f;
+                velFilter_.x *= 0.5f;
+            }
+            if (iOut > 0.0f) {
+                iOut = 0.0f;
+                integral_ = 0.0f;
+            }
+        } else if (e >= kOvershootFloorPx) {
+            if (ff < 0.0f) {
+                ff = 0.0f;
+                velFilter_.x *= 0.5f;
+            }
+            if (iOut < 0.0f) {
+                iOut = 0.0f;
+                integral_ = 0.0f;
+            }
+        }
+
         // 合成总输出
         float out = pT + dT + iOut + ff;
         out = clampRange(out, -kAimOutLimitPx, kAimOutLimitPx);
+
+        // ── 收敛刹车（★ 自 4c94f4a 存档点活代码原样移植）────────────────────
+        // 误差同号且确实在收缩时，按"本帧收掉的剩余误差比例"整体裁剪输出：
+        // 逼近越接近目标越慢，从根上拦住 P 打在滞后误差上造成的过冲振荡
+        // （"有时候甩飞出去"的来源——ki=0/前馈=0 也甩，就是这条路径）。
+        // 稳态咬住、匀速滞后、已完成的停止的 shrink≈0，原样通过不衰减。
+        // 跳帧豁免：那一帧的步长是跟踪器的，不是逼近的。
+        const float prevMag = std::fabs(lastError_);
+        if (!hardReset && !softJump &&
+            prevMag > kConvBrakeErrFloor && prevMag > absE &&
+            sameSign(e, lastError_)) {
+            const float shrink = 1.0f - absE / prevMag;
+            out *= clampRange(1.0f - shrink * kConvBrakeStrength,
+                              kConvBrakeMinMult, 1.0f);
+        }
+
+
         if (outSmooth_ < 0.999f) {
             outSmoothState_ += (out - outSmoothState_) * outSmooth_;
             out = outSmoothState_;

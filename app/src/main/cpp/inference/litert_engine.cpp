@@ -30,6 +30,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "inference/litert_engine.h"
+#include "inference/capabilities.h"
 #include "inference/libpath.h"
 
 #include "tensorflow/lite/c/c_api.h"
@@ -47,6 +48,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -185,7 +187,14 @@ LiteRtEngine::LiteRtEngine(Ep ep) : ep_(ep) {
         case Ep::Xnnpack: activeName_ = "LiteRT / XNNPACK"; break;
         case Ep::Nnapi:   activeName_ = "LiteRT / NNAPI";   break;
         case Ep::Gpu:     activeName_ = "LiteRT / GPU";     break;
-        case Ep::Htp:     activeName_ = "LiteRT / QNN HTP"; break;
+        // Hexagon 690 (SM8250 — SD865/870) is HTP v66, which modern QAIRT
+        // stacks do not ship an HTP backend for; QAIRT 2.50 carries it as the
+        // QnnDsp backend instead (libQnnDsp.so + libQnnDspV66*). Same row in
+        // the menu, different backend under it — hence the name.
+        case Ep::Htp:
+            activeName_ = capabilities().htpArch == 66 ? "LiteRT / QNN DSP"
+                                                       : "LiteRT / QNN HTP";
+            break;
         default:          activeName_ = "LiteRT";           break;
     }
     status_ = Status::good();
@@ -344,32 +353,64 @@ TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
     }
 
     if (ep == Ep::Htp) {
-        // Qualcomm's HTP runtime. The factory and the QNN libraries are
+        // Qualcomm's QNN runtime. The factory and the QNN libraries are
         // linked into libaimbotng.so statically, so the call is a direct
         // symbol — no dlopen. The same goes for the unload() path: the
         // deleter symbol comes from the same .so we already have.
         TfLiteQnnDelegateOptions qnn = TfLiteQnnDelegateOptionsDefault();
-        qnn.backend_type           = kHtpBackend;
         // skel_library_dir: QNN loads the per-SoC skel from this directory
-        // at runtime (libQnnHtpV68Skel.so, libQnnHtpV73Skel.so, …). libraryDir()
-        // returns our own libaimbotng.so's directory — the same place the
-        // skels live in jniLibs.
+        // at runtime (libQnnHtpV68Skel.so, libQnnHtpV73Skel.so, …, or the
+        // QnnDsp pair below). libraryDir() returns our own libaimbotng.so's
+        // directory — the same place the skels live in jniLibs.
         qnn.skel_library_dir       = libraryDir();
-        // Cache dir for the compiled HTP graph. /data/local/tmp is writable
+        // Cache dir for the compiled graph. /data/local/tmp is writable
         // by the shell daemon (uid 2000) without further setup.
         qnn.cache_dir              = "/data/local/tmp/aimbot_qnn";
         // Per-model token: each model gets a unique token (its basename,
-        // propagated via ModelSpec::cacheToken) so the HTP graph cache
+        // propagated via ModelSpec::cacheToken) so the graph cache
         // lives in its own file and warm-up work survives cold launches.
         qnn.model_token            = cacheToken.empty()
                                           ? nullptr
                                           : cacheToken.c_str();
-        // Latency-critical real-time workload: vote for the HTP performance
+        // Latency-critical real-time workload: vote for the performance
         // mode so the DSP scheduler does not throttle us when the game
         // contends for NPU resources. The mode is the per-model vote the
         // user picks in the Model Settings dialog (default: Sustained High
-        // Performance). It is the raw TfLiteQnnDelegateHtpPerformanceMode int.
+        // Performance). It is the raw TfLiteQnnDelegate*PerformanceMode int.
         const int pm = (htpPerfMode < 0 || htpPerfMode > 9) ? 1 : htpPerfMode;
+        // Hexagon 690 (SM8250 — SD865/870) is HTP v66, which the QAIRT 2.50
+        // stack does not carry an HTP backend for: it reaches that DSP
+        // through the QnnDsp backend instead (libQnnDsp.so +
+        // libQnnDspV66{Stub,CalculatorStub,Skel}.so — the same DSP silicon,
+        // the older interface). library_path is pinned so the delegate never
+        // resolves the soname against a namespace that cannot see it.
+        if (capabilities().htpArch == 66) {
+            // The DSP loader finds the Stub (host side) and the Skel (loaded
+            // onto the Hexagon) through ADSP_LIBRARY_PATH. The delegate is
+            // documented to build it from skel_library_dir, but the ORT path
+            // sets the same value before any QNN backend initialises — match
+            // it here so the DSP branch never depends on which runtime ran
+            // first in this process. Idempotent: same value, same process.
+            const std::string adsp =
+                std::string(libraryDir()) + ";native_lib_path";
+            setenv("ADSP_LIBRARY_PATH", adsp.c_str(), /*overwrite*/ 1);
+            // Lives in a local: library_path is a plain pointer, and the
+            // delegate dereferences it in TfLiteQnnDelegateCreate below.
+            const std::string dspPath = libraryPath("libQnnDsp.so");
+            qnn.backend_type  = kDspBackend;
+            qnn.library_path  = dspPath.c_str();
+            // The DSP enum numbers its modes identically to the HTP one
+            // (default 0, sustained 1, burst 2, …), so the same vote
+            // carries over unchanged.
+            qnn.dsp_options.performance_mode =
+                static_cast<TfLiteQnnDelegateDspPerformanceMode>(pm);
+            LOGI("QNN: v66 SoC — QnnDsp backend (%s, perf mode %d)",
+                 dspPath.c_str(), pm);
+            TfLiteDelegate* d = TfLiteQnnDelegateCreate(&qnn);
+            if (d == nullptr && why) *why = "TfLiteQnnDelegateCreate returned null";
+            return d;
+        }
+        qnn.backend_type           = kHtpBackend;
         qnn.htp_options.performance_mode =
             static_cast<TfLiteQnnDelegateHtpPerformanceMode>(pm);
         TfLiteDelegate* d = TfLiteQnnDelegateCreate(&qnn);

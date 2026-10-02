@@ -13,6 +13,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,15 +35,33 @@ int propInt(const char* name) {
     return s.empty() ? 0 : atoi(s.c_str());
 }
 
+std::string upperCopy(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
 /// Hexagon generation from the SoC model. Only the families this project has
 /// seen are listed; anything else reports 0 and the caller says so rather than
 /// guessing, because a wrong skel name is a dlopen failure two layers deeper.
-int htpArchFor(const std::string& soc) {
+int htpArchFor(const std::string& socRaw) {
     struct Row { const char* soc; int arch; };
+    // Matched case-insensitively as a *substring*: OEM builds report the same
+    // chip as "SM8250", "sm8250", "qcom,sm8250" or " Qualcomm Technologies,
+    // Inc SM8250", and a prefix match or a case-sensitive one silently misses
+    // on the builds that format it differently — which is exactly the device
+    // that then falls back to a backend it cannot run.
+    const std::string soc = upperCopy(socRaw);
     // SM8650 is the device this was developed against (HTP v75). The rest are
     // here so the same APK says something sensible on the other affected
     // handsets rather than "unknown Qualcomm".
     static const Row kRows[] = {
+        {"SM8250", 66},   // 865 / 870 (Hexagon 690) — QnnDsp backend, no HTP
+        {"KONA",   66},   // 865 / 870 by board name (ro.soc.model is absent
+                          // on some 870 builds)
+        {"SM8350", 68},   // 888
+        {"LAHAINA", 68},  // 888 by board name
         {"SM8450", 68},   // 8 Gen 1
         {"SM8475", 69},   // 8+ Gen 1
         {"SM8550", 73},   // 8 Gen 2
@@ -50,7 +69,7 @@ int htpArchFor(const std::string& soc) {
         {"SM8750", 79},   // 8 Elite
     };
     for (const Row& r : kRows) {
-        if (soc.rfind(r.soc, 0) == 0) return r.arch;
+        if (soc.find(r.soc) != std::string::npos) return r.arch;
     }
     return 0;
 }
@@ -64,19 +83,30 @@ Capabilities probe() {
     const long cores = sysconf(_SC_NPROCESSORS_ONLN);
     c.cpuCores = cores > 0 ? static_cast<int>(cores) : 0;
 
-    // Matched on either property: ro.soc.model is the modern one, but plenty of
-    // Qualcomm builds still only carry the platform name.
-    const std::string haystack = c.socModel + " " + c.board;
+    // Matched on either property, case-insensitively: ro.soc.model is the
+    // modern one, but plenty of Qualcomm builds still only carry the
+    // platform name, and a few format either one in lowercase.
+    const std::string haystack = upperCopy(c.socModel + " " + c.board);
     c.isQualcomm = haystack.find("SM8") != std::string::npos ||
-                   haystack.find("qcom") != std::string::npos ||
-                   haystack.find("pineapple") != std::string::npos ||
-                   haystack.find("kalama") != std::string::npos ||
-                   haystack.find("waipio") != std::string::npos ||
-                   haystack.find("cape") != std::string::npos;
+                   haystack.find("QCOM") != std::string::npos ||
+                   // Board names: several 865/870 and 888 builds ship no
+                   // ro.soc.model at all, so the platform name is all there is.
+                   haystack.find("KONA") != std::string::npos ||
+                   haystack.find("LAHAINA") != std::string::npos ||
+                   haystack.find("PINEAPPLE") != std::string::npos ||
+                   haystack.find("KALAMA") != std::string::npos ||
+                   haystack.find("WAIPIO") != std::string::npos ||
+                   haystack.find("CAPE") != std::string::npos;
     c.isMediaTek = haystack.find("MT") != std::string::npos ||
-                   haystack.find("mediatek") != std::string::npos;
+                   haystack.find("MEDIATEK") != std::string::npos;
 
-    if (c.isQualcomm) c.htpArch = htpArchFor(c.socModel);
+    if (c.isQualcomm) {
+        c.htpArch = htpArchFor(c.socModel);
+        // The board name fallback: ro.soc.model is the modern property and
+        // the one htpArchFor matches first, but kona/lahaina devices are
+        // exactly the ones most likely to omit it.
+        if (c.htpArch == 0) c.htpArch = htpArchFor(c.board);
+    }
 
     return c;
 }

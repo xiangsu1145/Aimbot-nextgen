@@ -205,6 +205,14 @@ const char* epLabel(Ep e) {
 
 void pairLabelTo(char* out, size_t outSize, Runtime r, Ep e) {
     if (out == nullptr || outSize == 0) return;
+    // v66 (SD865/870) runs the QnnDsp backend under this pair — see
+    // LiteRtEngine's delegate factory. The label follows the silicon, not
+    // the enum name, or an 870 user is told "HTP" by a button that never
+    // touches libQnnHtp.so and reports every failure as an HTP bug.
+    if (r == Runtime::LiteRT && e == Ep::Htp && capabilities().htpArch == 66) {
+        snprintf(out, outSize, "%s / QNN DSP", runtimeLabel(r));
+        return;
+    }
     snprintf(out, outSize, "%s / %s", runtimeLabel(r), epLabel(e));
 }
 
@@ -322,6 +330,17 @@ bool epAvailable(Runtime r, Ep e) {
                           : "QNN HTP requires a Qualcomm SoC";
                 return false;
             }
+            // v66 has no HTP backend in QAIRT 2.50, and this ORT path has no
+            // QnnDsp branch — the EP is pointed at libQnnHtp.so unconditionally.
+            // Left tappable it compiles for seconds and fails with no clue;
+            // the working v66 path is the LiteRT QNN row instead.
+            if (caps.htpArch == 66) {
+                p.ok  = false;
+                p.why = "v66 (SD865/870) has no HTP backend in QAIRT 2.50 — "
+                        "use the LiteRT QNN row, which runs the QnnDsp DSP "
+                        "backend on this Hexagon";
+                return false;
+            }
             if (!libraryPresent("libonnxruntime_providers_qnn.so")) {
                 p.ok  = false;
                 p.why = "libonnxruntime_providers_qnn.so is not on this device";
@@ -366,6 +385,23 @@ bool epAvailable(Runtime r, Ep e) {
                 p.ok  = false;
                 p.why = "libQnnTFLiteDelegate.so is not on this device";
                 return false;
+            }
+            // v66 (SD865/870) runs the QnnDsp backend, not HTP — QAIRT 2.50
+            // has no HTP backend for that Hexagon generation, so the skel
+            // and backend library the graph will actually load are the DSP
+            // pair. Existence check follows the silicon, not the label.
+            if (caps.htpArch == 66) {
+                if (!libraryPresent("libQnnDsp.so") ||
+                    !libraryPresent("libQnnDspV66Skel.so")) {
+                    p.ok  = false;
+                    p.why = "libQnnDsp.so / libQnnDspV66Skel.so (the v66 DSP "
+                            "backend) is not on this device";
+                    return false;
+                }
+                p.ok = true;
+                LOGI("backend available: %s (dsp v66, QnnDsp backend)",
+                     pairLabel(r, e));
+                return true;
             }
             p.ok = true;
             LOGI("backend available: %s (htp v%d)", pairLabel(r, e), caps.htpArch);
