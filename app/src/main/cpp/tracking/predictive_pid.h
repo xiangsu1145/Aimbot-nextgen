@@ -836,9 +836,12 @@ public:
         // lastOutput_ 是 clamp/刹车/平滑之后的最终输出，最接近真实注入量。
         // α=1 假设与克里斯一致（kSensFrozen = 1.0）。
         float vel = 0.0f;
-        // 跟踪器重关联/目标切换帧：Δe 含修正踢腿而非速度，保持上一帧速度估计
-        // （克里斯语义，aim_section.h 文档本就如此声明，此前活路径从未实现）。
-        const bool deIsNotVelocity = hardReset || softJump || measurementCorrected;
+        // hold 只留给真正的状态跳变帧（reset 已清滤波器，softJump 的 Δe 是跟踪器的）。
+        // ★ measurementCorrected 不能进 hold：控制帧率=检测帧率时每帧都是修正帧，
+        // hold 会变成永久冻结——设备日志实测 v̂ 恒定 1.87 连续 8 帧（滤波器不再
+        // 更新），前馈整体失效。修正踢腿由 velFilter_ 卡尔曼平均吸收（克里斯
+        // 观测器思路：不存在二值的"这帧不是速度"，只有连续的置信度）。
+        const bool deIsNotVelocity = hardReset || softJump;
         if (std::fabs(targetVel) > 0.02f) {
             vel = velFilter_.update(targetVel, dt);
         } else if (deIsNotVelocity) {
