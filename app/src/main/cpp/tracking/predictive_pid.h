@@ -133,6 +133,20 @@ namespace tracking {
 // 废除全局硬编码死值除数，对齐克里斯控制器统一误差尺度（定义 1.0 仅作符号兼容）
 constexpr float kSensFrozen = 1.0f;
 
+/// ★ 自运动补偿的屏幕换算系数（α 的实测值，克里斯接口要求"applied move 以
+/// error-coordinate 单位回报"，pid.h:64）：
+///
+///     rawVelocity = Δe + kAppliedViewScale·u      (屏幕 px/帧)
+///     ff = lookahead · v̂ / kAppliedViewScale      (手指 px)
+///
+/// 证据（设备日志 02:07 崩跑序列）：前馈 0.6 时自激励发散（v̂ 每帧翻倍
+/// 7→14→20，ff 跟涨 4→9→12，误差 62→105），前馈 0.4 可用 →
+/// s = ff·(α−1) 在 0.6 处越过 1、在 0.4 处 <1 → α ∈ (2.7, 3.5)，
+/// 与项目注释的触控比 1:0.3（α≈3.3）吻合，取 3.0。
+/// 稳态时 α 在载波份额中精确对消（v̂=α·u → ff=lookahead·u），DC 份额仍等于
+/// lookahead；kSens 偏大的方向是安全的（s = ff·(1−α/kSens) → lookahead）。
+constexpr float kAppliedViewScale = 3.0f;
+
 /// The output ceiling, finger px/step, applied as a tanh knee so the command
 /// stays linear where it works and saturates where a re-lock would otherwise
 /// fling the finger across the panel. 180 finger px/step at 120 Hz is
@@ -853,12 +867,15 @@ public:
             // 起步时滤波误差没反应 → v̂ 迟迟为 0 → ff 缺席（"起步肉"）。设备日志
             // 实测：v̂ 连续 5 帧读 0 而目标每帧动 2~3px。去抖是 P/D 的事，它们的
             // 输入继续走滤波路径；速度这条路只过 velFilter_ 卡尔曼。
+            // 自身输出按 kAppliedViewScale 折算成屏幕像素再加回（α 对消，
+            // 见该常量的注释——这是 0.6 前馈崩跑的根因修复）。
             const float rawDiff = hasPrevRaw_ ? (raw - prevRaw_) : 0.0f;
-            float rawVelocity = rawDiff + lastOutput_;
-            // 近场混合（pid.cpp:762-766）：贴住目标时向 (Δe + 0.5u) 收，
+            float rawVelocity = rawDiff + kAppliedViewScale * lastOutput_;
+            // 近场混合（pid.cpp:762-766）：贴住目标时向 (Δe + 0.5α·u) 收，
             // 抑制自回声在速度估计里的残余噪声。
             if (absE < 1.0f && absDe < 0.1f) {
-                const float nearZeroVelocity = rawDiff + 0.5f * lastOutput_;
+                const float nearZeroVelocity =
+                    rawDiff + 0.5f * kAppliedViewScale * lastOutput_;
                 rawVelocity = rawVelocity * 0.35f + nearZeroVelocity * 0.65f;
             }
             vel = velFilter_.update(rawVelocity, dt);
@@ -928,11 +945,11 @@ public:
         }
 
         // ── 4. 前馈项 FF（真正物理跟枪载波，克里斯 lookahead 结构）─────────────
-        // 速度重构已含自运动补偿，v̂ 就是目标真实速度（screen px/帧 ≈ finger px/帧）。
-        // 稳态咬住时 v̂ = u_ss，ff = lookahead·u_ss，恰好扛起 lookahead 份额的
-        // 载波，剩余 (1−lookahead) 由 P+I 补——积分从此只是残料清扫。
+        // v̂ 已是屏幕 px/帧（重构含 α 倍自运动补偿），除回 kAppliedViewScale 换算
+        // 成手指 px。稳态咬住时 v̂=α·u_ss → ff = lookahead·u_ss，恰好扛起
+        // lookahead 份额的载波，剩余 (1−lookahead) 由 P+I 补——积分只是残料清扫。
         // 旧版 ×2.5 系数是为 dNorm 低估打的补丁，真速度下不再需要，已移除。
-        float ff = lookahead_ * vel;
+        float ff = lookahead_ * vel / kAppliedViewScale;
         if (frozen || (absE < 0.8f && std::fabs(vel) < 0.25f)) {
             ff *= std::clamp(absE / 0.8f, 0.0f, 1.0f);
         }
