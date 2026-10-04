@@ -32,6 +32,7 @@
 #include "inference/litert_engine.h"
 #include "inference/capabilities.h"
 #include "inference/libpath.h"
+#include "inference/model_type.h"
 
 #include "tensorflow/lite/c/c_api.h"
 #include "tensorflow/lite/c/common.h"
@@ -296,7 +297,8 @@ struct alignas(16) OptionsBox {
 /// Builds the delegate for the engine's chosen Ep, or returns nullptr for
 /// Ep::Cpu (where "no delegate" is the whole point).
 TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
-                              std::string* why, int htpPerfMode = 1) {
+                              std::string* why, int htpPerfMode = 1,
+                              bool isQuantized = true) {
     if (ep == Ep::Cpu) return nullptr;
 
     if (ep == Ep::Xnnpack) {
@@ -411,6 +413,8 @@ TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
             return d;
         }
         qnn.backend_type           = kHtpBackend;
+        qnn.log_level              = kLogLevelDebug;
+        qnn.htp_options.precision  = isQuantized ? kHtpQuantized : kHtpFp16;
         qnn.htp_options.performance_mode =
             static_cast<TfLiteQnnDelegateHtpPerformanceMode>(pm);
         TfLiteDelegate* d = TfLiteQnnDelegateCreate(&qnn);
@@ -455,12 +459,21 @@ Status LiteRtEngine::load(const ModelSpec& spec) {
             return status_ = Status::bad("TfLiteInterpreterOptionsCreate failed");
         }
 
+        static auto tfliteErrorReporter = [](void*, const char* format, va_list args) {
+            char buf[1024];
+            vsnprintf(buf, sizeof(buf), format, args);
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "TFLite internal: %s", buf);
+        };
+        TfLiteInterpreterOptionsSetErrorReporter(opts, tfliteErrorReporter, nullptr);
+
         const int threads = spec.cpuThreads > 0 ? spec.cpuThreads : 1;
         TfLiteInterpreterOptionsSetNumThreads(opts, threads);
 
         std::string delWhy;
+        const std::string mtype = detectModelType(spec.path);
+        const bool isQuant = (mtype == "int8" || mtype == "uint8");
         impl->delegate = buildDelegate(ep_, spec.cacheToken, &delWhy,
-                                         spec.htpPerfMode);
+                                       spec.htpPerfMode, isQuant);
         if (impl->delegate != nullptr) {
             TfLiteInterpreterOptionsAddDelegate(opts, impl->delegate);
             LOGI("LiteRT delegate attached: %s (threads=%d)", activeName_.c_str(), threads);
@@ -549,8 +562,16 @@ Status LiteRtEngine::load(const ModelSpec& spec) {
                                     bool& cf) -> bool {
             if (t == nullptr) return false;
             const int nd = TfLiteTensorNumDims(t);
+            std::vector<int64_t> nonOnes;
+            for (int i = 0; i < nd; ++i) {
+                int64_t d = TfLiteTensorDim(t, i);
+                if (d > 1) nonOnes.push_back(d);
+            }
             int64_t x = 0, y = 0;
-            if (nd >= 3) {
+            if (nonOnes.size() >= 2) {
+                x = nonOnes[nonOnes.size() - 2];
+                y = nonOnes[nonOnes.size() - 1];
+            } else if (nd >= 3) {
                 x = TfLiteTensorDim(t, nd - 2);
                 y = TfLiteTensorDim(t, nd - 1);
             } else if (nd == 2) {
@@ -1106,8 +1127,9 @@ std::vector<Box> LiteRtEngine::run(const FrameView& frame, const Roi& roi) {
 
         // ── Infer ──────────────────────────────────────────────────────────
         const auto tInfer = Clock::now();
-        if (TfLiteInterpreterInvoke(m.interp) != kTfLiteOk) {
-            status_ = Status::bad("TfLiteInterpreterInvoke failed");
+        const TfLiteStatus invokeStatus = TfLiteInterpreterInvoke(m.interp);
+        if (invokeStatus != kTfLiteOk) {
+            status_ = Status::bad("TfLiteInterpreterInvoke failed: code=" + std::to_string(invokeStatus));
             LOGW("%s", status_.message.c_str());
             return none;
         }

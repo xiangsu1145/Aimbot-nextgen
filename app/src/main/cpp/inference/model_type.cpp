@@ -159,10 +159,19 @@ bool detectTfliteInputSize(const std::string& path, int& w, int& h) {
  *  exports ([1,4,A] boxes + [1,nc,A] scores) the caller merges outputs, so
  *  this helper stays single-tensor; see detectTfliteShape for the merge. */
 int tfliteOutputClasses(const TfLiteTensor* out) {
-    if (out == nullptr || out->dims == nullptr || out->dims->size < 3) return 0;
-    const int d1 = out->dims->data[1];
-    const int d2 = out->dims->data[2];
-    const int ch = (d1 < d2) ? d1 : d2;
+    if (out == nullptr || out->dims == nullptr || out->dims->size < 2) return 0;
+    std::vector<int> nonOnes;
+    for (int i = 0; i < out->dims->size; ++i) {
+        if (out->dims->data[i] > 1) nonOnes.push_back(out->dims->data[i]);
+    }
+    int ch = 0;
+    if (nonOnes.size() >= 2) {
+        ch = std::min(nonOnes[0], nonOnes[1]);
+    } else if (out->dims->size >= 3) {
+        const int d1 = out->dims->data[1];
+        const int d2 = out->dims->data[2];
+        ch = (d1 < d2) ? d1 : d2;
+    }
     return (ch > 4) ? (ch - 4) : 0;
 }
 
