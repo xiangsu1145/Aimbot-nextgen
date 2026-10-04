@@ -844,11 +844,18 @@ public:
         } else if (deIsNotVelocity) {
             vel = velFilter_.x;
         } else {
-            float rawVelocity = rawDe + lastOutput_;
+            // ★ 速度重构必须吃原始误差差分（raw − prevRaw_），不能吃 rawDe。
+            // rawDe 来自 OneEuro 滤波后的误差（kErrMinCutoff 1.05Hz ≈ 150ms 时间
+            // 常数）：急停后滤波误差还在走 → v̂ 不归零 → ff 推着过冲（"停下晃"）；
+            // 起步时滤波误差没反应 → v̂ 迟迟为 0 → ff 缺席（"起步肉"）。设备日志
+            // 实测：v̂ 连续 5 帧读 0 而目标每帧动 2~3px。去抖是 P/D 的事，它们的
+            // 输入继续走滤波路径；速度这条路只过 velFilter_ 卡尔曼。
+            const float rawDiff = hasPrevRaw_ ? (raw - prevRaw_) : 0.0f;
+            float rawVelocity = rawDiff + lastOutput_;
             // 近场混合（pid.cpp:762-766）：贴住目标时向 (Δe + 0.5u) 收，
             // 抑制自回声在速度估计里的残余噪声。
             if (absE < 1.0f && absDe < 0.1f) {
-                const float nearZeroVelocity = rawDe + 0.5f * lastOutput_;
+                const float nearZeroVelocity = rawDiff + 0.5f * lastOutput_;
                 rawVelocity = rawVelocity * 0.35f + nearZeroVelocity * 0.65f;
             }
             vel = velFilter_.update(rawVelocity, dt);
