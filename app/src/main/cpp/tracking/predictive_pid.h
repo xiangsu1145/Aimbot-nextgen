@@ -133,20 +133,6 @@ namespace tracking {
 // 废除全局硬编码死值除数，对齐克里斯控制器统一误差尺度（定义 1.0 仅作符号兼容）
 constexpr float kSensFrozen = 1.0f;
 
-/// ★ 自运动补偿的屏幕换算系数（α 的实测值，克里斯接口要求"applied move 以
-/// error-coordinate 单位回报"，pid.h:64）：
-///
-///     rawVelocity = Δe + kAppliedViewScale·u      (屏幕 px/帧)
-///     ff = lookahead · v̂ / kAppliedViewScale      (手指 px)
-///
-/// 证据（设备日志 02:07 崩跑序列）：前馈 0.6 时自激励发散（v̂ 每帧翻倍
-/// 7→14→20，ff 跟涨 4→9→12，误差 62→105），前馈 0.4 可用 →
-/// s = ff·(α−1) 在 0.6 处越过 1、在 0.4 处 <1 → α ∈ (2.7, 3.5)，
-/// 与项目注释的触控比 1:0.3（α≈3.3）吻合，取 3.0。
-/// 稳态时 α 在载波份额中精确对消（v̂=α·u → ff=lookahead·u），DC 份额仍等于
-/// lookahead；kSens 偏大的方向是安全的（s = ff·(1−α/kSens) → lookahead）。
-constexpr float kAppliedViewScale = 3.0f;
-
 /// The output ceiling, finger px/step, applied as a tanh knee so the command
 /// stays linear where it works and saturates where a re-lock would otherwise
 /// fling the finger across the panel. 180 finger px/step at 120 Hz is
@@ -850,32 +836,19 @@ public:
         // lastOutput_ 是 clamp/刹车/平滑之后的最终输出，最接近真实注入量。
         // α=1 假设与克里斯一致（kSensFrozen = 1.0）。
         float vel = 0.0f;
-        // hold 只留给真正的状态跳变帧（reset 已清滤波器，softJump 的 Δe 是跟踪器的）。
-        // ★ measurementCorrected 不能进 hold：控制帧率=检测帧率时每帧都是修正帧，
-        // hold 会变成永久冻结——设备日志实测 v̂ 恒定 1.87 连续 8 帧（滤波器不再
-        // 更新），前馈整体失效。修正踢腿由 velFilter_ 卡尔曼平均吸收（克里斯
-        // 观测器思路：不存在二值的"这帧不是速度"，只有连续的置信度）。
-        const bool deIsNotVelocity = hardReset || softJump;
+        // 跟踪器重关联/目标切换帧：Δe 含修正踢腿而非速度，保持上一帧速度估计
+        // （克里斯语义，aim_section.h 文档本就如此声明，此前活路径从未实现）。
+        const bool deIsNotVelocity = hardReset || softJump || measurementCorrected;
         if (std::fabs(targetVel) > 0.02f) {
             vel = velFilter_.update(targetVel, dt);
         } else if (deIsNotVelocity) {
             vel = velFilter_.x;
         } else {
-            // ★ 速度重构必须吃原始误差差分（raw − prevRaw_），不能吃 rawDe。
-            // rawDe 来自 OneEuro 滤波后的误差（kErrMinCutoff 1.05Hz ≈ 150ms 时间
-            // 常数）：急停后滤波误差还在走 → v̂ 不归零 → ff 推着过冲（"停下晃"）；
-            // 起步时滤波误差没反应 → v̂ 迟迟为 0 → ff 缺席（"起步肉"）。设备日志
-            // 实测：v̂ 连续 5 帧读 0 而目标每帧动 2~3px。去抖是 P/D 的事，它们的
-            // 输入继续走滤波路径；速度这条路只过 velFilter_ 卡尔曼。
-            // 自身输出按 kAppliedViewScale 折算成屏幕像素再加回（α 对消，
-            // 见该常量的注释——这是 0.6 前馈崩跑的根因修复）。
-            const float rawDiff = hasPrevRaw_ ? (raw - prevRaw_) : 0.0f;
-            float rawVelocity = rawDiff + kAppliedViewScale * lastOutput_;
-            // 近场混合（pid.cpp:762-766）：贴住目标时向 (Δe + 0.5α·u) 收，
+            float rawVelocity = rawDe + lastOutput_;
+            // 近场混合（pid.cpp:762-766）：贴住目标时向 (Δe + 0.5u) 收，
             // 抑制自回声在速度估计里的残余噪声。
             if (absE < 1.0f && absDe < 0.1f) {
-                const float nearZeroVelocity =
-                    rawDiff + 0.5f * kAppliedViewScale * lastOutput_;
+                const float nearZeroVelocity = rawDe + 0.5f * lastOutput_;
                 rawVelocity = rawVelocity * 0.35f + nearZeroVelocity * 0.65f;
             }
             vel = velFilter_.update(rawVelocity, dt);
@@ -945,11 +918,11 @@ public:
         }
 
         // ── 4. 前馈项 FF（真正物理跟枪载波，克里斯 lookahead 结构）─────────────
-        // v̂ 已是屏幕 px/帧（重构含 α 倍自运动补偿），除回 kAppliedViewScale 换算
-        // 成手指 px。稳态咬住时 v̂=α·u_ss → ff = lookahead·u_ss，恰好扛起
-        // lookahead 份额的载波，剩余 (1−lookahead) 由 P+I 补——积分只是残料清扫。
+        // 速度重构已含自运动补偿，v̂ 就是目标真实速度（screen px/帧 ≈ finger px/帧）。
+        // 稳态咬住时 v̂ = u_ss，ff = lookahead·u_ss，恰好扛起 lookahead 份额的
+        // 载波，剩余 (1−lookahead) 由 P+I 补——积分从此只是残料清扫。
         // 旧版 ×2.5 系数是为 dNorm 低估打的补丁，真速度下不再需要，已移除。
-        float ff = lookahead_ * vel / kAppliedViewScale;
+        float ff = lookahead_ * vel;
         if (frozen || (absE < 0.8f && std::fabs(vel) < 0.25f)) {
             ff *= std::clamp(absE / 0.8f, 0.0f, 1.0f);
         }
