@@ -429,6 +429,16 @@ constexpr float kIntegralDiffScale   = 3.0f;
 constexpr float kIntegralScaleFloor = 0.25f;
 constexpr float kIntegralTrustCut   = 0.65f;
 
+/// ★ 克里斯远场累加封顶（等效于其 iGain 远场抑制，pid.cpp:1185-1190）：
+/// 积分累加把 e 折算为 min(|e|, 50)，远场累加速率被钉在 50·ki/帧且与 e 无关，
+/// 大误差想充也充不大——配合下面的输出近场门控，根治远场拉枪的积分充能飞出。
+constexpr float kIntegralAccCapPx = 50.0f;
+/// ★ 克里斯输出近场门控（pid.cpp:219-224）：
+/// integralScale = 0.25 + 0.75·e^{−|e|/12}·√(e^{−|e|/12})
+/// 积分状态可以蓄，但到达输出的份额在远处只有 25%，贴近目标全额放行。
+/// ki 因此可以保持高值（近场刚度高、不滞后），又不会在远场推飞准星。
+constexpr float kIntegralNearGateErrScale = 12.0f;
+
 // ── The integral ───────────────────────────────────────────────────────────
 
 /// Per-frame leak. At 120 Hz this is a **0.16 s** time constant (19 frames), so
@@ -818,14 +828,30 @@ public:
         }
         const float dNormForD = deD * (kNominalDt / dt);
 
-        // ★ 核心根本重构：真实目标速度提取
-        // 彻底根除将自身上一帧输出 uDelayed 反向加回输入的自激回路（那是闭环正反馈自激弹簧的唯一根源）！
-        // 优先直接使用 Kalman Tracker 独立解算的目标物理速度 targetVel；若未提供则使用微分 dNorm
+        // ★ 克里斯控制器速度重构（D:\克里斯控制器\pid.cpp:751-766）：
+        //     rawVelocity = errorDiff + lastOutput_
+        // 误差导数里混着自身引起的运动，加回上一帧实际派发的位移后剩下的才是
+        // 目标真实速度。拉静止目标: Δe=−u, +u → v̂≈0，前馈不捣乱（治"甩飞"）；
+        // 咬住移动目标: Δe≈0, +u → v̂=u_ss，前馈瞬时扛起载波（治"降ki滞后"）。
+        // lastOutput_ 是 clamp/刹车/平滑之后的最终输出，最接近真实注入量。
+        // α=1 假设与克里斯一致（kSensFrozen = 1.0）。
         float vel = 0.0f;
+        // 跟踪器重关联/目标切换帧：Δe 含修正踢腿而非速度，保持上一帧速度估计
+        // （克里斯语义，aim_section.h 文档本就如此声明，此前活路径从未实现）。
+        const bool deIsNotVelocity = hardReset || softJump || measurementCorrected;
         if (std::fabs(targetVel) > 0.02f) {
             vel = velFilter_.update(targetVel, dt);
+        } else if (deIsNotVelocity) {
+            vel = velFilter_.x;
         } else {
-            vel = velFilter_.update(dNorm, dt);
+            float rawVelocity = rawDe + lastOutput_;
+            // 近场混合（pid.cpp:762-766）：贴住目标时向 (Δe + 0.5u) 收，
+            // 抑制自回声在速度估计里的残余噪声。
+            if (absE < 1.0f && absDe < 0.1f) {
+                const float nearZeroVelocity = rawDe + 0.5f * lastOutput_;
+                rawVelocity = rawVelocity * 0.35f + nearZeroVelocity * 0.65f;
+            }
+            vel = velFilter_.update(rawVelocity, dt);
         }
         if (std::fabs(vel) < 0.15f) vel = 0.0f;
         velNow_  = vel;
@@ -856,46 +882,47 @@ public:
             dT = 0.0f;
         }
 
-        // ── 3. 积分项 I（平滑稳态残差微调）───────────────────────────────────
-        // 仅作微小稳态静差清除，平滑自然衰减，严禁过零断电硬切断。
-        // ★ 变号泄放 + 近距微抖区冻结：自 4c94f4a 存档点的 updateIntegral 原样
-        // 移植回活路径——误差变号（已越过目标）时电荷是向外推的能量，按运动
-        // 状态泄放；|e|<3px 且无真实运动的微抖区冻结累加，防静止积分抖动。
+        // ── 3. 积分项 I（纯残料清扫，克里斯三重护栏）─────────────────────────
+        // 前馈已扛起载波（速度重构含自运动补偿），积分从此只清稳态残差。
+        // ★ 护栏一（pid.cpp:1391-1394 prepareIntegralForError）：变号硬清零。
+        //   过零电荷是纯外推能量，直接排空——旧版"运动中保留 70~95%"的软泄放
+        //   是载波缺失时代防断崖失速的补丁，载波修复后不再需要，它是极限环续命源。
+        // ★ 护栏二（pid.cpp:1185 iGain 远场抑制的等效写法）：远场累加封顶，
+        //   累加速率 = min(|e|,50)·ki，与大误差无关。
+        // ★ 护栏三（pid.cpp:219-224 integralScale）：输出近场门控，远处只放行
+        //   25%，贴近目标全额——ki 可以保持高值而不飞。
         float iOut = 0.0f;
         if (ki_ > 1e-4f && !frozen) {
             if (integral_ != 0.0f && e != 0.0f && !sameSign(e, integral_)) {
-                const float motion = clamp01(std::fabs(velNow_) / 0.35f);
-                if (motion > 0.3f && absE < 3.0f) {
-                    integral_ *= (0.70f + 0.25f * motion);
-                } else {
-                    integral_ *= 0.25f;
-                    if (std::fabs(integral_) < 0.05f) integral_ = 0.0f;
-                }
+                integral_ = 0.0f;
             }
             if (absE < 3.0f && absDe < 2.0f) {
+                // 近距微抖区：冻结累加并温和泄电（保留原有机制）
                 integral_ *= 0.88f;
             } else {
                 if (integral_ != 0.0f) {
                     integral_ *= 0.94f;
                 }
-                // ki 直进：滑块标称值即实际生效值（参数不撒谎）。静止不抖由
-                // 上面的微抖区负责，甩出由过冲方向抑制（变号即排空）与相对
-                // 限幅负责——不在积分增益里藏衰减系数。
-                integral_ += e * ki_ * dtScale;
+                const float eAcc = std::copysign(
+                    std::fmin(absE, kIntegralAccCapPx), e);
+                integral_ += eAcc * ki_ * dtScale;
             }
             const float iCap = std::fmin(30.0f, std::fmax(2.0f, absE * 0.5f));
             integral_ = clampRange(integral_, -iCap, iCap);
-            iOut = integral_;
+            const float nearGate = std::exp(-absE / kIntegralNearGateErrScale);
+            const float integralScale =
+                0.25f + 0.75f * nearGate * std::sqrt(nearGate);
+            iOut = integral_ * integralScale;
         } else {
             integral_ *= 0.80f;
         }
 
-        // ── 4. 前馈项 FF（真正物理跟枪载波）──────────────────────────────────
-        // 游戏触控中手指像素与屏幕转动比通常为 1:0.3，因此前馈增益乘上 2.5 换算系数，
-        // 确保敌人以 600px/s 奔跑时，自瞄前馈能够直接输出同等速度的手指位移，实现无延迟咬住！
-        // 目标一旦停下，targetVel 瞬间归零，前馈瞬间为 0，物理上杜绝任何惯性推移过冲！
-        constexpr float kVelCarrierGain = 2.5f;
-        float ff = lookahead_ * vel * kVelCarrierGain;
+        // ── 4. 前馈项 FF（真正物理跟枪载波，克里斯 lookahead 结构）─────────────
+        // 速度重构已含自运动补偿，v̂ 就是目标真实速度（screen px/帧 ≈ finger px/帧）。
+        // 稳态咬住时 v̂ = u_ss，ff = lookahead·u_ss，恰好扛起 lookahead 份额的
+        // 载波，剩余 (1−lookahead) 由 P+I 补——积分从此只是残料清扫。
+        // 旧版 ×2.5 系数是为 dNorm 低估打的补丁，真速度下不再需要，已移除。
+        float ff = lookahead_ * vel;
         if (frozen || (absE < 0.8f && std::fabs(vel) < 0.25f)) {
             ff *= std::clamp(absE / 0.8f, 0.0f, 1.0f);
         }
