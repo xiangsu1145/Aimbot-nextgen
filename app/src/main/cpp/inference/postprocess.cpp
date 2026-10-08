@@ -166,22 +166,42 @@ std::vector<Box> decode(const OutputTensor& t, const PostprocessConfig& cfg,
         if (bestScore < cfg.confidence) continue;
         if (!classWanted(cfg, bestCls)) continue;
 
-        float cx = r.at(i, 0);
-        float cy = r.at(i, 1);
-        float bw = r.at(i, 2);
-        float bh = r.at(i, 3);
+        float cx = 0.0f, cy = 0.0f, bw = 0.0f, bh = 0.0f;
+        if (cfg.boxXyxy) {
+            float x1 = r.at(i, 0);
+            float y1 = r.at(i, 1);
+            float x2 = r.at(i, 2);
+            float y2 = r.at(i, 3);
+            if (cfg.inputW > 0 && cfg.inputH > 0 && x1 <= 1.5f && x2 <= 1.5f) {
+                x1 *= static_cast<float>(cfg.inputW);
+                y1 *= static_cast<float>(cfg.inputH);
+                x2 *= static_cast<float>(cfg.inputW);
+                y2 *= static_cast<float>(cfg.inputH);
+            }
+            cx = (x1 + x2) * 0.5f;
+            cy = (y1 + y2) * 0.5f;
+            bw = x2 - x1;
+            bh = y2 - y1;
+        } else {
+            cx = r.at(i, 0);
+            cy = r.at(i, 1);
+            bw = r.at(i, 2);
+            bh = r.at(i, 3);
 
-        // Match the old project's normalizeIfNeeded(): TFLite/YOLOv8 exports
-        // frequently emit normalized (0..1) coordinates. Treat a small cx,cy
-        // (<= 1.5) as normalized and scale back to input pixels, otherwise
-        // assume the values are already pixels. Without this the boxes land in
-        // the top-left at ~1px because 0.5 is taken for half a pixel.
-        if (cfg.inputW > 0 && cfg.inputH > 0 && cx <= 1.5f && cy <= 1.5f) {
-            cx *= static_cast<float>(cfg.inputW);
-            cy *= static_cast<float>(cfg.inputH);
-            bw *= static_cast<float>(cfg.inputW);
-            bh *= static_cast<float>(cfg.inputH);
+            // Match the old project's normalizeIfNeeded(): TFLite/YOLOv8 exports
+            // frequently emit normalized (0..1) coordinates. Treat a small cx,cy
+            // (<= 1.5) as normalized and scale back to input pixels, otherwise
+            // assume the values are already pixels. Without this the boxes land in
+            // the top-left at ~1px because 0.5 is taken for half a pixel.
+            if (cfg.inputW > 0 && cfg.inputH > 0 && cx <= 1.5f && cy <= 1.5f) {
+                cx *= static_cast<float>(cfg.inputW);
+                cy *= static_cast<float>(cfg.inputH);
+                bw *= static_cast<float>(cfg.inputW);
+                bh *= static_cast<float>(cfg.inputH);
+            }
         }
+
+        if (bw <= 0.0f || bh <= 0.0f) continue;
 
         Box box;
         box.score = bestScore;

@@ -27,6 +27,7 @@
 #include "tracking/tuning_server.h"
 #include "tracking/recoil_profile.h"
 #include "ui/gui/sections/recoil_section.h"
+#include "tracking/crosshair_recoil.h"
 
 namespace aimbotng {
 namespace ui {
@@ -376,7 +377,7 @@ float g_detAgeMs = -1.0f;
 
 static void driveAimToTarget(TouchAimState& st, int slot,
                              const ImVec2& target, const ImVec2& rawTarget,
-                             const ImVec2& screenCenter,
+                             const ImVec2& crosshairPos,
                              const ImGuiIO& io, float dzXPx, float dzYPx,
                              float yDzPx,
                              float physDeltaX, float physDeltaY,
@@ -403,7 +404,7 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     // old code's bug: a target oscillating along X keeps popping OUTSIDE the
     // circle even when Y is at rest, dragging X onto the target centre.  Per-axis
     // freezing holds whichever axis is already inside its band.  The reference is
-    // the SCREEN CENTRE (the crosshair), not the live finger.
+    // the REAL CROSSHAIR (or screen centre on fallback), not the live finger.
     //
     // ROUND 17: the error that DRIVES the controller and the error that DECIDES
     // the freeze are now deliberately two different numbers. `dex/dey` are the
@@ -424,10 +425,10 @@ static void driveAimToTarget(TouchAimState& st, int slot,
     const float effectiveTargetY = target.y + rdyRecoil;
     const float effectiveRawTargetY = rawTarget.y + rdyRecoil;
 
-    const float dex = target.x - screenCenter.x;
-    const float dey = effectiveTargetY - screenCenter.y;
-    const float rdx = rawTarget.x - screenCenter.x;
-    const float rdy = effectiveRawTargetY - screenCenter.y;
+    const float dex = target.x - crosshairPos.x;
+    const float dey = effectiveTargetY - crosshairPos.y;
+    const float rdx = rawTarget.x - crosshairPos.x;
+    const float rdy = effectiveRawTargetY - crosshairPos.y;
     const bool xInDz  = dzXPx > 0.0f && rdx * rdx <= dzXPx * dzXPx;
     const bool yInDz  = dzYPx > 0.0f && rdy * rdy <= dzYPx * dzYPx;
     const bool yInYFollow = yDzPx > 0.0f && rdy * rdy <= yDzPx * yDzPx;
@@ -1858,6 +1859,14 @@ static void syncAimPageInner() {
     // overlay was moved. The touch area is only the synthetic finger's HOME
     // (press/move point).
     const ImVec2 screenCenter(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+    ImVec2 realCrosshair = screenCenter;
+    float chX = 0.0f, chY = 0.0f;
+    if (g_pageRecoil.enabled.value &&
+        g_pageRecoil.mode.value == PageRecoil::kModeCrosshair &&
+        g_pageRecoil.xTrack.value &&
+        crosshair::getCrosshairPosition(chX, chY)) {
+        realCrosshair = ImVec2(chX, chY);
+    }
 
     ImVec2 target(0, 0);
     float targetW = 0.0f, targetH = 0.0f;
@@ -1934,27 +1943,23 @@ static void syncAimPageInner() {
             hasTarget  = true;
         } else {
             // Not currently locking any target, or the locked target expired.
-            // Pick the nearest target: pass 0 = live tracks, pass 1 = lost tracks.
-            for (int pass = 0; pass < 2 && !hasTarget; ++pass) {
-                const bool wantLost = (pass == 1);
-                for (const auto& t : tracks) {
-                    if (!t.confirmed) continue;
-                    if (t.lost != wantLost) continue;
-                    if (!p.aimCategory.isClassSelected(t.cls)) continue;
-                    const float dx = t.cx - screenCenter.x;
-                    const float dy = t.cy - screenCenter.y;
-                    const float dSq = dx * dx + dy * dy;
-                    if (dSq >= bestDistSq) continue;
-                    bestDistSq = dSq;
-                    target     = ImVec2(t.cx, t.cy);
-                    bestVelX   = t.vx;
-                    bestVelY   = t.vy;
-                    targetW    = t.w;
-                    targetH    = t.h;
-                    bestCls    = t.cls;
-                    bestId     = t.id;
-                    hasTarget  = true;
-                }
+            // Pick the nearest confirmed target to the crosshair.
+            for (const auto& t : tracks) {
+                if (!t.confirmed) continue;
+                if (!p.aimCategory.isClassSelected(t.cls)) continue;
+                const float dx = t.cx - realCrosshair.x;
+                const float dy = t.cy - realCrosshair.y;
+                const float dSq = dx * dx + dy * dy;
+                if (dSq >= bestDistSq) continue;
+                bestDistSq = dSq;
+                target     = ImVec2(t.cx, t.cy);
+                bestVelX   = t.vx;
+                bestVelY   = t.vy;
+                targetW    = t.w;
+                targetH    = t.h;
+                bestCls    = t.cls;
+                bestId     = t.id;
+                hasTarget  = true;
             }
         }
     }
@@ -2232,7 +2237,7 @@ static void syncAimPageInner() {
                 // the anchor was taken, and passing a delta here would double-count
                 // the very movement that put it inside the box.
                 driveAimToTarget(p.touchAim, slot, target, rawTarget,
-                                 screenCenter, io, dzXPx, dzYPx, yDzPx,
+                                 realCrosshair, io, dzXPx, dzYPx, yDzPx,
                                  0.0f, 0.0f, targetChanged, freshDetections);
                 return;
             }
@@ -2299,14 +2304,14 @@ static void syncAimPageInner() {
             return;
         }
         driveAimToTarget(p.touchAim, p.touchAim.slot, target, rawTarget,
-                         screenCenter, io, dzXPx, dzYPx, yDzPx,
+                         realCrosshair, io, dzXPx, dzYPx, yDzPx,
                          physDeltaX, physDeltaY, targetChanged, freshDetections);
         return;
     }
 
     // Synthetic finger path (fusion OFF, or fusion ON with no finger in the box).
     driveAimToTarget(p.touchAim, p.touchAim.slot, target, rawTarget,
-                     screenCenter, io, dzXPx, dzYPx, yDzPx,
+                     realCrosshair, io, dzXPx, dzYPx, yDzPx,
                      physDeltaX, physDeltaY, targetChanged, freshDetections);
 
     // Drag safety (synthetic only): if the finger has travelled too far from its

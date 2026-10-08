@@ -117,6 +117,9 @@ struct ModelSpec {
     /// layer and the menu layer never share the QNN header.
     int   htpPerfMode = 1;     // default: Sustained High Performance
 
+    /// True when the model outputs [x1, y1, x2, y2] rather than [cx, cy, w, h].
+    bool boxXyxy = false;
+
     /// Per-model scratch key. Engines that compile a graph on the device —
     /// QNN HTP is the one that matters — cache the compiled artifact under
     /// this name, so a warm launch skips a compile measured in seconds.

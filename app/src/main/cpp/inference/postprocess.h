@@ -79,6 +79,9 @@ struct PostprocessConfig {
     /// with scores near 0.5 for everything, which is why it is a field and not
     /// a guess.
     bool applySigmoid = false;
+    /// Whether the raw box output is [x1, y1, x2, y2] corners rather than
+    /// [cx, cy, w, h] center+size.
+    bool boxXyxy = false;
 
     /// Drop boxes whose class is not in this set when non-empty. Empty means
     /// keep everything. Used by the auto-aim layer to want only players, and

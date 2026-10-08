@@ -679,6 +679,7 @@ Status LiteRtEngine::load(const ModelSpec& spec) {
             impl->post.numClasses);
         impl->post.confidence = std::clamp(spec.confidence, 0.01f, 0.99f);
         impl->post.iou = std::clamp(spec.iou, 0.05f, 0.95f);
+        impl->post.boxXyxy = spec.boxXyxy;
         impl->confidence.store(impl->post.confidence, std::memory_order_relaxed);
 
         if (impl->anchors <= 0 || impl->post.numClasses <= 0) {

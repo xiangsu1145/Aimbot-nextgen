@@ -471,6 +471,7 @@ Status NcnnEngine::load(const ModelSpec& spec) {
     impl->post.numClasses = (impl->channels > 4) ? (impl->channels - 4) : 1;
     impl->post.confidence = spec.confidence;
     impl->post.iou = (spec.iou > 0.0f) ? spec.iou : 0.45f;
+    impl->post.boxXyxy = spec.boxXyxy;
     impl->post.inputW = edge;
     impl->post.inputH = edge;
     impl->post.maxDetections = 64;

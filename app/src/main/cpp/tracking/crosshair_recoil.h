@@ -21,16 +21,6 @@
 namespace aimbotng {
 namespace crosshair {
 
-struct Params {
-    float kp   = 4.0f;   // P: finger px/s per screen px of error (before gain)
-    float ki   = 1.5f;   // I
-    float kd   = 0.8f;   // D
-    float gain = 1.0f;   // finger px of travel per screen px of error
-};
-
-void setParams(const Params& p);
-Params params();
-
 // ── Sampling ────────────────────────────────────────────────────────────────
 /// Starts a 1.5 s colour sample that will be saved as `<name>`. Returns false
 /// (with `err`) when the name is unusable or a sample is already running.
@@ -54,20 +44,37 @@ int  configCount();
 std::vector<std::string> configNames();
 bool deleteConfig(const std::string& name);
 
-// ── Tracking / control ──────────────────────────────────────────────────────
+// ── Tracking ────────────────────────────────────────────────────────────────
 void setTracking(bool on);
 bool tracking();
 
-/// One control tick. When firing, accumulates the PID's output into
-/// `accX/accY` (the burst-so-far finger displacement, for the view-offset and
-/// own-contact carriers) and reports this frame's increment in `dx/dy`.
-/// When not firing, resets the burst. Returns true when compensation is live.
-bool tick(float dt, bool firing, float& accX, float& accY, float& dx, float& dy);
+/// Master-gated tracking pump: grabs frames and runs localized ROI detection
+/// only if recoil master switch is ON, mode is Crosshair, and tracking is ON.
+void pumpTracking(bool enabled);
 
-/// Whether frames must keep flowing (sampling or tracking active).
+/// Resets tracking state (e.g. when disabled or switching modes).
+void resetTracking();
+
+/// Returns true and outputs the real crosshair position in screen coordinates
+/// when crosshair tracking has locked onto the crosshair.
+bool getCrosshairPosition(float& screenX, float& screenY);
+
+/// Compatibility stub: crosshair mode does not drive finger displacement;
+/// the aimbot uses getCrosshairPosition directly.
+inline bool tick(float dt, bool firing, float& accX, float& accY, float& dx, float& dy) {
+    (void)dt; (void)firing;
+    accX = accY = dx = dy = 0.0f;
+    return false;
+}
+
+/// Whether frames must keep flowing (sampling or active tracking).
 bool wantsFrames();
 
 // ── Preview ─────────────────────────────────────────────────────────────────
+/// Actively grabs a frame and detects crosshairs for the preview widget
+/// even when in-game tracking is off.
+void pumpPreview();
+
 struct Preview {
     bool  found = false;
     float fx = 0.0f, fy = 0.0f;    // crosshair position in frame coords

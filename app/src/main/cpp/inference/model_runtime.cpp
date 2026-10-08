@@ -213,6 +213,10 @@ ModelSpec toSpec(const model::Entry& e) {
     spec.cpuThreads = e.cpuThreads;   // ONNX Runtime intra-op threads (1–8)
     spec.htpPerfMode = e.htpPerfMode;  // HTP performance-mode vote (QNN only)
     spec.cacheToken = model::baseName(e.path);
+    // Auto-detect xyxy box coordinate format from path or name
+    std::string s = e.path + " " + e.name;
+    for (char& c : s) c = static_cast<char>(std::tolower(c));
+    spec.boxXyxy = (s.find("xyxy") != std::string::npos);
     return spec;
 }
 

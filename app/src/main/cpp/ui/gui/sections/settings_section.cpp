@@ -16,6 +16,7 @@
 #include "ui/gui/aimbot_ui.h"
 #include "ui/gui/hud.h"
 #include "ui/gui/notify.h"
+#include "ui/gui/sections/capture_section.h"
 #include "ui/gui/theme.h"
 #include "tracking/kalman_tracker.h"
 
@@ -412,9 +413,28 @@ void syncSettingsPage() {
     const bool haveModel = model::loadedId() > 0;
     const bool wants     = holdToInferHeld() && haveModel;
 
+    // 手指按住推理区域但未选择模型时给出明确提示
+    if (holdToInferHeld() && !haveModel) {
+        static bool s_warnedNoModel = false;
+        if (!s_warnedNoModel) {
+            s_warnedNoModel = true;
+            notify::warn("infer.nomodel", "未加载模型，请先在模型页面选择模型", 4.0f);
+        }
+    } else if (!holdToInferHeld()) {
+        static bool s_warnedNoModel = false;
+        s_warnedNoModel = false;
+    }
+
     if (wants != lastWants) {
         lastWants = wants;
         if (wants) {
+            // 用户按住推理区域：若截图开关未开启，自动开启截图并发送 notification
+            if (!g_pageCapture.enabled.value) {
+                g_pageCapture.enabled.value = true;
+                capture::setEnabled(true);
+                notify::info("capture.auto", "推理需要画面，已自动开启截图", 4.0f);
+            }
+
             // The compile, if one is owed. Idempotent and returns immediately,
             // so calling it on the edge costs a compare-exchange on the common
             // (already-prepared) path. The toast it raises is what tells the
@@ -426,22 +446,6 @@ void syncSettingsPage() {
             // records the intent, and prepare() applies it on completion. That
             // is what makes the first press work instead of requiring a second.
             infer::runtime::arm();
-
-            // The other half of "holding does nothing": frames. Inference with
-            // no frame source runs on a stale frame and reports the same boxes
-            // forever, which reads as a detector that is stuck. Say so, once,
-            // rather than letting the user work it out.
-            //
-            // The question has to be `enabled()` — the menu's capture switch —
-            // and NOT `consuming()`. consuming() is `wantsPreview || wantsInfer`
-            // (see aimbot_ui.cpp, where the renderer publishes it), so the
-            // moment this very branch calls arm() the "wantsInfer" half becomes
-            // true and consuming() reads true regardless of the switch. The
-            // warning would never fire on the only path that can reach it.
-            if (!capture::enabled()) {
-                notify::warn("infer.noframes",
-                             "请先开启截图否则无法推理", 5.0f);
-            }
         } else {
             infer::runtime::disarm();
         }

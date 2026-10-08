@@ -148,7 +148,12 @@ struct PageRecoil {
     widgets::SwitchState flipX{false};
     widgets::SwitchState flipY{false};
 
-    // ── Overlays ────────────────────────────────────────────────────────────
+    // ── Triggers & Overlays ─────────────────────────────────────────────────
+    /// Continuous trigger switch (持续触发) — defaults to true.
+    /// When on, recoil activates continuously; when off, the "触发区域" switch
+    /// is shown and recoil only activates when touching the trigger area circle.
+    widgets::SwitchState continuousTrigger{true};
+
     widgets::SwitchState fireToggle{false};
     RecoilFireArea       fire;
 
@@ -161,13 +166,6 @@ struct PageRecoil {
     widgets::SwitchState editVertical{false};
 
     // ── 准心识别 mode knobs ─────────────────────────────────────────────────
-    /// Simple PID on the crosshair-to-target error, plus the screen-px →
-    /// finger-px conversion the closed loop needs (game sensitivity lives
-    /// outside the daemon, so it comes in as this gain).
-    widgets::SliderState xKp{4.0f, 0.0f, 15.0f, 0.1f};
-    widgets::SliderState xKi{1.5f, 0.0f,  8.0f, 0.05f};
-    widgets::SliderState xKd{0.8f, 0.0f,  6.0f, 0.05f};
-    widgets::SliderState xGain{1.0f, 0.1f, 5.0f, 0.05f};
     /// The crosshair tracking switch (准心追踪).
     widgets::SwitchState xTrack{false};
 

@@ -75,19 +75,36 @@ inline bool matches(const ColorRange& c, int H, int S, int V) {
 
 // Builds a range from one sampled HSV, mirrors 配置由采样设置().
 inline void rangeFromSample(int H, int S, int V, ColorRange& c,
-                            int hTol = 10, int svSlack = 50) {
+                            int hTol = 7, int svSlack = 60) {
     if (S < 30) {
-        // Grey/white crosshair: H is meaningless, keep the full wheel and lean
-        // on V alone (the sampler refuses these anyway — see recoil module).
+        // Grey/white crosshair
         c.hLo = 0; c.hHi = 179;
+        c.sLo = 0; c.sHi = std::min(255, S + svSlack);
     } else {
-        int lo = H - hTol, hi = H + hTol;
-        if (lo < 0)      { c.hLo = lo + 180; c.hHi = hi; }
-        else if (hi > 179){ c.hLo = lo;      c.hHi = hi - 180; }
-        else             { c.hLo = lo;       c.hHi = hi; }
+        const bool isRed = (H <= 12 || H >= 168);
+        const int actualHTol = isRed ? 6 : std::min(hTol, 7);
+        int lo = H - actualHTol, hi = H + actualHTol;
+        if (lo < 0)       { c.hLo = lo + 180; c.hHi = hi; }
+        else if (hi > 179){ c.hLo = lo;       c.hHi = hi - 180; }
+        else              { c.hLo = lo;       c.hHi = hi; }
+
+        if (isRed) {
+            // 严格限制红色上界 <= 11，彻底杜绝混入黄色/橙色（黄色起始为 H >= 23）。
+            // 下界限制 >= 169。
+            if (c.hHi > 11 && c.hHi < 100) c.hHi = 11;
+            if (c.hLo < 169 && c.hLo > 100) c.hLo = 169;
+            // 白墙背景适配：
+            // 红色准星（无论是纯色还是“中间白外圈红”）在白墙背景上，因抗锯齿或半透明与白色混合，
+            // 边缘饱和度 S 会降低至 35~60。白墙本身 S < 15。
+            // 将 sLo 下限定为 35，既能稳定锁住白墙上的红准星，又绝不误识白墙。
+            c.sLo = 35;
+        } else {
+            c.sLo = std::max(40, S - svSlack);
+        }
+        c.sHi = 255;
     }
-    c.sLo = std::max(0, S - svSlack); c.sHi = std::min(255, S + svSlack);
-    c.vLo = std::max(0, V - svSlack); c.vHi = std::min(255, V + svSlack);
+    c.vLo = std::max(50, V - svSlack);
+    c.vHi = 255;
 }
 
 // ── 方案一: pure HSV centroid ────────────────────────────────────────────────
@@ -109,8 +126,15 @@ inline Result byColor(const uint8_t* rgba, int w, int h, int stride,
     for (int y = y0; y < y1; ++y) {
         const uint8_t* row = rgba + (size_t)y * stride + (size_t)x0 * 4;
         for (int x = x0; x < x1; ++x, row += 4) {
+            const int r_c = row[0], g_c = row[1], b_c = row[2];
+            const int M = std::max(r_c, std::max(g_c, b_c));
+            if (M < cfg.vLo || M > cfg.vHi) continue;
+            const int m_c = std::min(r_c, std::min(g_c, b_c));
+            const int delta = M - m_c;
+            if (255 * delta < cfg.sLo * M) continue;
+
             int H, S, V;
-            rgb2hsv(row[0], row[1], row[2], H, S, V);
+            rgb2hsv(r_c, g_c, b_c, H, S, V);
             if (matches(cfg, H, S, V)) { sx += x; sy += y; ++n; }
         }
     }
@@ -222,28 +246,36 @@ inline double componentScore(const Component& c,
     double sSize = 1.0;
     if (expectPix > 0) {
         const double ratio = (double)c.pix / (double)expectPix;
-        if (ratio < 0.3 || ratio > 2.0) return 0.0;
+        // 白墙背景适配：在白墙上部分抗锯齿边缘红色变淡，通过像素可能减少至原来的 15%，
+        // 放宽比例下限至 0.12，避免白墙上直接返回 0 分导致漏检
+        if (ratio < 0.12 || ratio > 3.5) return 0.0;
         const double dev = (ratio >= 1.0) ? (ratio - 1.0) : (1.0 - ratio);
-        sSize = 1.0 - dev * 0.5;
+        sSize = 1.0 - std::min(0.5, dev * 0.25);
     }
     const int bw = c.w(), bh = c.h();
     if (bw <= 0 || bh <= 0) return 0.0;
     const double ar = (double)std::min(bw, bh) / (double)std::max(bw, bh);
     const double s2 = 0.3 + 0.7 * ar;
     const double fill = (double)c.pix / (double)(bw * bh);
-    if (expectPix > 0 && bw * bh >= 25 && fill > 0.65) return 0.0;
-    double s3;
-    if (fill <= 0.5)       s3 = 1.0;
-    else if (fill >= 0.95) s3 = 0.0;
-    else                   s3 = 1.0 - (fill - 0.5) / 0.45;
+    // 适配纯色准星（如实心红点）：实心圆形/方块准星 fill 在 0.75~1.0 之间，
+    // 原先 fill > 0.65 直接 return 0 会导致纯色实心准星被 100% 拒绝。
+    // 这里允许高 fill 正常得分。
+    double s3 = 1.0;
+    if (fill > 0.85) {
+        s3 = 0.85; // 实心圆/方块准星赋予良好得分
+    } else if (fill > 0.5) {
+        s3 = 1.0 - (fill - 0.5) / 0.70;
+    }
     const double dx = (double)c.cx() - ex, dy = (double)c.cy() - ey;
     const double dist = std::sqrt(dx * dx + dy * dy);
     const double maxDist = radius * 1.2;
     const double s4 = (dist <= maxDist) ? (1.0 - dist / maxDist) : 0.0;
-    return sSize * (0.15 * s2 + 0.30 * s3 + 0.25 * s4 + 0.30);
+    return sSize * (0.20 * s2 + 0.25 * s3 + 0.25 * s4 + 0.30);
 }
 
-// Cluster position: best component, widened by any nearby non-noise sibling.
+// Cluster position: best component, widened by nearby siblings (same reticle ring/cross).
+// 对纯色准星或“中间白色周围红色”准星，包围盒中心 (cl+cr)*0.5f, (ct+cb)*0.5f
+// 均精准指向红圈/轮廓正中心的真实瞄准点（即白色点中心）。
 inline void clusterPos(const std::vector<Component>& list, int bestIdx,
                        int minPix, float& ox, float& oy) {
     const Component& best = list[bestIdx];
@@ -253,19 +285,25 @@ inline void clusterPos(const std::vector<Component>& list, int bestIdx,
     for (size_t i = 0; i < list.size(); ++i) {
         if ((int)i == bestIdx) continue;
         if (list[i].pix < noise) continue;
+        // 严格空间约束：仅合并与 best 相距在 18px 以内的同属结构（如同一准星光圈的断续孤岛或准星分叉），
+        // 严禁将远处背景/火花/敌方标点合并进来，防止把准星坐标拉飞
+        const float cdx = std::abs(list[i].cx() - best.cx());
+        const float cdy = std::abs(list[i].cy() - best.cy());
+        if (cdx > 18.0f || cdy > 18.0f) continue;
+
         cl = std::min(cl, list[i].l); cr = std::max(cr, list[i].r);
         ct = std::min(ct, list[i].t); cb = std::max(cb, list[i].b);
         ++members;
     }
-    if (members >= 2) { ox = (cl + cr) * 0.5f; oy = (ct + cb) * 0.5f; }
-    else              { ox = best.cx();        oy = best.cy(); }
+    ox = (cl + cr) * 0.5f;
+    oy = (ct + cb) * 0.5f;
 }
 
 inline Result byFeature(const uint8_t* rgba, int w, int h, int stride,
                         const ColorRange& cfg,
                         int cx = -1, int cy = -1, int radiusCover = -1,
-                        int maxPix = 120, double mergeDist = 8.0,
-                        double scoreGate = 0.65) {
+                        int maxPix = 160, double mergeDist = 12.0,
+                        double scoreGate = 0.40) {
     Result r;
     r.x = w * 0.5f; r.y = h * 0.5f;
     if (rgba == nullptr || w <= 0 || h <= 0) return r;
@@ -295,8 +333,15 @@ inline Result byFeature(const uint8_t* rgba, int w, int h, int stride,
         const uint8_t* row = rgba + (size_t)(y0 + y) * stride + (size_t)x0 * 4;
         uint8_t* mrow = mask.data() + (size_t)y * mw;
         for (int x = 0; x < mw; ++x, row += 4) {
+            const int r_c = row[0], g_c = row[1], b_c = row[2];
+            const int M = std::max(r_c, std::max(g_c, b_c));
+            if (M < cfg.vLo || M > cfg.vHi) continue;
+            const int m_c = std::min(r_c, std::min(g_c, b_c));
+            const int delta = M - m_c;
+            if (255 * delta < cfg.sLo * M) continue;
+
             int H, S, V;
-            rgb2hsv(row[0], row[1], row[2], H, S, V);
+            rgb2hsv(r_c, g_c, b_c, H, S, V);
             if (matches(cfg, H, S, V)) {
                 mrow[x] = 1;
                 sx += x0 + x; sy += y0 + y; ++n;
@@ -330,8 +375,8 @@ inline Result byFeature(const uint8_t* rgba, int w, int h, int stride,
 inline Result multi(const uint8_t* rgba, int w, int h, int stride,
                     const std::vector<ColorRange>& cfgs,
                     int cx = -1, int cy = -1, int radiusCover = -1,
-                    int maxPix = 120, double mergeDist = 8.0,
-                    double scoreGate = 0.7) {
+                    int maxPix = 160, double mergeDist = 12.0,
+                    double scoreGate = 0.40) {
     Result best;
     best.x = w * 0.5f; best.y = h * 0.5f;
     if (cfgs.empty()) return best;

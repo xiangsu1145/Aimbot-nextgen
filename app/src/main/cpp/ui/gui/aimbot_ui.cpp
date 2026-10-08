@@ -1087,8 +1087,13 @@ bool updateCaptureTexture() {
     // record the mirror being torn down underneath it.
     const bool wantsRecoil  = recoil::wantsFrames();
     // The crosshair-recoil mode is a FOURTH reader: sampling and tracking both
-    // need the mirror alive with the board hidden.
-    const bool wantsCross   = crosshair::wantsFrames();
+    // need the mirror alive with the board hidden, and the Recoil page preview
+    const bool wantsRecoilPreview = (currentSection() == MenuSection::Recoil) && !hudHidden() &&
+                                    (sections::g_pageRecoil.mode.value == sections::PageRecoil::kModeCrosshair) &&
+                                    sections::g_pageRecoil.enabled.value &&
+                                    sections::g_pageRecoil.xTrack.value &&
+                                    (sections::g_pageRecoil.continuousTrigger.value || sections::recoilIsFiring());
+    const bool wantsCross   = crosshair::wantsFrames() || wantsRecoilPreview;
     // Told to the frame thread rather than kept private: it is the one doing the
     // crop, so it is the only place the work can actually be avoided.
     capture::setConsuming(wantsPreview || wantsInfer || wantsRecoil || wantsCross);

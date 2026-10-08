@@ -26,6 +26,7 @@
 #include "ui/gui/sections/trigger_section.h"
 #include "ui/gui/sections/backflash_section.h"
 #include "ui/gui/sections/recoil_section.h"
+#include "tracking/kalman_tracker.h"
 
 #define TAG "AimbotNg"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -359,6 +360,8 @@ json serialize() {
         const auto& rc = ui::sections::g_pageRecoil;
         json o;
         putSwitch(o, "on", rc.enabled);
+        putSwitch(o, "xTrack", rc.xTrack);
+        putSwitch(o, "continuousTrigger", rc.continuousTrigger);
         putDropdown(o, "mode", rc.mode);
         putDropdown(o, "vWeapon", rc.vWeapon);
         putSlider(o, "vStage1Px", rc.vStage1Px);
@@ -405,7 +408,7 @@ json serialize() {
         putSlider(o, "trackIou",  s.trackIou);
         putSlider(o, "trackConf", s.trackConfirm);
         putSlider(o, "trackTerm", s.trackTerminate);
-        // trackPred lives on the Aim page now → persisted under aim.trackPred
+        putSlider(o, "trackPred", s.trackPredictHoldFrames);
         putCircle(o, "infArea", s.inferenceArea.toggle.value,
                   s.inferenceArea.cx, s.inferenceArea.cy, s.inferenceArea.r,
                   s.inferenceArea.placed);
@@ -645,6 +648,8 @@ void apply(const json& j) {
         auto& rc = ui::sections::g_pageRecoil;
         const json& o = *it;
         getSwitch(o, "on", rc.enabled);
+        getSwitch(o, "xTrack", rc.xTrack);
+        getSwitch(o, "continuousTrigger", rc.continuousTrigger);
         getDropdown(o, "mode", rc.mode);
         if (rc.mode.value < 0 || rc.mode.value > 1) rc.mode.value = 0;
         getDropdown(o, "vWeapon", rc.vWeapon);
@@ -736,6 +741,13 @@ void apply(const json& j) {
             backend.value = (wanted == 0 || wanted == 1) ? wanted : 0;
         }
     }
+
+    // Immediately push loaded settings into trackerConfig so it takes effect upon load
+    auto& tcfg = tracking::trackerConfig();
+    tcfg.iouThreshold      = ui::sections::g_pageSettings.trackIou.value;
+    tcfg.confirmFrames     = static_cast<int>(ui::sections::g_pageSettings.trackConfirm.value + 0.5f);
+    tcfg.terminateFrames   = static_cast<int>(ui::sections::g_pageSettings.trackTerminate.value + 0.5f);
+    tcfg.predictHoldFrames = static_cast<int>(ui::sections::g_pageSettings.trackPredictHoldFrames.value + 0.5f);
 }
 
 }  // namespace

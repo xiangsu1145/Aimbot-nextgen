@@ -8,9 +8,11 @@
 
 #include "capture/capture.h"
 #include "inference/model_runtime.h"
+#include "inference/model_store.h"
 #include "ui/gui/aimbot_ui.h"
 #include "ui/gui/hud.h"
 #include "ui/gui/notify.h"
+#include "ui/gui/sections/settings_section.h"
 #include "ui/gui/theme.h"
 
 namespace aimbotng {
@@ -154,7 +156,8 @@ void syncCapturePage() {
     // reads as a glitch. Nothing else would notice, which is why it is written
     // down here rather than left to be rediscovered.
     static bool lastInferWants = false;
-    const bool inferWants = infer::runtime::wantsFrames();
+    const bool inferWants = infer::runtime::wantsFrames() ||
+                            (!g_pageSettings.continuousInference.value && holdToInferHeld() && model::loadedId() > 0);
     if (inferWants && !lastInferWants && !g_pageCapture.enabled.value) {
         // Writing the switch is what makes the page honest rather than just the
         // module: the toggle is drawn from this same struct, so it flips visibly

@@ -414,12 +414,13 @@ void MultiTracker::matchAndUpdate(const std::vector<infer::Box>& dets) {
     // detection may match from further away than gateRadius, and it is bounded
     // to tracks matched within the last couple of detector results, so a
     // long-dead track can never steal a genuinely new enemy.
+    const size_t prevTrackCount = tracks_.size();
     for (size_t dj_j = 0; dj_j < dets.size(); ++dj_j) {
         if (matchedDets.count(static_cast<int>(dj_j))) continue;
         const auto& d = dets[dj_j];
 
         int inherited = -1;
-        for (size_t k = 0; k < tracks_.size(); ++k) {
+        for (size_t k = 0; k < prevTrackCount; ++k) {
             if (matchedTracks.count(static_cast<int>(k))) continue;
             const auto& tr = tracks_[k];
             if (tr.lost_frames > kInheritMaxLostFrames) continue;
@@ -471,8 +472,8 @@ void MultiTracker::matchAndUpdate(const std::vector<infer::Box>& dets) {
         tracks_.push_back(std::move(t));
     }
 
-    // Unmatched tracks: mark lost, count down, drop when expired.
-    for (size_t i = 0; i < tracks_.size(); ++i) {
+    // Unmatched tracks: only check tracks that existed BEFORE spawning new tracks.
+    for (size_t i = 0; i < prevTrackCount; ++i) {
         if (matchedTracks.count(static_cast<int>(i)) == 0) {
             tracks_[i].lost = true;
             tracks_[i].terminate_count -= 1;

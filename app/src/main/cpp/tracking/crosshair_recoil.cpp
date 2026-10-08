@@ -17,6 +17,8 @@
 #include "capture/capture.h"
 #include "tracking/crosshair_detect.h"
 #include "tracking/kalman_tracker.h"
+#include "ui/gui/notify.h"
+#include "ui/gui/sections/recoil_section.h"
 
 #define TAG "AimbotRecoil"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -30,8 +32,6 @@ namespace {
 constexpr const char* kDir = "/data/local/tmp/aimbotng/crosshair";
 constexpr int64_t kSampleMs = 1500;   // colour sample window, like F8
 constexpr int kCoastFrames = 6;       // keep last crosshair position this long
-
-Params g_params;
 
 // ── Sampling state ──────────────────────────────────────────────────────────
 bool        g_sampling   = false;
@@ -51,13 +51,6 @@ bool g_tracking = false;
 bool  g_havePos = false;
 float g_px = 0.0f, g_py = 0.0f;
 int   g_missed = 0;
-
-// PID state, per axis. Reset when the burst stops.
-float g_ix = 0.0f, g_iy = 0.0f;
-float g_dvx = 0.0f, g_dvy = 0.0f;
-float g_pex = 0.0f, g_pey = 0.0f;
-bool  g_pidFresh = false;
-float g_accX = 0.0f, g_accY = 0.0f;
 
 // Last detection, for the preview readout.
 int   g_lastHits = 0;
@@ -159,6 +152,7 @@ void finishSample() {
     if (g_sFrames == 0) {
         g_sampleStatus = "采样失败：画面中心没有可识别的彩色像素";
         g_sampleOk = false;
+        ui::notify::error("crosshair.sample", g_sampleStatus.c_str(), 5.0f);
         LOGW("crosshair: sample failed, no usable frames");
         return;
     }
@@ -170,6 +164,7 @@ void finishSample() {
     if (S < 30) {
         g_sampleStatus = "采样被拒绝：白色/灰色准星与场景高光冲突，请换有色准星";
         g_sampleOk = false;
+        ui::notify::error("crosshair.sample", g_sampleStatus.c_str(), 5.0f);
         LOGW("crosshair: sample rejected, grey/white (S=%d)", S);
         return;
     }
@@ -189,15 +184,14 @@ void finishSample() {
     // skipping the whole measurement (which is what zeroed expectPix every
     // time and made every sample "unsized").
     if (g_frameW > 0 || grabFrame()) {
-        // Full-frame probe: the frame is only 256x256, so a whole-frame scan
-        // is cheap and removes any assumption about where the crosshair sits.
+        const int midX = g_frameW / 2, midY = g_frameH / 2;
         for (int attempt = 0; attempt < 3; ++attempt) {
             ColorRange probe_cfg;
             rangeFromSample(H, S, V, probe_cfg,
-                            /*hTol=*/12 + attempt * 12, /*svSlack=*/60 + attempt * 40);
-            Result probe = byColor(g_frame.data(), g_frameW, g_frameH,
-                                   g_frameW * 4, probe_cfg, -1, -1,
-                                   std::max(g_frameW, g_frameH));
+                            /*hTol=*/6 + attempt * 2, /*svSlack=*/60 + attempt * 20);
+            Result probe = byFeature(g_frame.data(), g_frameW, g_frameH,
+                                     g_frameW * 4, probe_cfg, midX, midY,
+                                     /*radiusCover=*/40);
             if (probe.found) { cfg.expectPix = probe.hits; measured = true; break; }
         }
         // Diagnostic dump: the exact frame the probe ran on, so a "0 px" can
@@ -224,6 +218,7 @@ void finishSample() {
     if (f == nullptr) {
         g_sampleStatus = "写入配置失败";
         g_sampleOk = false;
+        ui::notify::error("crosshair.sample", g_sampleStatus.c_str(), 5.0f);
         return;
     }
     std::fwrite(line, 1, std::strlen(line), f);
@@ -236,22 +231,15 @@ void finishSample() {
                       H, S, V, cfg.expectPix, g_sFrames);
     } else {
         std::snprintf(buf, sizeof(buf),
-                      "采样完成：HSV(%d,%d,%d)，未测得像素——已按无尺寸配置保存（准星若在画面中心 30px 外，把它挪回中间再追踪）",
+                      "采样完成：HSV(%d,%d,%d)，共 %d 帧，未测得像素——已按无尺寸配置保存（准星若在画面中心 30px 外，把它挪回中间再追踪）",
                       H, S, V, g_sFrames);
     }
     g_sampleStatus = buf;
     g_sampleOk = true;
+    ui::notify::success("crosshair.sample", g_sampleStatus.c_str(), 5.0f);
     LOGI("crosshair: sampled '%s' HSV(%d,%d,%d) expectPix=%d frames=%d",
          g_sampleName.c_str(), H, S, V, cfg.expectPix, g_sFrames);
     reloadConfigs();
-}
-
-void resetPid() {
-    g_ix = g_iy = 0.0f;
-    g_dvx = g_dvy = 0.0f;
-    g_pex = g_pey = 0.0f;
-    g_pidFresh = false;
-    g_accX = g_accY = 0.0f;
 }
 
 /// Configs are scanned once, lazily — the daemon starts long before the user
@@ -264,11 +252,6 @@ void ensureLoaded() {
 }
 
 }  // namespace
-
-// ── Params ──────────────────────────────────────────────────────────────────
-
-void setParams(const Params& p) { g_params = p; }
-Params params() { return g_params; }
 
 // ── Sampling ────────────────────────────────────────────────────────────────
 
@@ -291,6 +274,7 @@ void abortSample() {
     g_sampling = false;
     g_sampleStatus = "采样已取消";
     g_sampleOk = false;
+    ui::notify::info("crosshair.sample", "已取消准星采样", 3.0f);
 }
 
 bool sampling() { return g_sampling; }
@@ -332,6 +316,25 @@ int reloadConfigs() {
         // discarding it left the user with a "successful" sample that could
         // never track anything.
         if (c.radius <= 0 || c.minPix <= 0) continue;
+        // 红色准星保护（防止混入黄色导致飞出）及白墙兼容：
+        // 若为红色（跨越 0/180，或纯红 0~15 或 165~179）：
+        // 1. 严格收缩上界至 <= 11，彻底杜绝混入黄色（黄色起始为 H >= 23）。
+        // 2. 下界拉至 >= 169。
+        // 3. 放宽 sLo 至 35，兼容白墙场景下的半透明/抗锯齿边缘（白墙本身 S < 15）。
+        if (c.hLo > c.hHi) {
+            if (c.hHi > 11) c.hHi = 11;
+            if (c.hLo < 169) c.hLo = 169;
+            if (c.sLo > 35) c.sLo = 35;
+        } else if (c.hHi <= 15) {
+            if (c.hHi > 11) c.hHi = 11;
+            if (c.sLo > 35) c.sLo = 35;
+        } else if (c.hLo >= 165) {
+            if (c.hLo < 169) c.hLo = 169;
+            if (c.sLo > 35) c.sLo = 35;
+        } else if (c.hLo != 0 || c.hHi != 179) {
+            // 其他彩色准星：白墙兼容放宽
+            if (c.sLo > 45) c.sLo = 45;
+        }
         g_cfgs.push_back(c);
         g_names.push_back(fn.substr(0, fn.size() - 4));
     }
@@ -358,140 +361,213 @@ void setTracking(bool on) {
     g_tracking = on;
     g_havePos = false;
     g_missed = 0;
-    resetPid();
     LOGI("crosshair: tracking %s", on ? "on" : "off");
 }
 bool tracking() { return g_tracking; }
 
-bool tick(float dt, bool firing, float& accX, float& accY, float& dx, float& dy) {
-    accX = accY = 0.0f;
-    dx = dy = 0.0f;
+void resetTracking() {
+    g_havePos = false;
+    g_missed = 0;
+}
 
-    ensureLoaded();
-    pumpSampling();
-
-    if (!g_tracking) { resetPid(); return false; }
-
-    // ── 1. locate the crosshair on the newest frame (whole frame) ───────────
-    // Detection runs at half the UI rate (~30 Hz): the crosshair moves a few
-    // px per frame at most, and the whole-frame scan ×2 recognisers was the
-    // main source of the daemon's heat.
-    static int s_detectSkip = 0;
-    const bool detectFrame = (g_tracking && (s_detectSkip++ & 1) == 0);
-    if (detectFrame && grabFrame() && !g_cfgs.empty()) {
-        Result r = multi(g_frame.data(), g_frameW, g_frameH,
-                         g_frameW * 4, g_cfgs, -1, -1,
-                         std::max(g_frameW, g_frameH));
-        // Firing floods the frame with red-family interference (muzzle flash,
-        // damage markers). The shape-scored recogniser correctly rejects those
-        // frames — its size/shape gates are exactly what a blob of flash
-        // pixels fails — but that reads as "crosshair lost" every shot. Fall
-        // back to the plain HSV centroid, but with a size gate: the fallback
-        // has no shape opinion, so without it any brown dirt (same hue family
-        // as a red crosshair) is accepted wholesale. The crosshair's own
-        // sampled pixel count is the yardstick.
-        if (!r.found) {
-            for (size_t i = 0; i < g_cfgs.size() && !r.found; ++i) {
-                Result c = byColor(g_frame.data(), g_frameW, g_frameH,
-                                   g_frameW * 4, g_cfgs[i], -1, -1,
-                                   std::max(g_frameW, g_frameH));
-                if (!c.found) continue;
-                if (g_cfgs[i].expectPix > 0 &&
-                    (c.hits < g_cfgs[i].expectPix * 2 / 5 ||
-                     c.hits > g_cfgs[i].expectPix * 3)) continue;
-                r = c; r.cfg = (int)i; r.score = 0.5f;
-            }
-        }
-        g_lastHits = r.hits;
-        g_lastScore = r.score;
-        g_lastCfg = r.cfg;
-        if (r.found) {
-            if (!g_havePos) {
-                LOGI("crosshair: locked at (%.0f,%.0f) hits=%d cfg=%d",
-                     r.x, r.y, r.hits, r.cfg);
-            }
-            g_havePos = true;
-            g_missed = 0;
-            g_px = r.x;
-            g_py = r.y;
-        } else if (g_havePos && g_missed < kCoastFrames) {
-            ++g_missed;   // coast on the last position
-        } else {
-            g_havePos = false;
-            resetPid();
-        }
-    }
-
-    // ── 2. burst bookkeeping ────────────────────────────────────────────────
-    if (!firing) {
-        resetPid();
+bool getCrosshairPosition(float& screenX, float& screenY) {
+    const auto& pg = ui::sections::g_pageRecoil;
+    if (!pg.enabled.value ||
+        pg.mode.value != ui::sections::PageRecoil::kModeCrosshair ||
+        !g_tracking || !g_havePos) {
         return false;
     }
-
-    // Goal: the aim's target box centre; without a target there is nothing to
-    // hold the crosshair on, and the mode is documented as needing the aim.
-    const auto& tracks = tracking::tracker().tracks();
-    const tracking::TrackedTarget* tgt = nullptr;
-    for (const auto& t : tracks) {
-        if (t.confirmed && !t.lost) { tgt = &t; break; }
-    }
-    if (tgt == nullptr || !g_havePos) return false;
-
     int ox = 0, oy = 0;
     capture::cropOrigin(ox, oy);
-    const float cxs = (float)ox + g_px;
-    const float cys = (float)oy + g_py;
-    const float gx = tgt->cx;
-    const float gy = tgt->cy;
-    const float ex = gx - cxs;
-    const float ey = gy - cys;
-
-    // ── 3. PID (per axis), output = finger px/s → this frame's increment ────
-    const float kp = g_params.kp, ki = g_params.ki, kd = g_params.kd;
-    const float px = ex * kp;
-    const float py = ey * kp;
-    if (g_pidFresh) {
-        // Derivative on the error with a light low-pass: the raw per-frame
-        // difference is mostly capture noise.
-        const float a = std::clamp(dt / (dt + 0.05f), 0.0f, 1.0f);
-        const float dvx = (ex - g_pex) / std::max(1e-4f, dt);
-        const float dvy = (ey - g_pey) / std::max(1e-4f, dt);
-        g_dvx = g_dvx + (dvx - g_dvx) * a;
-        g_dvy = g_dvy + (dvy - g_dvy) * a;
-    } else {
-        g_dvx = g_dvy = 0.0f;
-        g_pidFresh = true;
-    }
-    g_pex = ex;
-    g_pey = ey;
-    // Integrator clamp: with the gain in front, ±80 screen px of held error is
-    // already a full-screen pull; anything larger is wind-up, not control.
-    g_ix = std::clamp(g_ix + ex * dt, -80.0f, 80.0f);
-    g_iy = std::clamp(g_iy + ey * dt, -80.0f, 80.0f);
-
-    const float ux = (px + ki * g_ix + kd * g_dvx) * g_params.gain;
-    const float uy = (py + ki * g_iy + kd * g_dvy) * g_params.gain;
-    dx = ux * dt;
-    dy = uy * dt;
-
-    // Rate cap: the finger cannot teleport, and an uncapped step reads as a
-    // flick. 600 finger px/s ≈ a fast but human swipe.
-    constexpr float kMaxStepPerSec = 600.0f;
-    const float mag = std::sqrt(dx * dx + dy * dy);
-    const float cap = kMaxStepPerSec * dt;
-    if (mag > cap && mag > 1e-4f) {
-        dx *= cap / mag;
-        dy *= cap / mag;
-    }
-
-    g_accX += dx;
-    g_accY += dy;
-    accX = g_accX;
-    accY = g_accY;
+    screenX = (float)ox + g_px;
+    screenY = (float)oy + g_py;
     return true;
 }
 
-bool wantsFrames() { return g_sampling || g_tracking; }
+void pumpPreview() {
+    ensureLoaded();
+    if (g_cfgs.empty()) return;
+
+    // Throttle preview detection to 30 Hz to save compute and battery
+    static int64_t s_lastPreviewMs = 0;
+    const int64_t tNow = nowMs();
+    if (tNow - s_lastPreviewMs < 30) return;
+    s_lastPreviewMs = tNow;
+
+    if (!grabFrame()) return;
+
+    const auto& pg = ui::sections::g_pageRecoil;
+    const int pick = pg.xPick.value;
+    std::vector<ColorRange> activeCfgs;
+    if (pick >= 0 && pick < static_cast<int>(g_cfgs.size())) {
+        activeCfgs.push_back(g_cfgs[pick]);
+    } else {
+        activeCfgs = g_cfgs;
+    }
+    if (activeCfgs.empty()) return;
+
+    int cx = g_frameW / 2;
+    int cy = g_frameH / 2;
+    int searchRad = 50;
+    if (g_havePos) {
+        cx = std::clamp((int)std::round(g_px), 0, g_frameW - 1);
+        cy = std::clamp((int)std::round(g_py), 0, g_frameH - 1);
+        searchRad = 36;
+    }
+
+    Result r = multi(g_frame.data(), g_frameW, g_frameH,
+                     g_frameW * 4, activeCfgs, cx, cy, searchRad);
+    if (!r.found && g_havePos) {
+        r = multi(g_frame.data(), g_frameW, g_frameH,
+                  g_frameW * 4, activeCfgs, g_frameW / 2, g_frameH / 2, 54);
+    }
+
+    bool acceptCandidate = false;
+    if (r.found) {
+        const float dxMid = r.x - g_frameW * 0.5f;
+        const float dyMid = r.y - g_frameH * 0.5f;
+        if (std::sqrt(dxMid * dxMid + dyMid * dyMid) <= 65.0f) {
+            if (g_havePos) {
+                const float dxPrev = r.x - g_px;
+                const float dyPrev = r.y - g_py;
+                if (std::sqrt(dxPrev * dxPrev + dyPrev * dyPrev) <= 25.0f) {
+                    acceptCandidate = true;
+                }
+            } else {
+                acceptCandidate = true;
+            }
+        }
+    }
+
+    g_lastHits = r.hits;
+    g_lastScore = r.score;
+    g_lastCfg = (pick >= 0 && pick < static_cast<int>(g_cfgs.size())) ? pick : r.cfg;
+    if (acceptCandidate) {
+        if (g_havePos) {
+            g_px = g_px * 0.35f + r.x * 0.65f;
+            g_py = g_py * 0.35f + r.y * 0.65f;
+        } else {
+            g_px = r.x;
+            g_py = r.y;
+        }
+        g_havePos = true;
+        g_missed = 0;
+    } else if (g_havePos && g_missed < kCoastFrames) {
+        ++g_missed;
+    } else {
+        g_havePos = false;
+    }
+}
+
+void pumpTracking(bool enabled) {
+    ensureLoaded();
+    pumpSampling();
+
+    const auto& pg = ui::sections::g_pageRecoil;
+    const bool isTriggering = pg.continuousTrigger.value || ui::sections::recoilIsFiring();
+    const bool active = enabled && pg.enabled.value &&
+                        pg.mode.value == ui::sections::PageRecoil::kModeCrosshair &&
+                        g_tracking && isTriggering;
+    if (!active) {
+        if (g_havePos) {
+            g_havePos = false;
+            g_missed = 0;
+        }
+        return;
+    }
+
+    // ── Throttled detection: ~30 Hz (every 30ms) to reduce CPU compute, power, and heat ──
+    static int64_t s_lastDetectMs = 0;
+    const int64_t tNow = nowMs();
+    if (tNow - s_lastDetectMs < 30) {
+        return;
+    }
+    s_lastDetectMs = tNow;
+
+    if (!grabFrame() || g_cfgs.empty()) return;
+
+    // ── 1. 优先使用用户在下拉框选定的当前准星配置，避免匹配到其他不相关准星 ──
+    const int pick = pg.xPick.value;
+    std::vector<ColorRange> activeCfgs;
+    if (pick >= 0 && pick < static_cast<int>(g_cfgs.size())) {
+        activeCfgs.push_back(g_cfgs[pick]);
+    } else {
+        activeCfgs = g_cfgs;
+    }
+    if (activeCfgs.empty()) return;
+
+    // ── 2. 自适应 ROI 窗口 ──
+    int cx = g_frameW / 2;
+    int cy = g_frameH / 2;
+    int searchRad = 50;
+    if (g_havePos) {
+        cx = std::clamp((int)std::round(g_px), 0, g_frameW - 1);
+        cy = std::clamp((int)std::round(g_py), 0, g_frameH - 1);
+        searchRad = 36;
+    }
+
+    Result r = multi(g_frame.data(), g_frameW, g_frameH,
+                     g_frameW * 4, activeCfgs, cx, cy, searchRad);
+
+    // 丢失后若连续 miss，尝试扩大至中心范围重新抓取
+    if (!r.found && g_havePos && g_missed >= 2) {
+        r = multi(g_frame.data(), g_frameW, g_frameH,
+                  g_frameW * 4, activeCfgs, g_frameW / 2, g_frameH / 2, 54);
+    }
+
+    // ── 3. 严格防飞保护 (Jump / Teleportation Protection) ──
+    // 物理枪械后坐力在 30ms 内准星位移极小 (通常 <= 15px)。
+    // 凡是突变位移 > 24px，或者漂移出画面中心 65px 之外的孤立亮斑，直接判定为误检（火花/UI/敌人标志），拒绝锁跳！
+    bool acceptCandidate = false;
+    if (r.found) {
+        const float dxMid = r.x - g_frameW * 0.5f;
+        const float dyMid = r.y - g_frameH * 0.5f;
+        const float distMid = std::sqrt(dxMid * dxMid + dyMid * dyMid);
+        if (distMid <= 65.0f) {
+            if (g_havePos) {
+                const float dxPrev = r.x - g_px;
+                const float dyPrev = r.y - g_py;
+                const float jumpDist = std::sqrt(dxPrev * dxPrev + dyPrev * dyPrev);
+                if (jumpDist <= 24.0f) {
+                    acceptCandidate = true;
+                }
+            } else {
+                acceptCandidate = true;
+            }
+        }
+    }
+
+    g_lastHits = r.hits;
+    g_lastScore = r.score;
+    g_lastCfg = (pick >= 0 && pick < static_cast<int>(g_cfgs.size())) ? pick : r.cfg;
+    if (acceptCandidate) {
+        if (!g_havePos) {
+            LOGI("crosshair: locked at (%.1f,%.1f) hits=%d cfg=%d",
+                 r.x, r.y, r.hits, r.cfg);
+            g_px = r.x;
+            g_py = r.y;
+        } else {
+            // 指数平滑：平滑防抖，彻底消除准星瞬间抖动和跳变
+            g_px = g_px * 0.35f + r.x * 0.65f;
+            g_py = g_py * 0.35f + r.y * 0.65f;
+        }
+        g_havePos = true;
+        g_missed = 0;
+    } else if (g_havePos && g_missed < kCoastFrames) {
+        ++g_missed;   // coast on the last position
+    } else {
+        g_havePos = false;
+    }
+}
+
+bool wantsFrames() {
+    if (g_sampling) return true;
+    const auto& pg = ui::sections::g_pageRecoil;
+    const bool isTriggering = pg.continuousTrigger.value || ui::sections::recoilIsFiring();
+    return pg.enabled.value &&
+           pg.mode.value == ui::sections::PageRecoil::kModeCrosshair &&
+           g_tracking && isTriggering;
+}
 
 bool preview(Preview& out) {
     // Screen coordinates, not frame coordinates: the preview panel maps

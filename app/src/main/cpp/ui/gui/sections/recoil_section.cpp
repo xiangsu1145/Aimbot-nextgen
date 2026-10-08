@@ -29,6 +29,7 @@
 #include "tracking/crosshair_recoil.h"
 #include "tracking/recoil_recorder.h"
 #include "tracking/valorant_recoil.h"
+#include "ui/gui/sections/capture_section.h"
 
 #define TAG "AimbotRecoil"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -134,12 +135,8 @@ bool anyPhysicalFingerIn(const widgets::Rect& r) {
 /// out through uinput and never appears there at all.
 bool firingNow() {
     PageRecoil& pg = g_pageRecoil;
-    // The trigger page's auto-fire counts for the WHOLE hold, not just while a
-    // tap is down — the gun keeps firing between taps, and the burst would
-    // otherwise start/stop several times a second. This is the primary signal;
-    // the fire area below is only for manual fire, and it must sit ON the
-    // game's fire button to see that finger.
     if (triggerIsFiring()) return true;
+    if (pg.continuousTrigger.value) return true;
     if (!pg.fire.placed) return false;
     ReaderPointer buf[READER_MAX_POINTERS];
     const int n = reader_read_pointers(buf, READER_MAX_POINTERS);
@@ -389,6 +386,13 @@ bool drawPatternChart(ImDrawList* dl, const widgets::Rect& r, float s, const Xf&
 /// detected crosshair, the screen centre and the aim's target box drawn on it.
 void drawCrosshairPreview(ImDrawList* dl, const widgets::Rect& r, float s,
                           const Xf& xf) {
+    const PageRecoil& pg = g_pageRecoil;
+    const bool active = pg.enabled.value && pg.xTrack.value &&
+                        (pg.continuousTrigger.value || recoilIsFiring());
+    if (active) {
+        crosshair::pumpPreview();
+    }
+
     using crosshair::Preview;
     Preview pv;
     crosshair::preview(pv);
@@ -427,7 +431,7 @@ void drawCrosshairPreview(ImDrawList* dl, const widgets::Rect& r, float s,
         dl->AddLine(ImVec2(c.x - arm, c.y), ImVec2(c.x + arm, c.y), grey, 2.0f * s);
         dl->AddLine(ImVec2(c.x, c.y - arm), ImVec2(c.x, c.y + arm), grey, 2.0f * s);
     }
-    if (pv.found && haveSq) {
+    if (pv.found && haveSq && active) {
         const ImVec2 c = toPanel(pv.fx, pv.fy);
         const float arm = 11.0f * s;
         dl->AddLine(ImVec2(c.x - arm, c.y), ImVec2(c.x + arm, c.y), green, 2.5f * s);
@@ -436,7 +440,13 @@ void drawCrosshairPreview(ImDrawList* dl, const widgets::Rect& r, float s,
     }
 
     char info[160];
-    if (pv.nCfgs == 0) {
+    if (!pg.enabled.value) {
+        std::snprintf(info, sizeof(info), "准心预览 · 压枪总开关已关闭");
+    } else if (!pg.xTrack.value) {
+        std::snprintf(info, sizeof(info), "准心预览 · 准心追踪未开启");
+    } else if (!pg.continuousTrigger.value && !recoilIsFiring()) {
+        std::snprintf(info, sizeof(info), "准心预览 · 等待触发（未按住触发区域）");
+    } else if (pv.nCfgs == 0) {
         std::snprintf(info, sizeof(info), "准心预览 · 无配置，先开始识别");
     } else if (!haveSq) {
         std::snprintf(info, sizeof(info), "准心预览 · 等待画面…");
@@ -455,6 +465,9 @@ void drawCrosshairPreview(ImDrawList* dl, const widgets::Rect& r, float s,
 /// the two column ends.
 float drawCrosshairMode(ImDrawList* dl, float x, float y, float w,
                         float s, float es, const Xf& xf, Scroll& sc) {
+    if (crosshair::sampling()) {
+        crosshair::pumpSampling();
+    }
     PageRecoil& pg = g_pageRecoil;
     ImFont* font = ImGui::GetFont();
     const float gap    = csize(kRowGap) * s;
@@ -500,6 +513,11 @@ float drawCrosshairMode(ImDrawList* dl, float x, float y, float w,
             if (!crosshair::startSample(buf, err)) {
                 notify::error("", err.c_str());
             } else {
+                if (!g_pageCapture.enabled.value) {
+                    g_pageCapture.enabled.value = true;
+                    capture::setEnabled(true);
+                    notify::info("capture.auto", "采样需要画面，已自动开启截图", 4.0f);
+                }
                 notify::info("", "识别中：把准星对准画面中心，保持 1.5 秒不动");
             }
         }
@@ -512,32 +530,22 @@ float drawCrosshairMode(ImDrawList* dl, float x, float y, float w,
         crosshair::setTracking(pg.xTrack.value);
     }
     yL += rowSw + gap;
-    widgets::switchButton(dl, wRect(x, sc.screenY(yL), leftW, rowSw), pg.fireToggle,
-                          "显示开火区域", es);
+
+    // ── 持续触发开关（默认打开，关掉时显示触发区域） ──
+    widgets::switchButton(dl, wRect(x, sc.screenY(yL), leftW, rowSw), pg.continuousTrigger,
+                          "持续触发", es);
     yL += rowSw + gap;
 
-    // The grey note under 参数设置: what this mode needs to work.
+    if (!pg.continuousTrigger.value) {
+        widgets::switchButton(dl, wRect(x, sc.screenY(yL), leftW, rowSw), pg.fireToggle,
+                              "触发区域", es);
+        yL += rowSw + gap;
+    }
+
     dl->AddText(font, tsize(kSmallS * s) * xf.scale,
                 xf.pt(ImVec2(x, sc.screenY(yL))), xf.col(TextMuted),
-                "需要配合自瞄，开火后才会压枪");
+                "准星识别作为自瞄真实准心，无需额外压枪参数");
     yL += csize(kSmallS + kLabelGap + 4.0f) * s;
-
-    dl->AddText(font, tsize(kTextS * s) * xf.scale,
-                xf.pt(ImVec2(x, sc.screenY(yL))), xf.col(TextMuted), "参数设置");
-    yL += csize(kTextS + kLabelGap) * s;
-
-    widgets::sliderFloat(dl, wRect(x, sc.screenY(yL), leftW, rowSl), pg.xKp,
-                         "Kp（比例）", 0, es);
-    yL += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, sc.screenY(yL), leftW, rowSl), pg.xKi,
-                         "Ki（积分）", 0, es);
-    yL += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, sc.screenY(yL), leftW, rowSl), pg.xKd,
-                         "Kd（微分）", 0, es);
-    yL += rowSl + gap;
-    widgets::sliderFloat(dl, wRect(x, sc.screenY(yL), leftW, rowSl), pg.xGain,
-                         "灵敏度换算（finger px / screen px）", 0, es);
-    yL += rowSl + gap;
 
     // Status: the sampler's last word, then the tracker's.
     {
@@ -660,10 +668,16 @@ float drawValorantMode(ImDrawList* dl, float x, float y, float w,
         }
     }
 
-    // 复用已有的开火区域与回位开关
-    widgets::switchButton(dl, wRect(x, sc.screenY(yL), leftW, rowSw), pg.fireToggle,
-                          "调整开火区域 (实战关闭后仍生效)", es);
+    // 持续触发与触发区域开关
+    widgets::switchButton(dl, wRect(x, sc.screenY(yL), leftW, rowSw), pg.continuousTrigger,
+                          "持续触发", es);
     yL += rowSw + gap;
+
+    if (!pg.continuousTrigger.value) {
+        widgets::switchButton(dl, wRect(x, sc.screenY(yL), leftW, rowSw), pg.fireToggle,
+                              "触发区域", es);
+        yL += rowSw + gap;
+    }
 
     widgets::switchButton(dl, wRect(x, sc.screenY(yL), leftW, rowSw), pg.vReturnHome,
                           "停火平滑回中", es);
@@ -1123,7 +1137,7 @@ void drawRecoilOverlays() {
     // ── Tracked crosshair marker (准心识别 mode) ─────────────────────────────
     // A purple cross pinned to where the recogniser sees the real crosshair,
     // so "is it tracking" is answerable at a glance on the game itself.
-    if (pg.mode.value == PageRecoil::kModeCrosshair && crosshair::tracking()) {
+    if (pg.enabled.value && pg.mode.value == PageRecoil::kModeCrosshair && crosshair::tracking()) {
         crosshair::Preview pv;
         crosshair::preview(pv);
         if (pv.found) {
@@ -1142,8 +1156,8 @@ void drawRecoilOverlays() {
         }
     }
 
-    // ── Fire area (circle, same look as the Trigger page's 触发区域) ─────────
-    if (pg.fireToggle.value) {
+    // ── Trigger area (circle, same look as the Trigger page's 触发区域) ───────
+    if (!pg.continuousTrigger.value && pg.fireToggle.value) {
         if (!pg.fire.placed) {
             pg.fire.cx = io.DisplaySize.x * 0.5f;
             pg.fire.cy = io.DisplaySize.y * 0.72f;
@@ -1160,7 +1174,7 @@ void drawRecoilOverlays() {
         dl->AddCircleFilled(ImVec2(c.x - pg.fire.r, c.y), 9.0f * s, line, 12);
         {
             ImFont* font = ImGui::GetFont();
-            const char* label = live ? "开火区域 · 开火中" : "开火区域";
+            const char* label = live ? "触发区域 · 生效中" : "触发区域";
             const float fs = tsize(22.0f * s);
             const ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, label);
             dl->AddText(font, fs, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f),
@@ -1529,15 +1543,16 @@ void syncRecoilPage() {
 
     const float dt = std::clamp(ImGui::GetIO().DeltaTime, 1.0f / 2000.0f, 0.2f);
 
-    // Leaving 准心识别 mode must stop its tracker, or it would keep reading
+    // Leaving 准心识别 mode or master switch off must stop its tracker, or it would keep reading
     // frames (and spend the capture pipeline) while the page shows something
     // else entirely.
-    if (mode != PageRecoil::kModeCrosshair && crosshair::tracking()) {
-        crosshair::setTracking(false);
+    if ((!pg.enabled.value || mode != PageRecoil::kModeCrosshair) && crosshair::tracking()) {
+        crosshair::resetTracking();
     }
-    // Sampling started from the UI must keep being pumped even if the user
-    // flips the mode dropdown mid-sample. (In crosshair mode tick() pumps.)
-    if (mode != PageRecoil::kModeCrosshair && crosshair::sampling()) {
+    // 准星采样：只要处于采样状态中，必须每帧无条件 pumpSampling，直至 1.5s 完成并保存配置。
+    // 绝不受压枪总开关、准星追踪或模式切换的阻断（此前若开启了总开关但没开准星追踪，
+    // pumpSampling 被跳过导致采样进度卡在 100% 无法结束）。
+    if (crosshair::sampling()) {
         crosshair::pumpSampling();
     }
 
@@ -1550,15 +1565,12 @@ void syncRecoilPage() {
     bool driving = false;
 
     if (mode == PageRecoil::kModeCrosshair) {
-        crosshair::Params cp;
-        cp.kp = pg.xKp.value; cp.ki = pg.xKi.value;
-        cp.kd = pg.xKd.value; cp.gain = pg.xGain.value;
-        crosshair::setParams(cp);
-        driving = crosshair::tick(dt, firing && pg.enabled.value, accX, accY, dx, dy);
-        if (driving && !g_wasFiring) {
-            LOGI("recoil: crosshair burst start kp=%.2f ki=%.2f kd=%.2f gain=%.2f",
-                 cp.kp, cp.ki, cp.kd, cp.gain);
+        if (pg.enabled.value && pg.xTrack.value) {
+            crosshair::pumpTracking(pg.enabled.value);
+        } else {
+            crosshair::resetTracking();
         }
+        driving = false;
     } else if (mode == PageRecoil::kModeValorant) {
         valorant_recoil::Config vc;
         vc.weapon = static_cast<valorant_recoil::Weapon>(pg.vWeapon.value);
