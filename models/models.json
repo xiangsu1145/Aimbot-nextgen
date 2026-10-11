@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "updatedAt": "2026-09-22",
+  "version": 3,
+  "updatedAt": "2026-10-11",
   "models": [
     {
       "modelId": "tflite-wa-yolov8n-256-int8",
@@ -46,6 +46,132 @@
       "resolution": "256x256",
       "quantize": "INT8",
       "classCount": 3
+    },
+    {
+      "modelId": "tflite-6ay-v26m-0917-256-int8",
+      "modelName": "6AY v26m 256",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/6AY_v26m_0917_256_int8.tflite",
+      "description": "三角洲手游 YOLOv26m INT8 量化,256x256,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-6ay-v26m-0917-320-int8",
+      "modelName": "6AY v26m 320",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/6AY_v26m_0917_320_int8.tflite",
+      "description": "三角洲手游 YOLOv26m INT8 量化,320x320,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "320x320",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-6ay-v26m-0917-416-int8",
+      "modelName": "6AY v26m 416",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/6AY_v26m_0917_416_int8.tflite",
+      "description": "三角洲手游 YOLOv26m INT8 量化,416x416,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "416x416",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-6ay-v26m-0917-640-int8",
+      "modelName": "6AY v26m 640",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/6AY_v26m_0917_640_int8.tflite",
+      "description": "三角洲手游 YOLOv26m INT8 量化,640x640,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "640x640",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-babi-v11s-0920-256-int8",
+      "modelName": "BaBi v11s 256",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/BaBi_v11s_0920_256_int8.tflite",
+      "description": "三角洲手游 YOLOv11s INT8 量化,256x256,cxcywh 双输出头,支持 NPU 推理",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-babi-v11s-0920-320-int8",
+      "modelName": "BaBi v11s 320",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/BaBi_v11s_0920_320_int8.tflite",
+      "description": "三角洲手游 YOLOv11s INT8 量化,320x320,cxcywh 双输出头,支持 NPU 推理",
+      "resolution": "320x320",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-babi-v11s-0920-416-int8",
+      "modelName": "BaBi v11s 416",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/BaBi_v11s_0920_416_int8.tflite",
+      "description": "三角洲手游 YOLOv11s INT8 量化,416x416,cxcywh 双输出头,支持 NPU 推理",
+      "resolution": "416x416",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-babi-v11s-0920-512-int8",
+      "modelName": "BaBi v11s 512",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/BaBi_v11s_0920_512_int8.tflite",
+      "description": "三角洲手游 YOLOv11s INT8 量化,512x512,cxcywh 双输出头,支持 NPU 推理",
+      "resolution": "512x512",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-babi-v11s-0920-640-int8",
+      "modelName": "BaBi v11s 640",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/BaBi_v11s_0920_640_int8.tflite",
+      "description": "三角洲手游 YOLOv11s INT8 量化,640x640,cxcywh 双输出头,支持 NPU 推理",
+      "resolution": "640x640",
+      "quantize": "INT8",
+      "classCount": 7
+    },
+    {
+      "modelId": "tflite-capoo-v26s-1002-256-int8",
+      "modelName": "Capoo v26s 256",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Capoo_v26s_1002_256_int8.tflite",
+      "description": "三角洲手游 YOLOv26s INT8 量化,256x256,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "256x256",
+      "quantize": "INT8",
+      "classCount": 5
+    },
+    {
+      "modelId": "tflite-capoo-v26s-1002-320-int8",
+      "modelName": "Capoo v26s 320",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Capoo_v26s_1002_320_int8.tflite",
+      "description": "三角洲手游 YOLOv26s INT8 量化,320x320,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "320x320",
+      "quantize": "INT8",
+      "classCount": 5
+    },
+    {
+      "modelId": "tflite-capoo-v26s-1002-416-int8",
+      "modelName": "Capoo v26s 416",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Capoo_v26s_1002_416_int8.tflite",
+      "description": "三角洲手游 YOLOv26s INT8 量化,416x416,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "416x416",
+      "quantize": "INT8",
+      "classCount": 5
+    },
+    {
+      "modelId": "tflite-capoo-v26s-1002-640-int8",
+      "modelName": "Capoo v26s 640",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Capoo_v26s_1002_640_int8.tflite",
+      "description": "三角洲手游 YOLOv26s INT8 量化,640x640,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "640x640",
+      "quantize": "INT8",
+      "classCount": 5
+    },
+    {
+      "modelId": "tflite-capoo-v26s-1002-960-int8",
+      "modelName": "Capoo v26s 960",
+      "modelUrl": "https://raw.githubusercontent.com/xiangsu1145/Aimbot-nextgen/main/models/tflite/Capoo_v26s_1002_960_int8.tflite",
+      "description": "三角洲手游 YOLOv26s INT8 量化,960x960,xyxy 双输出头,支持 NPU 推理",
+      "resolution": "960x960",
+      "quantize": "INT8",
+      "classCount": 5
     }
   ]
 }
