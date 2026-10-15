@@ -105,6 +105,11 @@ public:
     /// reason this is not `run()`.
     void submit(const FrameView&);
 
+    /// Directly pulls the latest frame from the capture module into the active
+    /// mailbox slot, skipping intermediate heap staging buffers entirely (Single-Copy).
+    /// Returns true when a new frame was submitted.
+    bool submitFromCapture(uint64_t& lastId);
+
     /// Whether the pipeline wants frames at all right now: a model is loaded and
     /// a consumer is registered. **This is what the capture path should gate on**
     /// — not on whether a preview is on screen.

@@ -904,6 +904,21 @@ static void driveAimToTarget(TouchAimState& st, int slot,
 
     st.position.x += moveX;
     st.position.y += moveY;
+    // ★ DEBUG (临时) — 逐帧打印手指指令与坐标，抓"往目标走→过冲→停不下来"。
+    // 8 帧一条，避免刷爆 logd 配额。
+    {
+        static int sDbgTick = 0;
+        if ((sDbgTick++ & 7) == 0) {
+            LOGI("aimdbg: id=%d e=(%.1f,%.1f) tot=(%.1f,%.1f) D=(%.1f,%.1f) I=(%.1f,%.1f) FF=(%.1f,%.1f) mv=(%.2f,%.2f) phys=(%.2f,%.2f) pos=(%.0f,%.0f) chg=%d",
+                 st.lastTargetId, dex, dey,
+                 pidX, pidY,
+                 st.aim.derivX(), st.aim.derivY(),
+                 st.aim.trimX(), st.aim.trimY(),
+                 st.aim.ffX(), st.aim.ffY(),
+                 moveX, moveY, physDeltaX, physDeltaY,
+                 st.position.x, st.position.y, targetChanged ? 1 : 0);
+        }
+    }
     emitContactMove(slot, st.position.x, st.position.y);
 }
 
@@ -1677,6 +1692,7 @@ static void syncAimPageInner() {
     // needed here — the estimator, the guard, the rate limit on kf — is gone
     // with the controller. The remaining loop constants are
     // tracking::kAimOutLimitPx / kAimTrimLimitPx / kFfLimitPx.
+    //
     p.touchAim.aim.setGains(
         p.kp.value, p.ki.value, p.kd.value, p.outSmooth.value,
         p.ffGain.value);
@@ -1945,7 +1961,7 @@ static void syncAimPageInner() {
             // Not currently locking any target, or the locked target expired.
             // Pick the nearest confirmed target to the crosshair.
             for (const auto& t : tracks) {
-                if (!t.confirmed) continue;
+                if (!t.confirmed || t.lost) continue;
                 if (!p.aimCategory.isClassSelected(t.cls)) continue;
                 const float dx = t.cx - realCrosshair.x;
                 const float dy = t.cy - realCrosshair.y;

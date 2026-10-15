@@ -461,6 +461,7 @@ void apply(const json& j) {
         // soft, and it would read as "跟枪跟不上" on the first engagement and
         // look like a fault in the new controller. Re-seeding is the lesser
         // evil, and it happens once.
+        //
         const bool sameSchema = (storedCtl == kCtlSchema);
         if (sameSchema) {
             getSlider(o, "kp", a.kp);

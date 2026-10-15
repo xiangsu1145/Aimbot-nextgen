@@ -118,6 +118,11 @@ struct ModelSpec {
     int   htpPerfMode = 1;     // default: Sustained High Performance
 
     /// True when the model outputs [x1, y1, x2, y2] rather than [cx, cy, w, h].
+    /// Set from `Entry::boxXyxy`, which is the user's choice in the Add-Model
+    /// dialog and persisted in the model's TSV row. The post-process picks
+    /// one of two readers on this single bit: a YOLOv8 raw head ships as
+    /// cxcywh normalised (default), and a v26 end2end export or any model with
+    /// a baked-in `dist2bbox` ships as xyxy pixel coords (user opts in).
     bool boxXyxy = false;
 
     /// Per-model scratch key. Engines that compile a graph on the device —

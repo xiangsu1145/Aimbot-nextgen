@@ -129,7 +129,6 @@ namespace tracking {
 /// only kind of game the reference can serve at all.
 ///
 /// Do not tune this, and do not read it as a performance knob: with 1.0 the DC
-/// carrier share is still exactly `lookahead` (α cancels there), so nothing about
 // 废除全局硬编码死值除数，对齐克里斯控制器统一误差尺度（定义 1.0 仅作符号兼容）
 constexpr float kSensFrozen = 1.0f;
 
@@ -227,7 +226,7 @@ constexpr float kErrorEpsPx = 0.30f;
 /// terms whose steady state is zero", and that premise is FALSE in this
 /// architecture: the prediction term's steady state is `lookahead · u_ss` and the
 /// integral's is `(1 − lookahead) · u_ss`, i.e. together they ARE the carrier.
-/// A deadband of 0.30 finger px is not small next to a residual cleaner whose
+/// A deadband of 0.30 screen px is not small next to a residual cleaner whose
 /// whole output can be a couple of px, so on a close approach the two terms were
 /// being nulled one after the other while P and D were simultaneously gated by
 /// the aim deadzone — leaving the axes at EXACTLY zero on target. That is
@@ -323,8 +322,8 @@ constexpr float kDirChangeVelPx = 2.5f;
 
 /// `drop` is the DIMENSIONLESS deceleration — (|v_prev| − |v|)/|v_prev| — and
 /// `reversal` the normalised sign flip. Both are ratios, so neither carries a
-/// unit and neither can be disabled by a wrong kSensFrozen. That property is
-/// the whole reason the stop detection moved here: the old detector's test was
+/// unit and neither can be disabled by a wrong kSensFrozen. That property is the
+/// whole reason the stop detection moved here: the old detector's test was
 /// `|carry| < 1 px` with carry = ffVel/alpha_hat, so a small alpha_hat made the
 /// gate impossible to satisfy and the charge could never be released.
 constexpr float kStopGateStrength    = 3.6f;   // exp(−kStopGateStrength·drop)
@@ -577,17 +576,8 @@ constexpr float kOutGainRate       = 0.03f;
 // is the opposite shape from the round-26 fault, where the carrier was
 // suppressed by the SIZE of the error (a positive feedback: big error → less
 // drive → bigger error); this one is driven by the CLOSURE of the error,
-// which only exists while the loop is already winning, so it can slow an
-// approach but never stall one.
-constexpr float kConvBrakeStrength = 1.0f;  // his approachDamping 5.0 × 0.2
-
-// …but his multiplier is allowed to reach exactly 0 (an instant collapse of
-// the error reads as "full brake" for one frame). This file's history — the
-// band in round 15, the deadband in round 26 — made "output silently zeroed
-// near the target" the most expensive fault class on the device, so the
-// multiplier is floored: the brake may halve nothing more than 60 % of the
-// command in a single step, and never zero it.
-constexpr float kConvBrakeMinMult  = 0.40f;
+constexpr float kConvBrakeStrength = 0.35f;  // 柔和阻尼，消除 60% 剧烈断崖减速引发的启停自激震荡
+constexpr float kConvBrakeMinMult  = 0.75f;  // 最小保留 75% 输出，避免输出断崖式掉半截引发锯齿卡顿
 
 /// His gate is `prevMag > 1.0` (view px here). Below about a pixel of error
 /// the frame-to-frame ratio is OneEuro filter noise, not closure, and braking
@@ -690,6 +680,165 @@ struct ScalarKalman {
         return x;
     }
     void reset() { x = 0.0f; p = 0.0f; }
+};
+
+// ── 克里斯控制器误差观测器（B①，pid.cpp:427-579）─────────────────────────────
+//
+// 参考实现的骨干，本移植版此前丢掉的就是它。状态是 (误差位置, 误差速度) 的
+// 2 状态卡尔曼，预测步里减去上一帧派发的位移 appliedMove：
+//
+//     position += velocity·dt − appliedMove;   velocity *= retention^(dt)
+//
+// 所以 velocity 天然不含"我们自己造成的误差变化"。手工重构 rawVelocity =
+// Δe + lastOutput_ 正是想近似这一步，但它只在 α=1、无噪声、无延迟时为真；
+// 观测器用一个卡门增益把同一件事做对，并且提供了手工版没有的三件事：
+//
+//   * 速度由 innovation 增益更新，增益随协方差自适应；
+//   * 连续大 innovation（真实机动）→ NIS 触发协方差膨胀，速度快速跟上；
+//   * 孤立大 innovation（检测框跳变/重关联踢腿）→ robustWeight<1 把它压下去，
+//     不污染速度；accept=false（重关联帧）→ 只预测不校正，且位置过零立即清速度。
+//
+// 单位：误差 in screen px，velocity out = screen px / 标称帧（dt 内部按
+// dt/kNominalDt 归一）。appliedMove 就是上一步派发的屏幕 px 指令——与误差
+// 同单位，预测步 position += v·dt − appliedMove 因此精确成立，不再依赖
+// α≈1 的假设（round 38 前 appliedMove 喂的是手指 px，与屏幕 px 的误差之间
+// 隔着一个猜出来的 kSensFrozen）。
+constexpr float kErrObsProcessNoise      = 0.25f;
+constexpr float kErrObsMeasurementNoise  = 2.25f;
+constexpr float kErrObsVelocityRetention = 0.45f;
+constexpr float kErrObsThreeSigmaNis     = 9.0f;
+constexpr float kErrObsMaxCovInflation   = 5.0f;
+constexpr float kErrObsMinFrameInterval  = 0.35f;
+constexpr float kErrObsMaxFrameInterval  = 2.50f;
+
+struct ErrorObserver {
+    bool  initialized = false;
+    float position = 0.0f;
+    float velocity = 0.0f;
+    float positionVariance = kErrObsMeasurementNoise;
+    float positionVelocityCovariance = 0.0f;
+    float velocityVariance = kErrObsProcessNoise;
+    float innovationNis = 0.0f;
+    float robustWeight = 1.0f;
+    float covarianceInflation = 1.0f;
+    int   innovationRun = 0;
+    float previousInnovation = 0.0f;
+    float previousInnovationNis = 0.0f;
+
+    /// `measurement` — raw error (screen px); `appliedMove` — last step's
+    /// dispatched SCREEN px command (same unit as the error, so the self-copy
+    /// subtraction is exact); `accept` — false on re-association frames.
+    /// Returns the posterior error estimate; `velocity` holds the estimate.
+    float update(float measurement, float appliedMove, float dtSeconds, bool accept) {
+        const float dt = clampRange(dtSeconds / kNominalDt,
+                                    kErrObsMinFrameInterval, kErrObsMaxFrameInterval);
+        if (!initialized) {
+            initialized = true;
+            position = measurement;
+            velocity = 0.0f;
+            positionVariance = kErrObsMeasurementNoise;
+            positionVelocityCovariance = 0.0f;
+            velocityVariance = kErrObsProcessNoise;
+            return position;
+        }
+
+        const float velocityRetention = std::pow(kErrObsVelocityRetention, dt);
+        const float priorPosition = position;
+        position += velocity * dt - appliedMove;
+        velocity *= velocityRetention;
+
+        const float dt2 = dt * dt;
+        const float dt3 = dt2 * dt;
+        const float dt4 = dt2 * dt2;
+        float predictedPositionVariance =
+            positionVariance +
+            2.0f * dt * positionVelocityCovariance +
+            dt2 * velocityVariance +
+            0.25f * kErrObsProcessNoise * dt4;
+        float predictedPositionVelocityCovariance =
+            velocityRetention * (positionVelocityCovariance + dt * velocityVariance) +
+            0.5f * kErrObsProcessNoise * dt3;
+        float predictedVelocityVariance =
+            velocityRetention * velocityRetention * velocityVariance +
+            kErrObsProcessNoise * dt2;
+
+        if (!accept) {
+            if (priorPosition * position < 0.0f) {
+                position = 0.0f;
+                velocity = 0.0f;
+            }
+            positionVariance = std::fmax(predictedPositionVariance, 0.0f);
+            positionVelocityCovariance = predictedPositionVelocityCovariance;
+            velocityVariance = std::fmax(predictedVelocityVariance, 0.0f);
+            innovationNis = 0.0f;
+            robustWeight = 1.0f;
+            covarianceInflation = 1.0f;
+            return position;
+        }
+
+        const float innovation = measurement - position;
+        const float innovationVariance =
+            std::fmax(predictedPositionVariance + kErrObsMeasurementNoise, kEps);
+        innovationNis = innovation * innovation / innovationVariance;
+        const bool significant = innovationNis >= kErrObsThreeSigmaNis;
+        const bool previousSignificant = previousInnovationNis >= kErrObsThreeSigmaNis;
+        const bool sameDirection = innovation * previousInnovation > 0.0f;
+        innovationRun = significant
+            ? ((sameDirection && previousSignificant)
+                   ? std::min(innovationRun + 1, 1000)
+                   : 1)
+            : 0;
+
+        robustWeight = 1.0f;
+        covarianceInflation = 1.0f;
+        if (significant && innovationRun >= 2) {
+            covarianceInflation = clampRange(innovationNis / kErrObsThreeSigmaNis,
+                                             1.0f, kErrObsMaxCovInflation);
+            predictedPositionVariance *= covarianceInflation;
+            predictedPositionVelocityCovariance *= covarianceInflation;
+            predictedVelocityVariance *= covarianceInflation;
+        } else if (significant) {
+            robustWeight = std::sqrt(kErrObsThreeSigmaNis / innovationNis);
+        }
+
+        // ★ 返回 acceptedError（克里斯 pid.cpp:521），不是卡尔曼后验 position。
+        //   acceptedError = 先验 + robustWeight·innovation：robustWeight=1 时恰等于
+        //   本帧测量值，孤立大 innovation（检测跳变）被压向先验。控制误差用它——后验
+        //   position 带 ~0.22 的位置增益，把误差滞后再喂给 P/D，是"慢慢拉+反复过冲"的源。
+        const float acceptedError = position + robustWeight * innovation;
+
+        const float effectiveMeasurementNoise =
+            kErrObsMeasurementNoise / std::fmax(robustWeight * robustWeight, kEps);
+        const float posteriorVariance =
+            std::fmax(predictedPositionVariance + effectiveMeasurementNoise, kEps);
+        const float positionGain = predictedPositionVariance / posteriorVariance;
+        const float velocityGain = predictedPositionVelocityCovariance / posteriorVariance;
+        position += positionGain * innovation;
+        velocity += velocityGain * innovation;
+
+        const float priorPVC = predictedPositionVelocityCovariance;
+        positionVariance = std::fmax((1.0f - positionGain) * predictedPositionVariance, 0.0f);
+        positionVelocityCovariance = (1.0f - positionGain) * predictedPositionVelocityCovariance;
+        velocityVariance = std::fmax(predictedVelocityVariance - velocityGain * priorPVC, 0.0f);
+        previousInnovation = innovation;
+        previousInnovationNis = innovationNis;
+        return acceptedError;
+    }
+
+    void reset() {
+        initialized = false;
+        position = 0.0f;
+        velocity = 0.0f;
+        positionVariance = kErrObsMeasurementNoise;
+        positionVelocityCovariance = 0.0f;
+        velocityVariance = kErrObsProcessNoise;
+        innovationNis = 0.0f;
+        robustWeight = 1.0f;
+        covarianceInflation = 1.0f;
+        innovationRun = 0;
+        previousInnovation = 0.0f;
+        previousInnovationNis = 0.0f;
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -806,11 +955,20 @@ public:
             }
         }
 
-        const float filtered = errFilter_.update(raw, dt);
-        const float blend    = rawBlend(raw, hasPrevRaw_ ? prevRaw_ : lastError_);
-        const float e        = round2(filtered + (raw - filtered) * blend);
+        // ★ 控制误差 e = ErrorObserver 输出，但 accept 只在"本帧确有新检测"时为 true。
+        //   现场 aimf 抓到：rdx 会连续 4~6 帧纹丝不动（render 120Hz 而检测 30~60Hz 的
+        //   空洞帧），随后新检测一到直接跳 100+ px（69.73 → −36.82）。空洞帧里若照旧
+        //   accept=true，观测器把冻结的测量当真实值，而我们自己的旋转仍在累积 → P/D 按
+        //   假误差继续满输出，刷新帧又被那 100 px 假误差反手一记 → 单帧 ±5 finger px 的
+        //   抖动（d 撞到 ±3.000 钳位就是它）。
+        //   accept=false 时观测器走纯预测分支 position += v·dt − appliedMove，返回的正是
+        //   "扣掉自身旋转"的误差：空洞帧不再驱动，刷新帧不再有幽灵跳变。
+        const float e = obs_.update(raw, lastOutput_, dt, measurementCorrected);
 
-        const float rawDe = (hardReset || softJump) ? 0.0f : (e - lastError_);
+        // 跳变帧的残余门控：观测器判定 innovation 异常（检测跳变/重关联）时 robustWeight
+        // 会塌向 0，用它压住这一帧的 Δe，D 就不会把一次检测重定位当成目标速度撞到钳位。
+        const float obsGate = clampRange(obs_.robustWeight, 0.0f, 1.0f);
+        const float rawDe = hardReset ? 0.0f : (e - lastError_) * obsGate;
         const float absE  = std::fabs(e);
         const float absDe = std::fabs(rawDe);
 
@@ -820,164 +978,150 @@ public:
         const float deVel = (absDe < kVelNoiseFloor) ? 0.0f : rawDe;
         const float dNorm = deVel * (kNominalDt / dt);
 
-        // D 项消噪死区
-        constexpr float kDerivNoiseFloor = 0.35f;
-        float deD = 0.0f;
-        if (absDe >= kDerivNoiseFloor) {
-            deD = std::copysign(absDe - kDerivNoiseFloor, rawDe);
-        }
-        const float dNormForD = deD * (kNominalDt / dt);
 
-        // ★ 克里斯控制器速度重构（D:\克里斯控制器\pid.cpp:751-766）：
-        //     rawVelocity = errorDiff + lastOutput_
-        // 误差导数里混着自身引起的运动，加回上一帧实际派发的位移后剩下的才是
-        // 目标真实速度。拉静止目标: Δe=−u, +u → v̂≈0，前馈不捣乱（治"甩飞"）；
-        // 咬住移动目标: Δe≈0, +u → v̂=u_ss，前馈瞬时扛起载波（治"降ki滞后"）。
-        // lastOutput_ 是 clamp/刹车/平滑之后的最终输出，最接近真实注入量。
-        // α=1 假设与克里斯一致（kSensFrozen = 1.0）。
+        const float prevVel = velLast_;
         float vel = 0.0f;
-        // 跟踪器重关联/目标切换帧：Δe 含修正踢腿而非速度，保持上一帧速度估计
-        // （克里斯语义，aim_section.h 文档本就如此声明，此前活路径从未实现）。
-        const bool deIsNotVelocity = hardReset || softJump || measurementCorrected;
         if (std::fabs(targetVel) > 0.02f) {
-            vel = velFilter_.update(targetVel, dt);
-        } else if (deIsNotVelocity) {
-            vel = velFilter_.x;
+            vel = targetVel;   // 调用方直接给了速度（跟踪器），优先采用
         } else {
-            float rawVelocity = rawDe + lastOutput_;
-            // 近场混合（pid.cpp:762-766）：贴住目标时向 (Δe + 0.5u) 收，
-            // 抑制自回声在速度估计里的残余噪声。
-            if (absE < 1.0f && absDe < 0.1f) {
-                const float nearZeroVelocity = rawDe + 0.5f * lastOutput_;
-                rawVelocity = rawVelocity * 0.35f + nearZeroVelocity * 0.65f;
-            }
-            vel = velFilter_.update(rawVelocity, dt);
+            vel = obs_.velocity;
         }
         if (std::fabs(vel) < 0.15f) vel = 0.0f;
-        velNow_  = vel;
-        velLast_ = vel;
+
+        // ★ 核心修复 1：调用克里斯控制器自适应门控（计算急停 drop、变向 reversal、信任度 trust）
+        Adaptive adaptive = computeAdaptive(absE, absDe, vel, prevVel, prevTrust_);
+        prevTrust_ = adaptive.trust;
+
+        // ★ 核心修复 2：目标急停或变向时，按比例排空速度记忆与积分记忆，从物理源头扼杀过冲与回拉晃荡！
+        if (adaptive.intMemScale < 0.999f) {
+            integral_ *= adaptive.intMemScale;
+        }
+        if (adaptive.velMemScale < 0.999f) {
+            obs_.velocity *= adaptive.velMemScale;
+            vel *= adaptive.velMemScale;
+        }
+        velNow_   = vel;
         velFresh_ = true;
 
-        // ── 1. 比例项 P（平滑果断，无60px硬饱和，具备真正的快速拉枪与跟枪响应力）──
+        // ── 1. 比例项 P ───────────────────────────────────────────────────────
         const float gate = frozen ? 0.0f : 1.0f;
         const float nearBlend = std::fmin(1.0f, std::fmax(0.0f, (absE - 0.5f) / 12.0f));
-        const float nearScale = 0.70f + 0.30f * nearBlend;
-        const float farBlend  = std::fmin(1.0f, std::fmax(0.0f, (absE - 20.0f) / 60.0f));
-        const float farBoost  = 1.0f + 0.35f * farBlend;
-        float eShaped = std::copysign(absE * nearScale * farBoost, e);
+        const float nearScale = 0.65f + 0.35f * nearBlend;
+        // 杜绝 farBoost 虚高放大 35% 导致的延迟管道充盈过冲
+        float eShaped = std::copysign(absE * nearScale, e);
         if (absE < 0.5f && std::fabs(vel) < 0.2f && std::fabs(dNorm) < 0.2f) {
             eShaped = 0.0f;
         }
-        // ★ P 软饱和（自 4c94f4a 存档点活代码原样移植）：eForP = kPSatPx·tanh。
-        // 线性区（<~60px）与原式一致；大误差渐近 kPSatPx——快速滑动后跟踪器
-        // 会按自身速度模型把发布中心朝滑动方向外推若干帧（"鬼影"），无饱和的
-        // 线性 P 会以几十 px/帧追鬼影（读作"往滑动方向甩飞"），饱和后 ~9px/帧，
-        // 检测修正帧一到就被拉回。
-        const float pT = kPSatPx * std::tanh(eShaped / kPSatPx) * kp_ * gate;
+        // P 软饱和：阈值设为 80px，既保证拉枪敏捷果断，又杜绝大误差超调
+        constexpr float kPSatThresholdPx = 80.0f;
+        const float pT = kPSatThresholdPx * std::tanh(eShaped / kPSatThresholdPx) * kp_ * gate;
 
-        // ── 2. 微分项 D（强力减震阻尼器）──────────────────────────────────────
-        // 始终保持有效阻尼，直接吸收准星冲撞靶心时的晃荡动能，杜绝弹簧反弹
-        float dT = clampRange(dNormForD, -kDerivClampPx, kDerivClampPx) * kd_ * gate;
-        if (frozen || (absE < 0.5f && absDe < 0.2f)) {
-            dT = 0.0f;
+        // ── 2. 微分项 D（纯粹反向阻尼制动，彻底杜绝穿靶顺风踹）───────────────
+        // 物理定义：阻尼只能吸收动能、阻止运动。
+        // 当准星在向靶心收敛（|e| < |lastError_| 且同号）时：de 与 e 异号，dNorm < 0 与 P 项相减，提供正向刹车阻尼。
+        // 当穿靶（变号）或误差扩大（|e| >= |lastError_|）时：de 与 e 同号！如果仍按 de*kd 计算，D 项将顺着过冲方向猛踹！
+        // 必须彻底杜绝顺风踹：当 de 与 e 同号（误差向外扩大/穿靶）时，D 项推力直接归零并施加穿靶制动！
+        float dT = 0.0f;
+        if (!frozen && absE >= 0.5f) {
+            // 穿靶或误差扩大保护
+            const bool isApproaching = sameSign(e, lastError_) && (absE < std::fabs(lastError_));
+            if (isApproaching) {
+                // 仅在真实收敛逼近靶心时计算反向阻尼
+                const float deMag = std::fabs(e - lastError_);
+                constexpr float kDerivNoiseFloor = 0.25f;
+                if (deMag >= kDerivNoiseFloor) {
+                    const float deClamped = std::fmin(deMag - kDerivNoiseFloor, 5.0f);
+                    // 阻尼力方向永远与误差 e 相反，阻止准星冲过靶心
+                    dT = -std::copysign(deClamped, e) * kd_ * gate;
+                }
+            } else {
+                // 穿靶（变号）或者正在向外过冲：
+                // 此时准星具有穿靶动能，绝不能顺风助推！
+                dT = 0.0f;
+            }
         }
 
-        // ── 3. 积分项 I（纯残料清扫，克里斯三重护栏）─────────────────────────
-        // 前馈已扛起载波（速度重构含自运动补偿），积分从此只清稳态残差。
-        // ★ 护栏一（pid.cpp:1391-1394 prepareIntegralForError）：变号硬清零。
-        //   过零电荷是纯外推能量，直接排空——旧版"运动中保留 70~95%"的软泄放
-        //   是载波缺失时代防断崖失速的补丁，载波修复后不再需要，它是极限环续命源。
-        // ★ 护栏二（pid.cpp:1185 iGain 远场抑制的等效写法）：远场累加封顶，
-        //   累加速率 = min(|e|,50)·ki，与大误差无关。
-        // ★ 护栏三（pid.cpp:219-224 integralScale）：输出近场门控，远处只放行
-        //   25%，贴近目标全额——ki 可以保持高值而不飞。
+        // ── 3. 积分项 I（纯残料清扫，近场且稳态才生效，杜绝高速拉枪充流动能）─
         float iOut = 0.0f;
         if (ki_ > 1e-4f && !frozen) {
+            // 变号硬清零（过零电荷直接排空，杜绝往复振荡）
             if (integral_ != 0.0f && e != 0.0f && !sameSign(e, integral_)) {
                 integral_ = 0.0f;
             }
-            if (absE < 3.0f && absDe < 2.0f) {
-                // 近距微抖区：冻结累加并温和泄电（保留原有机制）
-                integral_ *= 0.88f;
-            } else {
-                if (integral_ != 0.0f) {
-                    integral_ *= 0.94f;
+            // 只有当准星进入近靶心区域（< 15px）且没有大动态时才允许积分介入
+            if (absE < 15.0f && absDe < 3.0f) {
+                if (absE < 2.5f && absDe < 1.0f) {
+                    integral_ *= 0.90f; // 极近死区温和泄电
+                } else {
+                    integral_ *= 0.96f;
+                    const float eAcc = std::copysign(std::fmin(absE, 8.0f), e);
+                    integral_ += eAcc * ki_ * dtScale;
                 }
-                const float eAcc = std::copysign(
-                    std::fmin(absE, kIntegralAccCapPx), e);
-                integral_ += eAcc * ki_ * dtScale;
+                const float iCap = std::fmin(15.0f, std::fmax(1.5f, absE * 0.4f));
+                integral_ = clampRange(integral_, -iCap, iCap);
+
+                // 克里斯原版近场门控：远离靶心时积分输出归零，高速运动时压制
+                const float nearGate = std::exp(-absE / 10.0f);
+                const float stableError = std::exp(-absDe / 2.5f);
+                float integralScale = nearGate * stableError * (1.0f - 0.70f * adaptive.trust);
+                iOut = integral_ * integralScale;
+            } else {
+                // 大误差拉枪阶段：完全冻结并迅速泄放积分，防止冲过头时积分踢脚
+                integral_ *= 0.80f;
             }
-            const float iCap = std::fmin(30.0f, std::fmax(2.0f, absE * 0.5f));
-            integral_ = clampRange(integral_, -iCap, iCap);
-            const float nearGate = std::exp(-absE / kIntegralNearGateErrScale);
-            const float integralScale =
-                0.25f + 0.75f * nearGate * std::sqrt(nearGate);
-            iOut = integral_ * integralScale;
         } else {
-            integral_ *= 0.80f;
+            integral_ = 0.0f;
         }
 
-        // ── 4. 前馈项 FF（真正物理跟枪载波，克里斯 lookahead 结构）─────────────
-        // 速度重构已含自运动补偿，v̂ 就是目标真实速度（screen px/帧 ≈ finger px/帧）。
-        // 稳态咬住时 v̂ = u_ss，ff = lookahead·u_ss，恰好扛起 lookahead 份额的
-        // 载波，剩余 (1−lookahead) 由 P+I 补——积分从此只是残料清扫。
-        // 旧版 ×2.5 系数是为 dNorm 低估打的补丁，真速度下不再需要，已移除。
-        float ff = lookahead_ * vel;
+        // ── 4. 前馈项 FF（真正物理跟枪载波，结合自适应信任度门控）───────────
+        const float lookaheadFrames = clampRange(lookahead_ * latencyFrames(),
+                                                 0.0f, kMaxPredictionLookaheadFrames);
+        // 前馈结合自适应信任度门控：高速匀速全额输出，急停变向迅速衰减，杜绝过冲
+        float ff = lookaheadFrames * vel * (0.35f + 0.65f * adaptive.trust);
         if (frozen || (absE < 0.8f && std::fabs(vel) < 0.25f)) {
             ff *= std::clamp(absE / 0.8f, 0.0f, 1.0f);
         }
+        // 拉枪大误差阶段（> 20px）如果目标本身并无高置信度匀速运动，压制前馈，防止拉枪误用前馈
+        if (absE > 20.0f && adaptive.trust < 0.5f) {
+            ff *= adaptive.trust;
+        }
+        // 跳变帧不喂速度噪声
+        ff *= obsGate;
         ff = clampRange(ff, -kFfLimitPx, kFfLimitPx);
 
-        // ── 过冲方向抑制（★ 自 4c94f4a 存档点活代码原样移植）────────────────
-        // 误差越过目标 ≥1px 后，任何仍朝"远离目标"方向推的前馈分量清零、
-        // 速度记忆减半，积分分量清零且电荷排空——过冲发生后它们只会把准星
-        // 往外甩（"有时候甩出去"的来源就是本文件此前缺了这段）。
-        // 误差未越过的正常逼近侧不受影响，跟枪载波保持原样。
+        // ── 过冲方向抑制 ───────────────────────────────────────────────────
+        // 误差越过目标 ≥1px 后，抑制外推分量并衰减速度状态记忆
         if (e <= -kOvershootFloorPx) {
-            if (ff > 0.0f) {
-                ff = 0.0f;
-                velFilter_.x *= 0.5f;
-            }
-            if (iOut > 0.0f) {
-                iOut = 0.0f;
-                integral_ = 0.0f;
-            }
+            if (ff > 0.0f) { ff = 0.0f; obs_.velocity *= 0.5f; }
+            if (iOut > 0.0f) { iOut = 0.0f; integral_ = 0.0f; }
         } else if (e >= kOvershootFloorPx) {
-            if (ff < 0.0f) {
-                ff = 0.0f;
-                velFilter_.x *= 0.5f;
-            }
-            if (iOut < 0.0f) {
-                iOut = 0.0f;
-                integral_ = 0.0f;
-            }
+            if (ff < 0.0f) { ff = 0.0f; obs_.velocity *= 0.5f; }
+            if (iOut < 0.0f) { iOut = 0.0f; integral_ = 0.0f; }
         }
 
         // 合成总输出
         float out = pT + dT + iOut + ff;
         out = clampRange(out, -kAimOutLimitPx, kAimOutLimitPx);
 
-        // ── 收敛刹车（★ 自 4c94f4a 存档点活代码原样移植）────────────────────
-        // 误差同号且确实在收缩时，按"本帧收掉的剩余误差比例"整体裁剪输出：
-        // 逼近越接近目标越慢，从根上拦住 P 打在滞后误差上造成的过冲振荡
-        // （"有时候甩飞出去"的来源——ki=0/前馈=0 也甩，就是这条路径）。
-        // 稳态咬住、匀速滞后、已完成的停止的 shrink≈0，原样通过不衰减。
-        // 跳帧豁免：那一帧的步长是跟踪器的，不是逼近的。
+        // ── 克里斯控制器原版收敛刹车与穿靶吸附制动 ──────────────────────────
         const float prevMag = std::fabs(lastError_);
-        if (!hardReset && !softJump &&
-            prevMag > kConvBrakeErrFloor && prevMag > absE &&
-            sameSign(e, lastError_)) {
-            const float shrink = 1.0f - absE / prevMag;
-            out *= clampRange(1.0f - shrink * kConvBrakeStrength,
-                              kConvBrakeMinMult, 1.0f);
+        if (!hardReset && !softJump && prevMag > kConvBrakeErrFloor) {
+            if (sameSign(e, lastError_) && prevMag > absE) {
+                // 正在快速逼近靶心：按接近比例动态收敛刹车（像磁铁吸附一样柔和降落）
+                const float shrink = 1.0f - absE / prevMag;
+                out *= clampRange(1.0f - shrink * 0.45f, 0.55f, 1.0f);
+            } else if (!sameSign(e, lastError_)) {
+                // 刚刚穿过靶心（Zero Crossing 瞬间）：立即斩断 50% 输出，消除延迟管道残留动能！
+                out *= 0.50f;
+            }
         }
-
 
         if (outSmooth_ < 0.999f) {
             outSmoothState_ += (out - outSmoothState_) * outSmooth_;
             out = outSmoothState_;
         }
 
+        velLast_     = vel;
         lastOutput_  = out;
         lastError_   = e;
         prevRaw_     = raw;
@@ -1014,6 +1158,7 @@ public:
         lastCoherenceVelocity_ = 0.0f;
         resetPredictionMemory();
         errFilter_.reset();
+        obs_.reset();
         velFilter_.reset();
         velSmooth_.reset();
         pDisp_ = dDisp_ = iDisp_ = fDisp_ = 0.0f;
@@ -1314,6 +1459,7 @@ private:
     float lastCoherenceVelocity_ = 0.0f;
 
     OneEuro      errFilter_;
+    ErrorObserver obs_;   ///< B① — Chris error observer, drives the velocity estimate
     ScalarKalman velFilter_{kVelKalmanQ, kVelKalmanR, 0.0f, 1.0f};
     ScalarKalman velSmooth_{kVelKalmanQ, kVelKalmanR, 0.0f, 1.0f};
 

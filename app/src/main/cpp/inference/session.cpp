@@ -17,6 +17,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include "inference/session.h"
 
+#include "capture/capture.h"
 #include "inference/shared_region.h"
 
 #include <android/log.h>
@@ -481,6 +482,57 @@ void Session::submit(const FrameView& frame) {
         if (copied) impl_->stats.copied++;
     }
     impl_->slotCv.notify_one();
+}
+
+bool Session::submitFromCapture(uint64_t& lastId) {
+    int w = 0, h = 0;
+    if (!capture::peekSize(w, h) || w <= 0 || h <= 0) return false;
+    const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+
+    int dst = -1;
+    uint8_t* out = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->slotMutex);
+        if (impl_->stop) return false;
+        if (!impl_->ensureCapacity(bytes)) return false;
+
+        dst = impl_->nextSeq;
+        if (impl_->owner == dst) dst ^= 1;
+        out = impl_->bytesOf(dst);
+        if (out == nullptr) return false;
+    }
+
+    int gotW = 0, gotH = 0;
+    uint64_t tsNs = 0;
+    uint64_t id = lastId;
+    // Single-Copy: copy directly from capture frame into session mailbox buffer
+    if (!capture::copyLatestInto(out, bytes, gotW, gotH, id, &tsNs)) {
+        return false;
+    }
+    lastId = id;
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->slotMutex);
+        if (impl_->slotSeq != impl_->takenSeq) {
+            std::lock_guard<std::mutex> slock(impl_->statsMutex);
+            impl_->stats.dropped++;
+        }
+        impl_->slotView.pixels = out;
+        impl_->slotView.width = gotW;
+        impl_->slotView.height = gotH;
+        impl_->slotView.rowStrideBytes = gotW * 4;
+        impl_->slotView.tsNs = tsNs;
+        impl_->published = dst;
+        impl_->slotSeq++;
+        impl_->nextSeq = dst ^ 1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->statsMutex);
+        impl_->stats.submitted++;
+        impl_->stats.copied++;
+    }
+    impl_->slotCv.notify_one();
+    return true;
 }
 
 bool Session::wantsFrames() const {

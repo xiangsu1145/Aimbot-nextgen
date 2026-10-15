@@ -413,7 +413,7 @@ TfLiteDelegate* buildDelegate(Ep ep, const std::string& cacheToken,
             return d;
         }
         qnn.backend_type           = kHtpBackend;
-        qnn.log_level              = kLogLevelDebug;
+        qnn.log_level              = kLogLevelError;   // was Debug — the VERBOSE flood was evicting every other tag from logd's per-proc quota
         qnn.htp_options.precision  = isQuantized ? kHtpQuantized : kHtpFp16;
         qnn.htp_options.performance_mode =
             static_cast<TfLiteQnnDelegateHtpPerformanceMode>(pm);
@@ -1027,10 +1027,21 @@ std::vector<Box> LiteRtEngine::run(const FrameView& frame, const Roi& roi) {
 
     try {
         // ── Preprocess ─────────────────────────────────────────────────────
+        // ── Input tensor setup ───────────────────────────────────────────────
+        TfLiteTensor* inTensor = TfLiteInterpreterGetInputTensor(m.interp, 0);
+        if (inTensor == nullptr) {
+            status_ = Status::bad("GetInputTensor returned null");
+            return none;
+        }
+        void* directData = TfLiteTensorData(inTensor);
+
         const auto tPre = Clock::now();
         LetterboxMap map;
 
-        if (m.inType == kTfLiteFloat32 || m.inType == kTfLiteFloat16) {
+        if (m.inType == kTfLiteFloat32 && directData != nullptr) {
+            // Single-Copy: write directly into the model's host tensor memory
+            map = letterboxRgba(frame, roi, m.pre, static_cast<float*>(directData));
+        } else if (m.inType == kTfLiteFloat32 || m.inType == kTfLiteFloat16) {
             map = letterboxRgba(frame, roi, m.pre, m.inputF32.data());
         } else {
             map = letterboxRgbaU8(frame, roi, m.pre, m.inputU8.data());
@@ -1039,15 +1050,11 @@ std::vector<Box> LiteRtEngine::run(const FrameView& frame, const Roi& roi) {
 
         // ── Copy into the input tensor ──────────────────────────────────────
         const auto tCopy = Clock::now();
-        TfLiteTensor* inTensor = TfLiteInterpreterGetInputTensor(m.interp, 0);
-        if (inTensor == nullptr) {
-            status_ = Status::bad("GetInputTensor returned null");
-            return none;
-        }
 
         const bool okCopy = [&]() {
             switch (m.inType) {
                 case kTfLiteFloat32:
+                    if (directData != nullptr) return true; // already written directly
                     return TfLiteTensorCopyFromBuffer(inTensor, m.inputF32.data(),
                         m.inputF32.size() * sizeof(float)) == kTfLiteOk;
                 case kTfLiteFloat16: {

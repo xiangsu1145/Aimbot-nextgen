@@ -18,6 +18,7 @@
 #include "tracking/crosshair_detect.h"
 #include "tracking/kalman_tracker.h"
 #include "ui/gui/notify.h"
+#include "ui/gui/sections/capture_section.h"
 #include "ui/gui/sections/recoil_section.h"
 
 #define TAG "AimbotRecoil"
@@ -89,6 +90,9 @@ bool validStem(const std::string& s) {
 }
 
 bool grabFrame() {
+    if (!ui::sections::g_pageRecoil.enabled.value || !ui::sections::g_pageCapture.enabled.value || !capture::enabled()) {
+        return false;
+    }
     int w = 0, h = 0;
     if (!capture::peekSize(w, h) || w <= 0 || h <= 0) return false;
     const size_t bytes = (size_t)w * h * 4;
@@ -372,19 +376,22 @@ void resetTracking() {
 
 bool getCrosshairPosition(float& screenX, float& screenY) {
     const auto& pg = ui::sections::g_pageRecoil;
-    if (!pg.enabled.value ||
+    if (!pg.enabled.value || !ui::sections::g_pageCapture.enabled.value || !capture::enabled() ||
         pg.mode.value != ui::sections::PageRecoil::kModeCrosshair ||
         !g_tracking || !g_havePos) {
         return false;
     }
     int ox = 0, oy = 0;
-    capture::cropOrigin(ox, oy);
+    if (!capture::cropOrigin(ox, oy)) return false;
     screenX = (float)ox + g_px;
     screenY = (float)oy + g_py;
     return true;
 }
 
 void pumpPreview() {
+    if (!ui::sections::g_pageRecoil.enabled.value || !ui::sections::g_pageCapture.enabled.value || !capture::enabled()) {
+        return;
+    }
     ensureLoaded();
     if (g_cfgs.empty()) return;
 
@@ -464,8 +471,15 @@ void pumpTracking(bool enabled) {
     pumpSampling();
 
     const auto& pg = ui::sections::g_pageRecoil;
+    if (!pg.enabled.value || !ui::sections::g_pageCapture.enabled.value || !capture::enabled()) {
+        if (g_havePos) {
+            g_havePos = false;
+            g_missed = 0;
+        }
+        return;
+    }
     const bool isTriggering = pg.continuousTrigger.value || ui::sections::recoilIsFiring();
-    const bool active = enabled && pg.enabled.value &&
+    const bool active = enabled &&
                         pg.mode.value == ui::sections::PageRecoil::kModeCrosshair &&
                         g_tracking && isTriggering;
     if (!active) {
@@ -563,9 +577,9 @@ void pumpTracking(bool enabled) {
 bool wantsFrames() {
     if (g_sampling) return true;
     const auto& pg = ui::sections::g_pageRecoil;
+    if (!pg.enabled.value || !ui::sections::g_pageCapture.enabled.value || !capture::enabled()) return false;
     const bool isTriggering = pg.continuousTrigger.value || ui::sections::recoilIsFiring();
-    return pg.enabled.value &&
-           pg.mode.value == ui::sections::PageRecoil::kModeCrosshair &&
+    return pg.mode.value == ui::sections::PageRecoil::kModeCrosshair &&
            g_tracking && isTriggering;
 }
 
@@ -573,8 +587,15 @@ bool preview(Preview& out) {
     // Screen coordinates, not frame coordinates: the preview panel maps
     // against the capture square's screen rect, so raw frame coords (0..255)
     // landed outside the panel and the green cross never showed.
+    if (!ui::sections::g_pageRecoil.enabled.value || !ui::sections::g_pageCapture.enabled.value || !capture::enabled()) {
+        out = Preview{};
+        return false;
+    }
     int ox = 0, oy = 0;
-    capture::cropOrigin(ox, oy);
+    if (!capture::cropOrigin(ox, oy)) {
+        out = Preview{};
+        return false;
+    }
     out.found = g_havePos;
     out.fx = (float)ox + g_px; out.fy = (float)oy + g_py;
     out.fw = g_frameW; out.fh = g_frameH;

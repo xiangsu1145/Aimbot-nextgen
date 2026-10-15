@@ -28,7 +28,9 @@
 #include "capture/capture.h"
 #include "config/config_manager.h"
 #include "inference/model_runtime.h"
+#include "inference/model_store.h"
 #include "input/skip_screenshot.h"
+#include "input/touch_reader.h"
 #include "tracking/crosshair_recoil.h"
 #include "tracking/recoil_recorder.h"
 #include "tracking/tuning_server.h"
@@ -1079,7 +1081,9 @@ bool updateCaptureTexture() {
     // frames while it is on screen, inference wants them while a model is
     // running.
     const bool wantsPreview = (currentSection() == MenuSection::Capture) && !hudHidden();
-    const bool wantsInfer   = infer::runtime::wantsFrames();
+    // 只要有模型已加载，并且截图总开关打开，就保持录屏与帧消费就绪状态，
+    // 使得“按住推理”时内存已有最新帧，避免反复释放和冷启动重建底层 VirtualDisplay 产生半秒延迟
+    const bool wantsInfer   = infer::runtime::wantsFrames() || (model::loadedId() > 0 && capture::enabled());
     // The recoil recorder is a THIRD reason to keep frames coming, and the one
     // most likely to be missed: it samples the crop the marker lives in while a
     // burst is being measured, which happens with the board hidden and with the
@@ -1367,6 +1371,7 @@ static void voteFrameRate(float fps) {
 /// Cheap "is a finger waiting?" test, used to cut the idle sleep short. Takes
 /// the input lock, so it stays out of the render path.
 static bool inputPending() {
+    if (reader_is_ready() && reader_pointer_count() > 0) return true;
     std::lock_guard<std::mutex> lock(g_inputMutex);
     return !g_inputQueue.empty() || g_pendingScroll != 0.0f;
 }
@@ -1583,6 +1588,9 @@ void* renderThread(void*) {
         // before drawHud(), so a fresh frame and the menu showing it land in
         // the same frame rather than the preview trailing by one.
         updateCaptureTexture();
+        // Sync settings page (which updates hold-to-infer intent and arms the detector)
+        // before pump(), so the very frame the finger lands immediately pumps to inference.
+        sections::syncSettingsPage();
         // Then hand the newest frame to the detector. Here rather than on a
         // timer of its own because this is already the once-per-frame tick, and
         // it is where the capture gate above has just been opened for inference
@@ -1657,16 +1665,17 @@ void* renderThread(void*) {
         } else if (aiming) {
             periodUs = kFramePeriodUs;
             pacedFps = kTargetFps;
-        } else if (inferring) {
-            // Checked before `hidden`, not after: the case that matters most is a
-            // hidden menu with a detector running, which is a person aiming. The
-            // dormant tier would starve it to 2 frames a second and the only
-            // visible symptom would be a detector that "does not work".
-            periodUs = kInferencePeriodUs;
-            pacedFps = kInferenceFps;
         } else if (hidden) {
+            // When the menu board is hidden and not aiming, the UI thread sleeps
+            // at the dormant tier (2 fps). Inference is now fed directly by the native
+            // capture callback onNativeImageAvailable, so dormant UI rendering will
+            // NOT starve the detector, saving massive GPU power and thermal budget.
             periodUs = kDormantPeriodUs;
             pacedFps = kDormantFps;
+        } else if (inferring) {
+            // Board is visible and inferring: redraw at 60 fps to show detections
+            periodUs = kInferencePeriodUs;
+            pacedFps = kInferenceFps;
         } else if (capture::consuming() && capture::frameRate() > 0) {
             // Live preview: smooth enough to watch, a quarter of the redraws.
             periodUs = kPreviewPeriodUs;

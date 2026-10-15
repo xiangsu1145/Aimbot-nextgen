@@ -352,11 +352,11 @@ Status NcnnEngine::load(const ModelSpec& spec) {
 #endif
     } else {
         impl->net.opt.use_vulkan_compute = false;
-        const int threads = (spec.cpuThreads > 0) ? spec.cpuThreads : 4;
+        const int threads = (spec.cpuThreads > 0) ? spec.cpuThreads : 2;
         impl->net.opt.num_threads = threads;
         ncnn::set_omp_num_threads(threads);
-        // Bind to big/performance cores (e.g. Snapdragon Cortex-X / Cortex-A7xx)
-        ncnn::set_cpu_powersave(0);
+        // Bind to big cores (Cortex-A7xx) instead of thrashing Cortex-X prime core to control thermals
+        ncnn::set_cpu_powersave(2);
         if (impl->isInt8) {
             // For INT8 models, disable FP16 storage and arithmetic to avoid redundant
             // fp16 <-> fp32 <-> int8 double-casting on ARM NEON

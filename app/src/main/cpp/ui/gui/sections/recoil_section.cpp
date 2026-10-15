@@ -135,6 +135,10 @@ bool anyPhysicalFingerIn(const widgets::Rect& r) {
 /// out through uinput and never appears there at all.
 bool firingNow() {
     PageRecoil& pg = g_pageRecoil;
+    // 没开压枪，不要进行任何压枪操作
+    if (!pg.enabled.value) return false;
+    // 没开截图，按压枪位置不发生任何事情
+    if (!g_pageCapture.enabled.value || !capture::enabled()) return false;
     if (triggerIsFiring()) return true;
     if (pg.continuousTrigger.value) return true;
     if (!pg.fire.placed) return false;
@@ -387,6 +391,19 @@ bool drawPatternChart(ImDrawList* dl, const widgets::Rect& r, float s, const Xf&
 void drawCrosshairPreview(ImDrawList* dl, const widgets::Rect& r, float s,
                           const Xf& xf) {
     const PageRecoil& pg = g_pageRecoil;
+    const ImU32 bg    = IM_COL32(16, 18, 22, 255);
+    const ImU32 line  = IM_COL32(255, 255, 255, 40);
+
+    if (!pg.enabled.value || !g_pageCapture.enabled.value || !capture::enabled()) {
+        dl->AddRectFilled(ImVec2(r.x, r.y), ImVec2(r.x + r.w, r.y + r.h), bg, 8.0f * s);
+        dl->AddRect(ImVec2(r.x, r.y), ImVec2(r.x + r.w, r.y + r.h), line, 8.0f * s);
+        ImFont* font = ImGui::GetFont();
+        const char* msg = !pg.enabled.value ? "准心预览 · 压枪总开关已关闭" : "准心预览 · 截图未开启";
+        dl->AddText(font, tsize(kTextS * s) * xf.scale, ImVec2(r.x + 12.0f * s, r.y + 12.0f * s),
+                    IM_COL32(180, 180, 180, 255), msg);
+        return;
+    }
+
     const bool active = pg.enabled.value && pg.xTrack.value &&
                         (pg.continuousTrigger.value || recoilIsFiring());
     if (active) {
@@ -397,8 +414,6 @@ void drawCrosshairPreview(ImDrawList* dl, const widgets::Rect& r, float s,
     Preview pv;
     crosshair::preview(pv);
 
-    const ImU32 bg    = IM_COL32(16, 18, 22, 255);
-    const ImU32 line  = IM_COL32(255, 255, 255, 40);
     const ImU32 grey  = IM_COL32(150, 150, 150, 200);
     const ImU32 green = IM_COL32( 80, 230, 120, 255);
     const ImU32 red   = IM_COL32(255,  80,  80, 220);
@@ -1486,6 +1501,38 @@ std::string recoilHeaderText() {
 
 void syncRecoilPage() {
     PageRecoil& pg = g_pageRecoil;
+
+    // ── 1. 没开压枪：清理所有状态，不进行任何压枪操作 ──
+    if (!pg.enabled.value) {
+        if (g_ownHeld) {
+            uinput_up(UINPUT_SLOT_PRIMARY);
+            g_ownHeld = false;
+            reader_set_point_guard(nullptr, false, -1);
+        }
+        reader_set_view_offset(nullptr, 0.0f, 0.0f);
+        recoil::publishAimDelta(0.0f, 0.0f);
+        if (crosshair::tracking()) {
+            crosshair::resetTracking();
+        }
+        g_wasFiring = false;
+        return;
+    }
+
+    // ── 2. 没开截图：按压枪位置不发生任何事情，直接返回 ──
+    if (!g_pageCapture.enabled.value || !capture::enabled()) {
+        if (g_ownHeld) {
+            uinput_up(UINPUT_SLOT_PRIMARY);
+            g_ownHeld = false;
+            reader_set_point_guard(nullptr, false, -1);
+        }
+        reader_set_view_offset(nullptr, 0.0f, 0.0f);
+        recoil::publishAimDelta(0.0f, 0.0f);
+        if (crosshair::tracking()) {
+            crosshair::resetTracking();
+        }
+        g_wasFiring = false;
+        return;
+    }
 
     // The recorder is a third reader of frames, alongside the preview and
     // inference. Announcing it here is what keeps the shell's capture

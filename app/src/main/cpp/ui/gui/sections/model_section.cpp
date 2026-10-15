@@ -18,6 +18,7 @@
 #include "inference/model_runtime.h"
 #include "inference/model_store.h"
 #include "inference/model_type.h"
+#include "inference/box_format.h"
 #include "inference/ncnn_engine.h"
 #include "ui/gui/hud.h"
 #include "ui/gui/notify.h"
@@ -221,6 +222,16 @@ int clampHtpPerf(int v) {
     return v;
 }
 
+/// Labels for the box-format dropdown. Index 0 = cxcywh (raw YOLOv8 head, the
+/// common case), index 1 = xyxy (end2end exports, baked dist2bbox). The model
+/// store persists 0/1; this list has to keep that order.
+const char* const kBoxFormatLabels[] = {
+    "中心+宽高 (cxcywh)",
+    "对角坐标 (xyxy)",
+};
+constexpr int kBoxFormatCount =
+    static_cast<int>(sizeof(kBoxFormatLabels) / sizeof(kBoxFormatLabels[0]));
+
 void loadDir(FileBrowser& fb, const std::string& dir) {
     fb.dir = dir;
     fb.entries.clear();
@@ -314,6 +325,21 @@ void selectFile(const std::string& path) {
 
     // Peek the model's tensor element type
     pg.pathType = aimbotng::infer::detectModelType(std::string(pg.pathBuf, pg.pathLen));
+
+    // Auto-detect the box-coordinate format from the file's static graph
+    // (no inference). The Add dialog uses this to seed the cxcywh/xyxy
+    // dropdown default; the user can flip it before adding. Detection runs
+    // on Add only — the Settings dialog always takes the entry's stored
+    // value as the starting point so flipping the model later doesn't
+    // silently change a previously-correct value.
+    {
+        const auto fmt = aimbotng::infer::analyzeBoxFormat(
+            std::string(pg.pathBuf, pg.pathLen));
+        pg.boxFormat.value = (fmt == aimbotng::infer::BoxFormat::Xyxy) ? 1 : 0;
+        pg.boxFormat.open  = false;
+        LOGI("AddDialog: file selected, box-format auto-detect -> %s",
+             aimbotng::infer::boxFormatName(fmt));
+    }
 
     // For NCNN models, check if the sibling companion file exists in the same folder
     const model::Kind kind = model::kindOfPath(std::string(pg.pathBuf, pg.pathLen));
@@ -683,6 +709,14 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     widgets::sliderFloat(dl, confRect, pg.conf, "置信度", 2, es);
     yc += 76.0f * s + padY;
 
+    // 3a. Box-coordinate format — the user's pick between cxcywh (raw YOLOv8
+    // head) and xyxy (end2end / dist2bbox baked). Always shown: every
+    // detection model needs the choice, regardless of engine.
+    widgets::Rect boxRect{card.x + padX, yc, card.w - 2.0f * padX, 58.0f * s};
+    widgets::dropdown(dl, boxRect, pg.boxFormat, "框坐标格式",
+                      kBoxFormatLabels, kBoxFormatCount, es, false);
+    yc += 58.0f * s + padY;
+
     // Which engine is currently selected drives which extra controls show.
     const model::Engine selEngine = (kind != model::Kind::Unknown && pg.engine.value >= 0)
                                      ? model::engineAt(kind, pg.engine.value)
@@ -771,6 +805,9 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
         e.typeText   = pg.pathType;   // detected at file pick time
         e.cpuThreads = static_cast<int>(pg.threadsSlider.value + 0.5f);
         e.htpPerfMode = clampHtpPerf(pg.htpPerf.value);  // HTP scheduler vote
+        // pg.boxFormat.value == 1 → xyxy. -1 (impossible here, dropdown was
+        // seeded with 0) and any out-of-range index coerce to 0 = cxcywh.
+        e.boxXyxy = (pg.boxFormat.value == 1);
         model::add(e);
         pg.dialog = ModelDialogState::Closed;
         pg.pathPicking = false;
@@ -788,6 +825,8 @@ void drawAddModelDialog(ImDrawList* dl, const HudRect& board, float s, float es,
     // the floating popover while it is open — standard menu behaviour.
     widgets::dropdownList(dl, engineRect, pg.engine, engines, enginesCount, es,
                           engineDisabled);
+    widgets::dropdownList(dl, boxRect, pg.boxFormat, kBoxFormatLabels,
+                          kBoxFormatCount, es);
     if (selEngine == model::Engine::QnnHtp && htpRect.w > 0.0f) {
         widgets::dropdownList(dl, htpRect, pg.htpPerf, htpLabels, htpCount, es);
     }
@@ -887,6 +926,13 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
     widgets::sliderFloat(dl, confRect, pg.settingsConf, "置信度", 2, es);
     yc += 80.0f * s + padY;
 
+    // 2a. Box-coordinate format — same choice as the Add dialog, read out of
+    // the entry on open and written back via setBoxXyxy() on Save.
+    widgets::Rect settingsBoxRect{card.x + padX, yc, card.w - 2.0f * padX, 58.0f * s};
+    widgets::dropdown(dl, settingsBoxRect, pg.settingsBoxFormat, "框坐标格式",
+                      kBoxFormatLabels, kBoxFormatCount, es, false);
+    yc += 58.0f * s + padY;
+
     // Which engine is currently selected drives which extra controls show.
     const model::Engine selEngine = (pg.settingsEngine.value >= 0)
                                      ? model::engineAt(current.kind, pg.settingsEngine.value)
@@ -939,25 +985,37 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
                        : current.engine;
         const float newConf   = pg.settingsConf.value;
         const int   newHtp    = clampHtpPerf(pg.settingsHtpPerf.value);
+        // boxXyxy change takes effect on the next Load, but the live engine
+        // is built from the old value; the box reader is a snapshot baked
+        // into the engine's PostprocessConfig. Same answer as engine / threads
+        // / htpPerf: a compile-time input that needs invalidateEngine() so the
+        // fast path stops serving the stale engine.
+        const bool newBoxXyxy = (pg.settingsBoxFormat.value == 1);
 
         // Did anything that the *compiled graph* depends on change? Engine,
-        // thread count and HTP vote are all baked in at delegate-build time, so
-        // a change to any of them leaves the live interpreter holding the old
-        // one — and prepare()'s fast path (`engineReady && same id`) cannot see
-        // it. Read the previous values before the write below clobbers them.
+        // thread count, HTP vote and box-format are all baked in at
+        // delegate-build / graph-load time, so a change to any of them leaves
+        // the live interpreter holding the old one — and prepare()'s fast
+        // path (`engineReady && same id`) cannot see it. Read the previous
+        // values before the write below clobbers them.
         const bool engineChanged =
             current.engine != newEngine || current.cpuThreads != threads ||
-            current.htpPerfMode != newHtp;
+            current.htpPerfMode != newHtp || current.boxXyxy != newBoxXyxy;
 
         LOGI("SettingsDialog: SAVE model #%d '%s' — old engine=%d (%s), "
              "new engine=%d (%s), threads=%d, htpPerf=%d, conf=%.2f, "
-             "engineChanged=%d",
+             "boxXyxy=%s, engineChanged=%d",
              current.id, current.name.c_str(),
              static_cast<int>(current.engine), model::engineLabel(current.engine),
              static_cast<int>(newEngine),    model::engineLabel(newEngine),
-             threads, newHtp, newConf, engineChanged ? 1 : 0);
+             threads, newHtp, newConf,
+             newBoxXyxy ? "xyxy" : "cxcywh",
+             engineChanged ? 1 : 0);
 
         model::setInference(pg.settingsId, newEngine, newConf, threads, newHtp);
+        if (current.boxXyxy != newBoxXyxy) {
+            model::setBoxXyxy(pg.settingsId, newBoxXyxy);
+        }
 
         // Confidence, by contrast, is applied per frame by the session's
         // post-processing, so it is picked up on the next inference and must NOT
@@ -974,6 +1032,8 @@ void drawModelSettingsDialog(ImDrawList* dl, const HudRect& board, float s, floa
     // floating popover while it is open.
     widgets::dropdownList(dl, engineRect, pg.settingsEngine, engines, enginesCount, es,
                           settingsEngineDisabled);
+    widgets::dropdownList(dl, settingsBoxRect, pg.settingsBoxFormat, kBoxFormatLabels,
+                          kBoxFormatCount, es);
     if (selEngine == model::Engine::QnnHtp && htpRect.w > 0.0f) {
         widgets::dropdownList(dl, htpRect, pg.settingsHtpPerf, htpLabels, htpCount, es);
     }
@@ -1034,6 +1094,8 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
         pg.threadsSlider.dragging = false;
         pg.htpPerf.value  = 1;   // default: Sustained High Performance
         pg.htpPerf.open   = false;
+        pg.boxFormat.value = 0;   // default: cxcywh (raw YOLOv8 head convention)
+        pg.boxFormat.open  = false;
         pg.pathPicking       = false;
         pg.pathFailed        = false;
         pg.pathErr[0]        = '\0';
@@ -1098,11 +1160,12 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
             detail[0] = '\0';
         }
         snprintf(line2, sizeof(line2),
-                 "%s  •  %s  •  conf %.2f  •  %d classes  •  %dx%d%s%s%s",
+                 "%s  •  %s  •  conf %.2f  •  %d classes  •  %s  •  %dx%d%s%s%s",
                  model::engineLabel(e.engine),
                  typeTxt,
                  e.confidence,
                  static_cast<int>(e.classCount),
+                 e.boxXyxy ? "xyxy" : "cxcywh",
                  e.inputSize,
                  e.inputSize,
                  detail[0] ? "  •  " : "",
@@ -1140,6 +1203,8 @@ void drawModelSection(ImDrawList* dl, float x, float& y, float w,
             pg.settingsThreadsSlider.dragging = false;
             pg.settingsHtpPerf.value = clampHtpPerf(e.htpPerfMode);
             pg.settingsHtpPerf.open  = false;
+            pg.settingsBoxFormat.value = e.boxXyxy ? 1 : 0;
+            pg.settingsBoxFormat.open  = false;
             pg.dialog = ModelDialogState::Settings;
             // Same opening-tap swallow as the Add Model button above.
             widgets::consumeTap();
@@ -1272,14 +1337,34 @@ void syncModelPage() {
     // a switch the user cannot even see, and holding the area would work or not
     // depending on the frame order.
     //
-    // So: in triggered mode this function only tracks the two values it watches,
-    // and touches nothing. The track is still updated (rather than returning
-    // early before it) so that leaving triggered mode does not look like a
-    // spontaneous edge to the code below.
+    // ── Triggered mode: this page has no authority over arm/disarm ──────────
+    // With continuous inference OFF, the Settings page's inference-area circle
+    // owns arm/disarm, and hud.cpp forces this page's switch off and grey
+    // precisely so the user cannot reach it.
+    //
+    // However, model selection (id != lastLoadedId) MUST still take effect!
+    // When the user taps Load on another model (or Unload), we compile
+    // the new model (or stop runtime), so it is ready when the user presses
+    // the inference area.
     if (!g_pageSettings.continuousInference.value) {
-        if (on != lastOn || id != lastLoadedId) {
-            lastOn = on;
+        lastOn = on;
+        if (id != lastLoadedId) {
             lastLoadedId = id;
+            if (id > 0) {
+                bool hasModel = false;
+                for (const model::Entry& e : model::all()) {
+                    if (e.id == id) { hasModel = true; break; }
+                }
+                if (hasModel) {
+                    static std::atomic<bool> killed{false};
+                    killed.store(false);
+                    startCompileAsync(id, &killed);
+                } else {
+                    infer::runtime::stop();
+                }
+            } else {
+                infer::runtime::stop();
+            }
         }
         return;
     }

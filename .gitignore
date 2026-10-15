@@ -66,9 +66,11 @@ framework.jar
 tombstone_29.txt
 tombstones_pulled/
 
-# ── Neuron reverse-engineering notes & tooling (private IP) ──────────
-docs/neuron-delegate-reverse-v2.md
-docs/mtk-litert-npu-crash.md
+# ── Reverse-engineering notes & tooling (private IP) ──────────────
+# docs/ holds private RE/analysis notes (e.g. Neuron delegate RE).
+# Whole directory is excluded — new files won't be tracked either.
+# (legacy per-file entries below kept commented for archaeology;
+/docs/
 tools/_diag/
 
 # ── Temp / private models & intermediate artifacts (never commit) ────

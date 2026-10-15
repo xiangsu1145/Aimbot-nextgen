@@ -199,6 +199,18 @@ void ensureLoadedLocked() {
         if (fields.size() > 13) {
             e.binPath = fields[13];
         }
+        // boxXyxy is the 15th field (index 14): the user's manual box-format
+        // choice for this model. A line written before this field existed
+        // (older builds) defaults to cxcywh — the project's documented
+        // default. The pre-rename build carried a fragile filename-substring
+        // heuristic here; dropping it is intentional (we do not want an old
+        // "raw_xyxy_*" file name silently forcing xyxy on a model whose
+        // actual head is cxcywh).
+        if (fields.size() > 14) {
+            e.boxXyxy = (atoi(fields[14].c_str()) != 0);
+        } else {
+            e.boxXyxy = false;   // default: cxcywh
+        }
         if (fields.size() > 7 && !fields[7].empty()) {
             std::istringstream cls(fields[7]);
             std::string name;
@@ -292,6 +304,11 @@ void saveLocked() {
         // binPath is the 14th field (index 13)
         fputc(kFieldSep, f);
         fputs(e.binPath.c_str(), f);
+        // boxXyxy is the 15th field (index 14): 0 for cxcywh, 1 for xyxy.
+        // Fixed single int appended last so older lines on device (no such
+        // field) keep loading under the same legacy heuristic.
+        fputc(kFieldSep, f);
+        fprintf(f, "%d", e.boxXyxy ? 1 : 0);
         fputc('\n', f);
     }
     fclose(f);
@@ -570,6 +587,20 @@ bool setType(int id, const std::string& typeText) {
         e.typeText = typeText;
         saveLocked();
         LOGI("model #%d type -> %s", id, typeText.c_str());
+        return true;
+    }
+    return false;
+}
+
+bool setBoxXyxy(int id, bool boxXyxy) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ensureLoadedLocked();
+    for (Entry& e : g_entries) {
+        if (e.id != id) continue;
+        if (e.boxXyxy == boxXyxy) return true;   // nothing to persist
+        e.boxXyxy = boxXyxy;
+        saveLocked();
+        LOGI("model #%d boxXyxy -> %s", id, boxXyxy ? "xyxy" : "cxcywh");
         return true;
     }
     return false;

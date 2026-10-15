@@ -28,6 +28,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace aimbotng {
 namespace infer {
 namespace {
@@ -156,6 +160,26 @@ Plan makePlan(const FrameView& frame, const Roi& roi, const PreprocessConfig& cf
     const Roi src = Roi::resolve(roi, frame);
     if (src.empty()) return p;
 
+    // ── Per-frame Plan Cache: eliminate heap reallocation when geometry is static
+    struct PlanKey {
+        int srcX = 0, srcY = 0, srcW = 0, srcH = 0;
+        int targetW = 0, targetH = 0;
+        bool keepAspect = false;
+
+        bool operator==(const PlanKey& o) const {
+            return srcX == o.srcX && srcY == o.srcY && srcW == o.srcW && srcH == o.srcH &&
+                   targetW == o.targetW && targetH == o.targetH && keepAspect == o.keepAspect;
+        }
+    };
+
+    static thread_local PlanKey cachedKey{};
+    static thread_local Plan    cachedPlan{};
+
+    const PlanKey key{src.x, src.y, src.w, src.h, cfg.targetW, cfg.targetH, cfg.keepAspect};
+    if (cachedPlan.ok && cachedKey == key) {
+        return cachedPlan;
+    }
+
     p.srcX = src.x;
     p.srcY = src.y;
     p.srcW = src.w;
@@ -194,6 +218,8 @@ Plan makePlan(const FrameView& frame, const Roi& roi, const PreprocessConfig& cf
     p.map.roiY  = src.y;
 
     p.ok = true;
+    cachedKey = key;
+    cachedPlan = p;
     return p;
 }
 
@@ -279,8 +305,10 @@ void LetterboxMap::toFrame(float& x1, float& y1, float& x2, float& y2) const {
 
 LetterboxMap letterboxRgba(const FrameView& frame, const Roi& roi,
                            const PreprocessConfig& cfg, float* out) {
+    if (out == nullptr) return LetterboxMap::identity();
+
     const Plan p = makePlan(frame, roi, cfg);
-    if (out == nullptr || !p.ok) return LetterboxMap::identity();
+    if (!p.ok) return LetterboxMap::identity();
 
     const int w = p.targetW;
     const int h = p.targetH;
@@ -301,15 +329,51 @@ LetterboxMap letterboxRgba(const FrameView& frame, const Roi& roi,
         const uint8_t* src = frame.pixels +
                              static_cast<size_t>(p.srcY) * static_cast<size_t>(frame.rowStrideBytes) +
                              static_cast<size_t>(p.srcX) * 4u;
+        const float invStdv[3] = {
+            1.0f / cfg.stdv[0],
+            1.0f / cfg.stdv[1],
+            1.0f / cfg.stdv[2]
+        };
+
         for (int y = 0; y < h; ++y) {
             const uint8_t* s = src + static_cast<size_t>(y) * static_cast<size_t>(frame.rowStrideBytes);
             float* d = out + static_cast<size_t>(y) * static_cast<size_t>(w) * 3u;
-            for (int x = 0; x < w; ++x) {
+            int x = 0;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            // Vectorize 4 pixels per chunk
+            for (; x + 4 <= w; x += 4) {
+                uint8x8x4_t rgba = vld4_u8(s);  // loads 8 pixels, we use lower 4
+                uint16x4_t r16 = vget_low_u16(vmovl_u8(rgba.val[cfg.bgr ? 2 : 0]));
+                uint16x4_t g16 = vget_low_u16(vmovl_u8(rgba.val[1]));
+                uint16x4_t b16 = vget_low_u16(vmovl_u8(rgba.val[cfg.bgr ? 0 : 2]));
+
+                float32x4_t rF = vcvtq_f32_u32(vmovl_u16(r16));
+                float32x4_t gF = vcvtq_f32_u32(vmovl_u16(g16));
+                float32x4_t bF = vcvtq_f32_u32(vmovl_u16(b16));
+
+                float32x4x3_t outRgb;
+                if (cfg.normalize) {
+                    const int c0_idx = cfg.bgr ? 2 : 0;
+                    const int c2_idx = cfg.bgr ? 0 : 2;
+                    outRgb.val[0] = vmulq_n_f32(vsubq_f32(rF, vdupq_n_f32(cfg.mean[c0_idx])), invStdv[c0_idx]);
+                    outRgb.val[1] = vmulq_n_f32(vsubq_f32(gF, vdupq_n_f32(cfg.mean[1])), invStdv[1]);
+                    outRgb.val[2] = vmulq_n_f32(vsubq_f32(bF, vdupq_n_f32(cfg.mean[c2_idx])), invStdv[c2_idx]);
+                } else {
+                    outRgb.val[0] = vmulq_n_f32(rF, sc);
+                    outRgb.val[1] = vmulq_n_f32(gF, sc);
+                    outRgb.val[2] = vmulq_n_f32(bF, sc);
+                }
+
+                vst3q_f32(d, outRgb);
+                s += 16;
+                d += 12;
+            }
+#endif
+            for (; x < w; ++x) {
                 float v[3] = {static_cast<float>(s[0]), static_cast<float>(s[1]),
                               static_cast<float>(s[2])};
                 if (cfg.normalize) {
-                    // Means and stddevs are conventionally given in 0..255 units
-                    // even when the model wants 0..1; see the general path.
                     for (int c = 0; c < 3; ++c) v[c] = (v[c] - cfg.mean[c]) * (1.0f / cfg.stdv[c]);
                 } else {
                     for (int c = 0; c < 3; ++c) v[c] *= sc;
@@ -370,8 +434,10 @@ LetterboxMap letterboxRgba(const FrameView& frame, const Roi& roi,
 
 LetterboxMap letterboxRgbaU8(const FrameView& frame, const Roi& roi,
                              const PreprocessConfig& cfg, uint8_t* out) {
+    if (out == nullptr) return LetterboxMap::identity();
+
     const Plan p = makePlan(frame, roi, cfg);
-    if (out == nullptr || !p.ok) return LetterboxMap::identity();
+    if (!p.ok) return LetterboxMap::identity();
 
     const int w = p.targetW;
     const int h = p.targetH;
@@ -408,7 +474,29 @@ LetterboxMap letterboxRgbaU8(const FrameView& frame, const Roi& roi,
         for (int y = 0; y < h; ++y) {
             const uint8_t* s = src + static_cast<size_t>(y) * static_cast<size_t>(frame.rowStrideBytes);
             uint8_t* d = out + static_cast<size_t>(y) * static_cast<size_t>(w) * 3u;
-            for (int x = 0; x < w; ++x) {
+            int x = 0;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            // 8 pixels per chunk: vld4_u8 loads 8x RGBA into 4 vector registers
+            // vst3_u8 packs 8x RGB back directly, eliminating scalar shuffle and Alpha channel
+            for (; x + 8 <= w; x += 8) {
+                uint8x8x4_t rgba = vld4_u8(s);
+                uint8x8x3_t rgb;
+                if (cfg.bgr) {
+                    rgb.val[0] = rgba.val[2];
+                    rgb.val[1] = rgba.val[1];
+                    rgb.val[2] = rgba.val[0];
+                } else {
+                    rgb.val[0] = rgba.val[0];
+                    rgb.val[1] = rgba.val[1];
+                    rgb.val[2] = rgba.val[2];
+                }
+                vst3_u8(d, rgb);
+                s += 32;
+                d += 24;
+            }
+#endif
+            for (; x < w; ++x) {
                 d[0] = s[c0];
                 d[1] = s[1];
                 d[2] = s[c2];

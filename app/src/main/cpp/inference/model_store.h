@@ -96,6 +96,14 @@ struct Entry {
     /// trained on 20 classes and one trained on 2 do not sit at the same
     /// operating point, and a single global number would force a compromise.
     float                    confidence = 0.5f;   // 0..1
+    /// True when the model's 4-channel box head emits [x1, y1, x2, y2] rather
+    /// than [cx, cy, w, h]. There is no model-side signal the engine can read
+    /// to tell them apart portably across ONNX / TFLite / NCNN, so the Add
+    /// dialog asks and we persist the answer. Default is cxcywh: most raw
+    /// YOLOv8-style exports are normalised cxcywh, while the xyxy form is the
+    /// exception (Ultralytics end2end exports, custom decoders) that the user
+    /// has to opt into.
+    bool                     boxXyxy = false;     // false = cxcywh (default)
     bool                     loaded = false;
     /// Detected tensor element type label: "fp32" / "fp16" / "int8" / … / "".
     /// Empty until the file is peeked (at add-time or on first load). Shown in
@@ -172,6 +180,11 @@ bool setConfidence(int id, float confidence);
 /// value < 0 to leave it untouched.
 bool setInference(int id, Engine engine, float confidence, int threads = -1,
                   int htpPerf = -1);
+
+/// Records the user's box-coordinate choice for this entry. The engine reads
+/// `Entry::boxXyxy` on every load — changing it while a model is loaded does
+/// NOT auto-recompile; it takes effect on the next Load. Idempotent.
+bool setBoxXyxy(int id, bool boxXyxy);
 
 /// Records the detected tensor element type for an entry ("fp32" / "fp16" / …),
 /// as reported by the inference backend after load or peeking the file.

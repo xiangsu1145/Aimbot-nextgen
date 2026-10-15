@@ -70,6 +70,9 @@ struct PageModel {
     // TfLiteQnnDelegateHtpPerformanceMode value. Shown only for the QNN HTP
     // engine; default Sustained High Performance (index 1).
     widgets::DropdownState htpPerf{1};
+    // Box-coordinate format: 0 = cxcywh (default, raw YOLOv8 head),
+    // 1 = xyxy (end2end-style / baked dist2bbox). Persisted on Save.
+    widgets::DropdownState boxFormat{0};
 
     // ── Per-model Settings dialog ─────────────────────────────────────────
     // Both fields are copied out of the entry when the dialog opens and
@@ -82,6 +85,10 @@ struct PageModel {
     widgets::SliderState   settingsThreadsSlider{1.0f, 1.0f, 8.0f, 1.0f};
     // HTP (QNN) performance-mode vote for the edited model.
     widgets::DropdownState settingsHtpPerf{1};
+    // Box-coordinate format the edited model is read in. Initialised to the
+    // entry's stored value when the dialog opens; updated locally and
+    // persisted via setBoxXyxy() when Save fires.
+    widgets::DropdownState settingsBoxFormat{0};
 
     // ── Compiling overlay ────────────────────────────────────────────────
     // Pushed up to model.h because the load runs on a background thread and

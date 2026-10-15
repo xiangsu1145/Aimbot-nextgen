@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "capture/capture.h"
+#include "capture/native_reader.h"
 #include "config/config_manager.h"
 #include "inference/engine.h"
 #include "inference/libpath.h"
@@ -429,6 +430,18 @@ PREFIX(captureSetRunning)(JNIEnv*, jobject, jboolean on) {
 JNIEXPORT void JNICALL
 PREFIX(captureInvalidateFrames)(JNIEnv*, jobject) {
     aimbotng::capture::invalidateFrames();
+}
+
+/// Creates native NDK AImageReader and returns Java Surface
+JNIEXPORT jobject JNICALL
+PREFIX(nativeCreateCaptureReader)(JNIEnv* env, jobject, jint width, jint height) {
+    return aimbotng::capture::createNativeCaptureReader(env, width, height);
+}
+
+/// Destroys native NDK AImageReader
+JNIEXPORT void JNICALL
+PREFIX(nativeDestroyCaptureReader)(JNIEnv*, jobject) {
+    aimbotng::capture::destroyNativeCaptureReader();
 }
 
 // ── Model store ────────────────────────────────────────────────────────

@@ -74,10 +74,8 @@ Session& session() {
     return *s;
 }
 
-/// The pixels of the newest capture frame, owned here because capture hands out
-/// copies into a caller-owned buffer.
-std::vector<uint8_t> g_frameBuf;
-uint64_t             g_lastFrameId = 0;
+// Last frame ID seen by the runtime pump
+uint64_t g_lastFrameId = 0;
 
 /// The frame geometry the session's Roi was last set from.
 ///
@@ -213,10 +211,12 @@ ModelSpec toSpec(const model::Entry& e) {
     spec.cpuThreads = e.cpuThreads;   // ONNX Runtime intra-op threads (1–8)
     spec.htpPerfMode = e.htpPerfMode;  // HTP performance-mode vote (QNN only)
     spec.cacheToken = model::baseName(e.path);
-    // Auto-detect xyxy box coordinate format from path or name
-    std::string s = e.path + " " + e.name;
-    for (char& c : s) c = static_cast<char>(std::tolower(c));
-    spec.boxXyxy = (s.find("xyxy") != std::string::npos);
+    // Box-coordinate format is a per-model choice the user makes on Add and
+    // again (if needed) on Settings. The previous filename-substring heuristic
+    // here was the bug behind the garbage-boxes report for any model whose
+    // name did not happen to contain "xyxy" — silently classifying v26 end2end
+    // exports as cxcywh. Explicit answer wins; default cxcywh lives on Entry.
+    spec.boxXyxy = e.boxXyxy;
     return spec;
 }
 
@@ -262,6 +262,9 @@ bool engineAvailable(model::Engine engine) {
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
 Status prepare() {
+    static std::mutex s_prepareMutex;
+    std::lock_guard<std::mutex> prepLock(s_prepareMutex);
+
     const int id = model::loadedId();
     if (id == 0) return Status::bad("no model is marked as loaded");
 
@@ -373,10 +376,11 @@ Status prepare() {
 
 void arm() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_engineReady) {
-        // Engine not ready yet — arm() is racing prepare() (typical when the
-        // user flips the switch on the same frame Load returns). Record the
-        // intent so prepare() can apply it on completion.
+    const int wantId = model::loadedId();
+    if (!g_engineReady || wantId == 0 || g_loadedId != wantId) {
+        // Engine not ready yet or does not match currently selected model —
+        // arm() is racing prepare(). Record the intent so prepare() can
+        // apply it on completion.
         g_pendingArm = true;
         return;
     }
@@ -455,7 +459,8 @@ bool running() {
 
 bool engineReady() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_engineReady;
+    const int wantId = model::loadedId();
+    return g_engineReady && wantId > 0 && g_loadedId == wantId;
 }
 
 void prepareAsync() {
@@ -463,9 +468,12 @@ void prepareAsync() {
     // The caller is typically a per-frame edge handler, so this is the hot
     // guard — a compare-exchange, not a lock, because the failing case (already
     // preparing) must be free.
-    if (g_engineReady) {
+    const int wantId = model::loadedId();
+    if (wantId == 0) return;
+
+    {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_engineReady && g_loadedId == model::loadedId()) return;
+        if (g_engineReady && g_loadedId == wantId) return;
     }
     bool expected = false;
     if (!g_preparing.compare_exchange_strong(expected, true,
@@ -473,7 +481,6 @@ void prepareAsync() {
         return;   // already compiling
     }
 
-    const int wantId = model::loadedId();
     LOGI("async prepare requested for model #%d", wantId);
 
     // Detached on purpose. The thread owns nothing the caller needs and the
@@ -593,26 +600,8 @@ void pump() {
         }
     }
 
-    const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
-    if (g_frameBuf.size() != bytes) g_frameBuf.resize(bytes);
-
-    int gotW = 0, gotH = 0;
-    uint64_t frameTsNs = 0;
-    uint64_t id = g_lastFrameId;
-    if (!capture::copyLatestInto(g_frameBuf.data(), g_frameBuf.size(), gotW, gotH, id,
-                                 &frameTsNs)) {
-        return;   // nothing new since last time; not an error
-    }
-    g_lastFrameId = id;
-
-    FrameView view;
-    view.pixels = g_frameBuf.data();
-    view.width = gotW;
-    view.height = gotH;
-    view.rowStrideBytes = gotW * 4;   // capture hands out tightly packed rows
-    view.tsNs = frameTsNs;
-
-    session().submit(view);
+    // Direct single copy from capture to session mailbox slot (no intermediate g_frameBuf)
+    session().submitFromCapture(g_lastFrameId);
 }
 
 // ── Reporting ───────────────────────────────────────────────────────────────

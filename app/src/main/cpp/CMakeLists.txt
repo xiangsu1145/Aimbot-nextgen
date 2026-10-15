@@ -41,6 +41,9 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O2")
 find_library(log-lib log)
 find_library(android-lib android)
 find_library(VULKAN-lib vulkan)
+find_library(mediandk-lib mediandk)
+find_library(EGL-lib EGL)
+find_library(GLESv3-lib GLESv3)
 
 # ImGui sources (cloned into include/imgui/)
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include/imgui)
@@ -102,13 +105,16 @@ set(NATIVE_SOURCES
     tracking/tuning_server.cpp      # TCP tuning server & PID telemetry
     config/config_manager.cpp         # page parameters <-> config.json
     capture/capture.cpp             # frame hand-off between the capture thread and the renderer
+    capture/native_reader.cpp       # NDK AImageReader native pipeline (Qnncpu alignment)
     inference/model_store.cpp       # the Add-Model page's persistent model list
     inference/preprocess.cpp        # frame -> tensor, shared by every runtime
+    inference/gpu_preprocessor.cpp  # GPU Compute Shader letterbox & normalisation
     inference/postprocess.cpp       # tensor -> boxes, shared by every runtime
     inference/engine.cpp            # the factory, and backend.h's table + probes
     inference/libpath.cpp           # locating and preloading the vendor .so files
     inference/capabilities.cpp      # what this device is, described not decided
     inference/model_type.cpp        # file-level dtype probe (ONNX + TFLite)
+    inference/box_format.cpp       # static-graph box-format auto-detection (xyxy / cxcywh)
     inference/ort_engine.cpp        # ONNX Runtime: XNNPACK and plain CPU
     inference/ncnn_engine.cpp       # Tencent NCNN: CPU and Vulkan GPU
     inference/litert_engine.cpp     # LiteRT (TFLite): CPU/XNNPACK/NNAPI/GPU delegates
@@ -231,6 +237,9 @@ target_link_libraries(${PROJECT_NAME}
     ${log-lib}
     ${android-lib}
     ${VULKAN-lib}
+    ${mediandk-lib}
+    ${EGL-lib}
+    ${GLESv3-lib}
 )
 
 # ── TensorFlow Lite runtime ────────────────────────────────────────────
