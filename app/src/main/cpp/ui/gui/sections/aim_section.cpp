@@ -1900,43 +1900,47 @@ static void syncAimPageInner() {
     bool hasTarget = false;
     float bestDistSq = 1e18f;
 
-    /// Hysteresis on re-selection: the engaged track is kept unless a rival is
-    /// more than this many times closer (in distance) to the crosshair.
-    constexpr float kStickyReselect = 1.5f;
-
     // ── Pick the target ──────────────────────────────────────────────────────
-    // Nearest confirmed track to the crosshair — with two rules whose only job
-    // is to stop the ENGAGED ID changing while the enemy has not.
+    // Nearest confirmed track to the crosshair — with one rule whose only job is
+    // to stop the ENGAGED ID changing while the enemy has not.
     //
-    //   1. A `lost` track never outranks a live one. A track that has missed its
-    //      measurements is still published for a few frames, so a one-frame
-    //      dropout does not break the lock, and it is held at its last known
-    //      position. But when a live track exists, the held one must not compete
-    //      with it: the case that produces both at once is precisely a failed
-    //      association — the held track plus the fresh one that replaces it —
-    //      and the two then sit a few px apart, so "nearest" alternates between
-    //      them and the id visibly flip-flops. Live tracks are therefore tried
-    //      in a first pass and held ones only if that pass finds nothing, which
-    //      is the brief-occlusion case they exist for.
+    //   Sticky retention. While the engaged id still exists in the tracker it IS
+    //   the target, with no distance test at all. This matters more here than in a
+    //   general tracker because ONE ENEMY CAN LEGITIMATELY PRODUCE TWO BOXES:
+    //   NMS upstream is per class, so a head/body model yields a head box and a
+    //   body box, and their centres are tens of px apart rather than zero.
+    //   Nearest-to-crosshair then flip-flops between them as the target crosses
+    //   the crosshair — one enemy, two ids, alternating — and every flip is also
+    //   a `targetChanged`, so the integrator is wiped several times a second and
+    //   the aim can never settle.
     //
-    //   2. Sticky re-selection. The engaged track is scored as if it were
-    //      kStickyReselect times closer than it is, so a rival has to be
-    //      substantially nearer to take over. This matters more here than in a
-    //      general tracker because ONE ENEMY CAN LEGITIMATELY PRODUCE TWO BOXES:
-    //      NMS upstream is per class, so a head/body model yields a head box and
-    //      a body box, and their centres are tens of px apart rather than zero.
-    //      Without hysteresis the pick flips between them as the target crosses
-    //      the crosshair — one enemy, two ids, alternating.
+    //   It also matters across a detection gap, which is the case this slider was
+    //   actually fighting: the engaged track is published while it is lost, held
+    //   near its last known position. Dropping the lock on the first lost frame
+    //   would let a nearer rival take over and then hand it back, which is
+    //   precisely the "多目标 + 丢框 = 乱跳乱切" oscillation.
     //
-    // Neither rule changes WHERE the aim points for a given track; they only
-    // decide which track is the target, so aim precision is untouched.
+    // NOTE ON A CONSTANT THAT WAS HERE: this block used to declare
+    // `kStickyReselect = 1.5f` and the comment described scoring the engaged
+    // track as if it were 1.5x closer, so a rival had to be substantially nearer
+    // to take over. That constant was never referenced — the code has always
+    // been an unconditional hold — and the comment described behaviour that did
+    // not exist. It is deleted rather than wired up, deliberately: at multi-target
+    // range a rival is often *legitimately* nearer, and letting one steal the lock
+    // is the switch this whole block exists to prevent. Making the hold
+    // conditional would reintroduce it. The correct place to stop a wrong target
+    // being locked in the first place is the tracker, where identity is decided
+    // from geometry rather than from screen proximity — see inheritWindow() in
+    // tracking/kalman_tracker.h.
+    //
+    // The stick costs nothing when the target is genuinely gone: the track expires
+    // after its 丢失帧 window, the id stops existing, and the next frame falls
+    // through to the nearest live track below.
     const auto& tracks = tracking::tracker().tracks();
     if (p.aimCategory.hasAnySelected()) {
         // ── Sticky retention for currently locked target ───────────────────
-        // If the locked target is still alive in tracks (even if t.lost == true within
-        // terminateFrames), stick to it! This prevents a momentary 1-frame dropout from
-        // flipping to a nearby rival enemy in multi-target situations, ensuring that
-        // the configured "丢失帧数" works as expected.
+        // The locked id is kept while it is alive — INCLUDING while it is `lost`
+        // inside its 丢失帧 window, which is what makes that slider do what it says.
         const tracking::TrackedTarget* lockedTrack = nullptr;
         if (p.touchAim.lastTargetId >= 0) {
             for (const auto& t : tracks) {
@@ -1958,8 +1962,19 @@ static void syncAimPageInner() {
             bestId     = lockedTrack->id;
             hasTarget  = true;
         } else {
-            // Not currently locking any target, or the locked target expired.
-            // Pick the nearest confirmed target to the crosshair.
+            // Cold pick: no lock is held, so this is the first frame of an
+            // engagement or the frame after the previous target expired. Nearest
+            // live track to the crosshair.
+            //
+            // `t.lost` tracks are excluded HERE ON PURPOSE. At this point the aim
+            // is not pointed at anything, so the alternative is either nothing or
+            // a position the detector has already said is stale — and "nothing" is
+            // handled a few lines below by holding the contact instead of lifting
+            // it. Letting a held track compete here would reintroduce the exact
+            // oscillation the branch above exists to prevent: a ghost and a rival
+            // a few px apart trading the pick every frame. The sticky branch has
+            // already covered the case this one is not for — a target we are
+            // ENGAGED with that briefly lost its measurement.
             for (const auto& t : tracks) {
                 if (!t.confirmed || t.lost) continue;
                 if (!p.aimCategory.isClassSelected(t.cls)) continue;

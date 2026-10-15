@@ -191,6 +191,30 @@ private:
     /// Frames an unmatched track survives before it is dropped. Always covers
     /// the whole prediction window — see the note on predictHoldFrames.
     int  liveFrames() const;
+
+    /// Frames after losing a measurement during which a track may still ADOPT a
+    /// detection that failed the normal association pass — i.e. the gap it is
+    /// willing to bridge before conceding the target is gone.
+    ///
+    /// This MUST cover the window the track is still alive and being aimed at,
+    /// and it is the single most important coupling in this file. It used to be
+    /// a hardcoded 2 while the track's lifetime came from the 丢失帧 slider, and
+    /// that gap is the "multi-target, 丢框就乱跳乱切" fault:
+    ///
+    ///   * miss 3+ frames, the enemy comes back → the inherit window has closed,
+    ///     so the detection MINTS A NEW ID while the old track is still alive
+    ///     and still being aimed at, frozen at a stale position;
+    ///   * two tracks now sit on one enemy, so any "nearest to crosshair" pick
+    ///     alternates between them, and the aim whips across the screen;
+    ///   * raising 丢失帧 made it WORSE, because it lengthened the ghost's life
+    ///     without lengthening the window in which the ghost could recognise the
+    ///     returning enemy as itself.
+    ///
+    /// So the window is derived from the prediction slider — "how many frames am
+    /// I willing to hold a target across a gap" is exactly what 丢框预测帧数
+    /// asks — floored at kInheritMinLostFrames so it can never regress below
+    /// the old fixed value.
+    int  inheritWindow() const;
 };
 
 /// Global tracker instance (stateful across frames — that is the whole point).

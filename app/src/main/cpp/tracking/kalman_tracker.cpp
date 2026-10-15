@@ -41,9 +41,13 @@ namespace tracking {
 //   from a JUST-LOST track and still be accepted as that same track returning
 //   (rather than a new enemy spawning). Expressed in box-sizes, like
 //   TrackerConfig::gateRadius.
-constexpr float kClassBonus        = 0.06f;
-constexpr float kInheritGateRadius = 2.5f;
-constexpr int   kInheritMaxLostFrames = 2;
+//
+// kInheritMinLostFrames — the NARROWEST inherit window, as a floor. The real
+//   window is inheritWindow() below, which tracks the prediction slider; this
+//   constant only guarantees the window never gets tighter than it used to be.
+constexpr float kClassBonus            = 0.06f;
+constexpr float kInheritGateRadius     = 2.5f;
+constexpr int   kInheritMinLostFrames  = 2;
 
 // ── Tiny fixed-size matrix (6x6 / 4x4 is all we need) ────────────────────────
 namespace {
@@ -199,9 +203,24 @@ TrackerConfig& trackerConfig() {
 // If terminateFrames <= 0, missed tracks drop immediately with zero hold and no phantom prediction.
 // When terminateFrames > 0, the track survives for terminateFrames misses (predicting during the first
 // predictHoldFrames, and freezing at last_valid for the remainder).
+//
+// The prediction window is taken into account, because a slider that says
+// "predict N frames" and then silently does nothing past terminateFrames is a
+// lie: the tracker would erase the track while it was still inside the window
+// the user asked for. So a positive 丢失帧 is a floor, not a cap. The zero case
+// keeps its meaning — 0 is an explicit "do not hold anything", not "hold the
+// default prediction window".
 int MultiTracker::liveFrames() const {
     if (cfg_.terminateFrames <= 0) return 0;
-    return cfg_.terminateFrames;
+    return std::max(cfg_.terminateFrames, cfg_.predictHoldFrames + 1);
+}
+
+// How long a lost track may still recognise its own enemy coming back. See the
+// note on inheritWindow() in the header — this number and liveFrames() have to
+// move together, or a ghost outlives the window in which it could be re-adopted
+// and every late return turns into a brand-new id.
+int MultiTracker::inheritWindow() const {
+    return std::max(kInheritMinLostFrames, cfg_.predictHoldFrames + 1);
 }
 
 // Monotonic, never recycled — see the note on `nextId_` in the header. The
@@ -242,10 +261,29 @@ void MultiTracker::predictAll(bool countMiss) {
         } else {
             if (countMiss) ++t.lost_frames;
             // Forward-predict using vx,vy for the first predictHoldFrames missed
-            // frames (covers brief occlusions: wall, smoke, foliage), then freeze
-            // at last_valid so a stale velocity estimate does not drift the aim
-            // across the screen on a longer miss. predictHoldFrames=0 disables
-            // forward-prediction entirely and falls back to instant freeze.
+            // frames (covers brief occlusions: wall, smoke, foliage), then settle
+            // at last_valid. predictHoldFrames=0 disables forward-prediction
+            // entirely and falls back to instant freeze.
+            //
+            // SETTLING IS A RAMP, NOT A SWITCH. This used to be an if/else: the
+            // predicted branch ran for lost_frames <= predictHoldFrames and then
+            // the very next frame did `t.x = t.last_valid`, a hard assignment. By
+            // that point the prediction had carried the box up to maxDisp (1.5 box
+            // widths, below) away from last_valid, so every gap longer than the
+            // prediction window produced a visible kick: drift out for N frames,
+            // teleport back, drift out again. On a strafing target that reads as
+            // exactly the "丢框就晃" the 丢失帧 slider is supposed to prevent — the
+            // slider was never able to prevent it, because the discontinuity is
+            // in this branch, not in the tracker's lifetime.
+            //
+            // The ramp fixes it at the source: after each predicted step the box is
+            // blended back toward last_valid by lost_frames/predictHoldFrames, so
+            // alpha reaches 1.0 on the LAST predicted frame. The freeze branch then
+            // takes over from a position that is already last_valid and a velocity
+            // that is already ~0, and the step across the boundary is zero by
+            // construction rather than by clamping. Converging rather than holding
+            // is also the better aim behaviour: a stale velocity carried across a
+            // whole occlusion is exactly what makes the aim chase a phantom.
             if (cfg_.predictHoldFrames > 0 && t.lost_frames <= cfg_.predictHoldFrames) {
                 t.x = A * t.x;
                 t.P = A * t.P * At + Q;
@@ -263,6 +301,12 @@ void MultiTracker::predictAll(bool countMiss) {
                         t.x.at(0, 0) = t.last_valid.at(0, 0) + dx * s;
                         t.x.at(1, 0) = t.last_valid.at(1, 0) + dy * s;
                     }
+                }
+                const float alpha = static_cast<float>(t.lost_frames) /
+                                     static_cast<float>(cfg_.predictHoldFrames);
+                if (alpha > 0.0f) {
+                    t.x.at(0, 0) += (t.last_valid.at(0, 0) - t.x.at(0, 0)) * alpha;
+                    t.x.at(1, 0) += (t.last_valid.at(1, 0) - t.x.at(1, 0)) * alpha;
                 }
             } else {
                 t.x = t.last_valid;
@@ -408,12 +452,18 @@ void MultiTracker::matchAndUpdate(const std::vector<infer::Box>& dets) {
     // flick, one frame of bad localisation — is the same enemy, and minting a
     // fresh id for it leaves the old track alive as a `lost` duplicate for the
     // next `terminateFrames` frames. Two tracks at one enemy is exactly the
-    // state in which the nearest-target pick alternates between ids. So: a
+    // state in which the nearest-target pick alternates between ids, and the
+    // aim then whips between two points instead of tracking one. So: a
     // just-lost track whose anchor is inside the relaxed inherit gate adopts
     // this detection and keeps its id. The relaxed gate is the only place a
     // detection may match from further away than gateRadius, and it is bounded
-    // to tracks matched within the last couple of detector results, so a
-    // long-dead track can never steal a genuinely new enemy.
+    // to the prediction window, so a long-dead track can never steal a
+    // genuinely new enemy.
+    //
+    // The window is inheritWindow() rather than a constant: it is what keeps
+    // "丢失帧" meaning something. See the note in the header for the failure it
+    // used to cause at multi-target range.
+    const int inheritMaxLost = inheritWindow();
     const size_t prevTrackCount = tracks_.size();
     for (size_t dj_j = 0; dj_j < dets.size(); ++dj_j) {
         if (matchedDets.count(static_cast<int>(dj_j))) continue;
@@ -423,7 +473,7 @@ void MultiTracker::matchAndUpdate(const std::vector<infer::Box>& dets) {
         for (size_t k = 0; k < prevTrackCount; ++k) {
             if (matchedTracks.count(static_cast<int>(k))) continue;
             const auto& tr = tracks_[k];
-            if (tr.lost_frames > kInheritMaxLostFrames) continue;
+            if (tr.lost_frames > inheritMaxLost) continue;
             const float scale = 0.5f * (tr.asW + tr.asH);
             if (scale <= 1.0f) continue;
             const float dx = d.cx() - tr.asCx, dy = d.cy() - tr.asCy;
